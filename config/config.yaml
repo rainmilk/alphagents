@@ -1,0 +1,197 @@
+# AAAI 2027 LLM Multi-Factor Stock Selection Project
+# Configuration File
+
+# ==================== Data Configuration ====================
+data:
+  # Data source
+  source: "tushare"  # or "akshare", "local"
+  
+  # Stock universe
+  universe:
+    index: "hs300"  # hs300, zz500, all_a
+    start_date: "2019-01-01"
+    end_date: "2024-12-31"
+    min_market_cap: 5e9  # 5 billion
+    exclude_st: true
+    exclude_suspended: true
+  
+  # Feature engineering
+  features:
+    price_features:
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+    technical_indicators:
+      - ma5
+      - ma20
+      - ma60
+      - vol
+      - macd
+      - rsi
+    fundamental_features:
+      - pe
+      - pb
+      - roe
+      - market_cap
+  
+  # Preprocessing
+  preprocessing:
+    fill_method: "forward"  # forward, backward, interpolate
+    outlier_method: "winsorize"  # winsorize, clip, none
+    outlier_threshold: 3.0  # sigma for clip, percentile for winsorize
+
+# ==================== LLM Configuration ====================
+llm:
+  # Factor generation
+  generator:
+    model: "deepseek-chat"  # deepseek-chat, gpt-4o, qwen-turbo
+    temperature: 0.7
+    max_tokens: 2000
+    n_candidates: 20  # number of candidate factors per round
+    
+  # Factor evaluation (debate)
+  evaluator:
+    model: "gpt-4o"  # stronger model for evaluation
+    temperature: 0.3
+    n_agents: 5
+    n_debate_rounds: 3
+    
+  # Embedding model
+  embedding:
+    model: "paraphrase-multilingual-MiniLM-L12-v2"
+    fallback: "tfidf"
+    device: "cpu"  # cpu, cuda
+
+# ==================== Evolution Configuration ====================
+evolution:
+  n_seed_factors: 20
+  top_k: 10
+  n_improve: 10
+  n_mutate: 5
+  max_rounds: 15
+  convergence_delta: 0.003
+  convergence_window: 2
+  patience: 3
+  
+  # Quality threshold
+  min_ic: 0.02
+  min_sharpe: 0.5
+  max_drawdown: -0.20
+
+# ==================== Memory Bank Configuration ====================
+memory:
+  # Market state encoding
+  market_state:
+    vix_low: 15.0
+    vix_high: 25.0
+    ma_short: 20
+    ma_long: 60
+    corr_threshold_low: 0.3
+    corr_threshold_high: 0.6
+  
+  # Retrieval
+  retrieval:
+    top_k: 5
+    state_weight: 0.3
+    min_ic: 0.02
+    
+  # Update
+  update:
+    alpha: 0.3  # EMA decay
+    
+  # Storage
+  storage:
+    db_path: "data/memory_bank.json"
+    faiss_path: "data/memory_bank.faiss"
+
+# ==================== Fusion Configuration ====================
+fusion:
+  # Normalization
+  normalization:
+    method: "zscore"  # zscore, rank, minmax
+    neutralize_industry: true
+    
+  # Weighting strategy
+  weighting:
+    strategy: "icir_weighted"  # equal, ic_weighted, icir_weighted, decay
+    corr_penalty: true
+    corr_threshold: 0.7
+    
+  # Portfolio construction
+  portfolio:
+    top_n: 50
+    method: "score_proportional"  # top_n, score_proportional
+    max_weight: 0.05
+    max_industry_exposure: 0.30
+    min_market_cap_percentile: 10
+
+# ==================== Backtest Configuration ====================
+backtest:
+  # Trading
+  trading:
+    frequency: "daily"  # daily, weekly, monthly
+    commission: 0.0003  # 0.03%
+    slippage: 0.001  # 0.1%
+    min_holding_days: 1
+    
+  # Rebalancing
+  rebalance:
+    frequency: "weekly"  # daily, weekly, monthly
+    lookback_window: 20  # trading days
+    
+  # Benchmark
+  benchmark:
+    name: "hs300"
+
+# ==================== Experiment Configuration ====================
+experiment:
+  # Cross-validation
+  cv:
+    method: "rolling"  # rolling, expanding, kfold
+    n_splits: 5
+    train_window: 252  # trading days
+    test_window: 63  # trading days
+    
+  # Baselines
+  baselines:
+    - "equal_weight"
+    - "ic_weighted"
+    - "alpha_grail"
+    - "gpt_factor"
+    
+  # Metrics
+  metrics:
+    - "annual_return"
+    - "sharpe_ratio"
+    - "max_drawdown"
+    - "information_ratio"
+    - "calmar_ratio"
+    - "win_rate"
+
+# ==================== Logging Configuration ====================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  save_dir: "logs"
+  save_frequency: 10  # save every N rounds
+
+# ==================== Output Configuration ====================
+output:
+  # Results
+  results_dir: "experiments/results"
+  
+  # Paper
+  paper_dir: "paper"
+  figures_dir: "paper/figures"
+  
+  # Feishu sync
+  feishu:
+    enable: true
+    doc_ids:
+      plan: "KJbhdd3HjoF4uIxpf0jcWOhdnMb"
+      debate: "OUIFdytglogDzhxv7bQcciTmnQu"
+      evolve: "P5mSdE0ALo0LbDxyNVAcBHmRnze"
+      memory: "H6XcdhqHOoSRK8x3elXc8FHJnBb"
+      fusion: "LX25dNu5roi3mjxL7npcMv6Kn7g"
