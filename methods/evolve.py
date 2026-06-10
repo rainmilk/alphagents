@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Self-Evolving Factor Generator Module
 
@@ -10,10 +11,27 @@ Date: 2026-06-07
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass, asdict
+import re
 import warnings
+import os
+import json
 warnings.filterwarnings('ignore')
+
+# Try to import scipy for Spearman rank correlation; fall back to pandas-only
+try:
+    from scipy.stats import spearmanr
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+# Try to import openai for LLM calls
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 
 @dataclass
@@ -48,40 +66,790 @@ class EvolutionResult:
     total_rounds: int
     
     
+# ---------------------------------------------------------------------------
+# Factor expression evaluator (recursive-descent parser)
+# ---------------------------------------------------------------------------
+
+# Token types
+_TOKEN_RE = re.compile(
+    r'\s*(?:'
+    r'(?P<number>\d+\.?\d*(?:[eE][+-]?\d+)?)'  # number
+    r'|(?P<ident>[a-zA-Z_]\w*)'                   # identifier / function name
+    r'|(?P<op>[+\-*/^])'                           # operator
+    r'|(?P<paren>[()])'                            # parentheses
+    r'|(?P<comma>,)'                               # comma
+    r'|(?P<invalid>\S+)'                           # catch-all
+    r')'
+)
+
+def _tokenize(expr: str) -> List[tuple]:
+    """Tokenize a factor expression string into (type, value) pairs."""
+    tokens = []
+    pos = 0
+    while pos < len(expr):
+        m = _TOKEN_RE.match(expr, pos)
+        if m is None:
+            # Skip whitespace
+            pos += 1
+            continue
+        kind = m.lastgroup
+        value = m.group(kind)
+        if kind == 'number':
+            tokens.append(('NUMBER', float(value)))
+        elif kind == 'ident':
+            tokens.append(('IDENT', value))
+        elif kind == 'op':
+            tokens.append(('OP', value))
+        elif kind == 'paren':
+            tokens.append(('PAREN', value))
+        elif kind == 'comma':
+            tokens.append(('COMMA', ','))
+        elif kind == 'invalid':
+            raise ValueError(f"Unexpected token '{value}' in factor expression")
+        pos = m.end()
+    return tokens
+
+
+class _FactorExprEvaluator:
+    """
+    Recursive-descent evaluator for WorldQuant-style factor expressions.
+
+    Supported data sources:
+        open, high, low, close, volume, amount  (price_data dict keys)
+        pe, pb, roe, market_cap                  (fundamental_data dict keys)
+
+    Supported functions:
+        rank(X)          — cross-sectional percentile rank [0, 1]
+        ts_rank(X, w)    — rolling time-series rank [0, 1]
+        ts_corr(X, Y, w) — rolling Pearson correlation
+        ts_mean(X, w)    — rolling mean
+        ts_std(X, w)     — rolling std (ddof=0)
+        ts_min(X, w)     — rolling minimum
+        ts_max(X, w)     — rolling maximum
+        ts_sum(X, w)     — rolling sum
+        ts_delta(X, w)   — X - delay(X, w)
+        ts_zscore(X, w)  — rolling z-score
+        delay(X, d)      — lag by d periods
+        sign(X)          — element-wise sign
+        abs(X)           — element-wise absolute value
+        log(X)           — element-wise natural log
+        sqrt(X)          — element-wise square root (clamped >= 0)
+        forward_returns  — 1-day forward return (precomputed)
+
+    Operators: +, -, *, /, ^ (power)
+    """
+
+    def __init__(self, data_map: Dict[str, pd.DataFrame]):
+        """
+        Args:
+            data_map: dict mapping field name → pd.DataFrame (dates × stocks)
+        """
+        self._data = data_map
+        self._tokens = []
+        self._pos = 0
+
+    def evaluate(self, expr: str) -> pd.DataFrame:
+        """Parse and evaluate a factor expression."""
+        self._tokens = _tokenize(expr)
+        self._pos = 0
+        result = self._parse_expression()
+        # Ensure result is a DataFrame (not a scalar or Series)
+        if isinstance(result, (int, float)):
+            # Broadcast scalar to same shape as first data source
+            template = next(iter(self._data.values()))
+            result = pd.DataFrame(result, index=template.index, columns=template.columns)
+        return result
+
+    # ---- Parser ----
+
+    def _peek(self):
+        return self._tokens[self._pos] if self._pos < len(self._tokens) else ('EOF', None)
+
+    def _advance(self):
+        tok = self._peek()
+        self._pos += 1
+        return tok
+
+    def _expect(self, kind, value=None):
+        tok = self._advance()
+        if tok[0] != kind or (value is not None and tok[1] != value):
+            raise ValueError(f"Expected {kind}({value}), got {tok}")
+        return tok
+
+    def _parse_expression(self) -> pd.DataFrame:
+        """expression := term (('+' | '-') term)*"""
+        left = self._parse_term()
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('+', '-'):
+            op = self._advance()[1]
+            right = self._parse_term()
+            if op == '+':
+                left = left + right
+            else:
+                left = left - right
+        return left
+
+    def _parse_term(self) -> pd.DataFrame:
+        """term := factor (('*' | '/') factor)*"""
+        left = self._parse_unary()
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('*', '/'):
+            op = self._advance()[1]
+            right = self._parse_unary()
+            if op == '*':
+                left = left * right
+            else:
+                left = left / right.replace(0, np.nan)
+        return left
+
+    def _parse_unary(self) -> pd.DataFrame:
+        """unary := ('+' | '-')? atom"""
+        if self._peek()[0] == 'OP' and self._peek()[1] == '-':
+            self._advance()
+            return -self._parse_unary()
+        if self._peek()[0] == 'OP' and self._peek()[1] == '+':
+            self._advance()
+            return self._parse_unary()
+        return self._parse_atom()
+
+    def _parse_atom(self) -> pd.DataFrame:
+        """atom := NUMBER | IDENT ['(' args ')'] | '(' expression ')' | POWER"""
+        tok = self._peek()
+
+        if tok[0] == 'NUMBER':
+            self._advance()
+            # Broadcast scalar
+            template = next(iter(self._data.values()))
+            return pd.DataFrame(tok[1], index=template.index, columns=template.columns)
+
+        if tok[0] == 'PAREN' and tok[1] == '(':
+            self._advance()
+            result = self._parse_expression()
+            self._expect('PAREN', ')')
+            return result
+
+        if tok[0] == 'IDENT':
+            name = self._advance()[1]
+            # Check if it's a function call
+            if self._peek()[0] == 'PAREN' and self._peek()[1] == '(':
+                return self._parse_func_call(name)
+            # Otherwise it's a data column
+            return self._lookup_data(name)
+
+        raise ValueError(f"Unexpected token {tok}")
+
+    def _parse_func_call(self, name: str) -> pd.DataFrame:
+        """Parse function arguments: '(' expression (',' expression)* ')'"""
+        self._expect('PAREN', '(')
+        args = []
+        if self._peek()[0] == 'PAREN' and self._peek()[1] == ')':
+            # Empty args — not valid for our functions, but handle gracefully
+            pass
+        else:
+            args.append(self._parse_expression())
+            while self._peek()[0] == 'COMMA':
+                self._advance()
+                args.append(self._parse_expression())
+        self._expect('PAREN', ')')
+        return self._dispatch_func(name, args)
+
+    def _lookup_data(self, name: str) -> pd.DataFrame:
+        """Look up a named data field."""
+        if name not in self._data:
+            raise ValueError(
+                f"Unknown identifier '{name}'. "
+                f"Available: {list(self._data.keys())}"
+            )
+        return self._data[name]
+
+    # ---- Function dispatch ----
+
+    def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
+        """Route function call to implementation."""
+        arity = len(args)
+        # Check arity
+        arity_map = {
+            'rank':       (1, 1),
+            'ts_rank':    (2, 2),
+            'ts_corr':    (3, 3),
+            'ts_mean':    (2, 2),
+            'ts_std':     (2, 2),
+            'ts_min':     (2, 2),
+            'ts_max':     (2, 2),
+            'ts_sum':     (2, 2),
+            'ts_delta':   (2, 2),
+            'ts_zscore':  (2, 2),
+            'delay':      (2, 2),
+            'sign':       (1, 1),
+            'abs':        (1, 1),
+            'log':        (1, 1),
+            'sqrt':       (1, 1),
+        }
+
+        if name in arity_map:
+            lo, hi = arity_map[name]
+            if not (lo <= arity <= hi):
+                raise ValueError(
+                    f"Function '{name}' expects {lo}-{hi} args, got {arity}"
+                )
+
+        impl = getattr(self, f'_fn_{name}', None)
+        if impl is None:
+            raise ValueError(f"Unknown function '{name}'")
+        return impl(*args)
+
+    # ---- Data access ----
+
+    @staticmethod
+    def _safe_int(val, default: int = 5) -> int:
+        """
+        Convert window/horizon argument to int, NaN-safe.
+
+        Windows are usually parsed from NUMBER tokens → scalar DataFrames.
+        NaN can appear if thread contention corrupts the token stream;
+        this guard prevents a hard crash.
+        """
+        if isinstance(val, pd.DataFrame):
+            raw = val.iloc[0, 0] if val.values.size > 0 else default
+        elif isinstance(val, pd.Series):
+            raw = val.iloc[0] if len(val) > 0 else default
+        elif isinstance(val, (int, float)):
+            raw = val
+        else:
+            raw = default
+
+        if isinstance(raw, float) and np.isnan(raw):
+            return default
+        return int(raw)
+
+    # ---- Function implementations ----
+
+    @staticmethod
+    def _fn_rank(x: pd.DataFrame) -> pd.DataFrame:
+        """Cross-sectional percentile rank (0~1)."""
+        return x.rank(axis=1, pct=True, na_option='bottom')
+
+    @staticmethod
+    def _fn_ts_rank(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling time-series rank within each stock."""
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(3, w // 2)).rank(pct=True) / w
+
+    @staticmethod
+    def _fn_ts_corr(x: pd.DataFrame, y: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling Pearson correlation between x and y (per stock)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(5, w // 2)).corr(y)
+
+    @staticmethod
+    def _fn_ts_mean(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(1, w // 2)).mean()
+
+    @staticmethod
+    def _fn_ts_std(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(2, w // 2)).std(ddof=0)
+
+    @staticmethod
+    def _fn_ts_min(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(1, w // 2)).min()
+
+    @staticmethod
+    def _fn_ts_max(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(1, w // 2)).max()
+
+    @staticmethod
+    def _fn_ts_sum(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.rolling(window=w, min_periods=max(1, w // 2)).sum()
+
+    @staticmethod
+    def _fn_ts_delta(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        return x - x.shift(w)
+
+    @staticmethod
+    def _fn_ts_zscore(x: pd.DataFrame, window) -> pd.DataFrame:
+        w = _FactorExprEvaluator._safe_int(window)
+        mean = x.rolling(window=w, min_periods=max(2, w // 2)).mean()
+        std = x.rolling(window=w, min_periods=max(2, w // 2)).std(ddof=0)
+        return (x - mean) / std.replace(0, np.nan)
+
+    @staticmethod
+    def _fn_delay(x: pd.DataFrame, d) -> pd.DataFrame:
+        periods = _FactorExprEvaluator._safe_int(d)
+        return x.shift(periods)
+
+    @staticmethod
+    def _fn_sign(x: pd.DataFrame) -> pd.DataFrame:
+        return np.sign(x)
+
+    @staticmethod
+    def _fn_abs(x: pd.DataFrame) -> pd.DataFrame:
+        return x.abs()
+
+    @staticmethod
+    def _fn_log(x: pd.DataFrame) -> pd.DataFrame:
+        return np.log(x.clip(lower=1e-10))
+
+    @staticmethod
+    def _fn_sqrt(x: pd.DataFrame) -> pd.DataFrame:
+        return np.sqrt(x.clip(lower=0))
+
+
+# ---------------------------------------------------------------------------
+# FactorBacktester — lightweight factor backtesting engine
+# ---------------------------------------------------------------------------
+
 class FactorBacktester:
     """
     Lightweight backtester for factor evaluation.
+
+    For each factor, this engine:
+      1. Parses and evaluates the factor expression on the full data panel
+      2. Computes Rank IC (Spearman) at each cross-section
+      3. Builds a long-short quantile portfolio and computes Sharpe / win_rate / max_dd
+
+    Constructor supports two calling conventions for backward compatibility:
+
+        Legacy:  FactorBacktester(close_df)
+                 → close_df is treated as price_data['close'].
+
+        Full:    FactorBacktester(price_df, volume_df, fundamentals_dict,
+                                  forward_period=20)
+                 → price_df = close prices (dates × stocks)
+                 → volume_df = volume (dates × stocks)
+                 → fundamentals_dict = {'pe': df, 'pb': df, ...}
+                 → forward_period = forward return horizon in trading days
+
+    If a dict is passed as the first argument, it is treated as price_data
+    with keys: open, high, low, close, volume, amount.
     """
-    
-    def __init__(self, prices: pd.DataFrame):
+
+    _DEFAULT_FORWARD_PERIOD = 20
+
+    def __init__(
+        self,
+        prices,
+        volume: Optional[pd.DataFrame] = None,
+        fundamentals: Optional[Dict[str, pd.DataFrame]] = None,
+        forward_period: int = _DEFAULT_FORWARD_PERIOD,
+    ):
         """
-        Initialize backtester.
-        
+        Initialize the backtester.
+
         Args:
-            prices: DataFrame of stock prices
+            prices: If dict → price_data dict (keys: open/high/low/close/volume/amount).
+                    If DataFrame → close prices only (legacy API, volume=None required).
+            volume: Volume DataFrame, used only when prices is a DataFrame (legacy API).
+            fundamentals: Optional dict of fundamental DataFrames (pe, pb, roe, market_cap).
+            forward_period: Forward return horizon in trading days.
         """
-        self.prices = prices
-        
-    def evaluate(self, factor: CandidateFactor) -> Dict:
+        # ---- Normalise price_data ----
+        if isinstance(prices, dict):
+            self.price_data = {k: v.copy() for k, v in prices.items()}
+        elif isinstance(prices, pd.DataFrame):
+            self.price_data = {'close': prices.copy()}
+            if volume is not None:
+                self.price_data['volume'] = volume.copy()
+        else:
+            raise TypeError(f"prices must be dict or DataFrame, got {type(prices)}")
+
+        # Pad missing price fields with empty DataFrames
+        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            if field not in self.price_data:
+                # Create a NaN DataFrame of same shape as 'close' (or whatever we have)
+                template = next(iter(self.price_data.values()))
+                self.price_data[field] = pd.DataFrame(
+                    np.nan, index=template.index, columns=template.columns
+                )
+
+        self.fundamental_data = fundamentals or {}
+        self.forward_period = forward_period
+
+        # ---- Build the unified data map for the expression evaluator ----
+        self._data_map = dict(self.price_data)
+        self._data_map.update(self.fundamental_data)
+
+        # ---- Compute forward returns ----
+        self._forward_returns = self._compute_forward_returns()
+
+        # ---- Expression evaluator (lazy init) ----
+        self._evaluator = None
+        self._eval_cache = {}        # expression → computed factor values
+        self._metric_cache = {}      # expression → metrics dict
+
+    @property
+    def evaluator(self) -> _FactorExprEvaluator:
         """
-        Evaluate a factor.
+        Return a FRESH expression evaluator every time.
         
+        The evaluator has mutable parsing state (self._tokens, self._pos),
+        so it MUST NOT be shared across threads. Creating a new instance
+        on every access is cheap — it only stores a reference to the data.
+        """
+        return _FactorExprEvaluator(self._data_map)
+
+    # ------------------------------------------------------------------
+    # Forward returns
+    # ------------------------------------------------------------------
+
+    def _compute_forward_returns(self) -> pd.DataFrame:
+        """Compute forward returns for the configured period."""
+        close = self.price_data['close']
+        fwd = close.pct_change(self.forward_period).shift(-self.forward_period)
+        return fwd
+
+    @property
+    def forward_returns(self) -> pd.DataFrame:
+        return self._forward_returns
+
+    # ------------------------------------------------------------------
+    # Main evaluation entry point
+    # ------------------------------------------------------------------
+
+    def evaluate(self, factor: 'CandidateFactor') -> Dict:
+        """
+        Evaluate a candidate factor.
+
         Args:
-            factor: Factor to evaluate
-            
+            factor: CandidateFactor with .expression set.
+
         Returns:
-            Dict of evaluation metrics
+            Dict with keys: ic, ic_ir, sharpe, win_rate, max_drawdown,
+                            long_short_ret, factor_values.
         """
-        # Mock evaluation (in practice, calculate actual metrics)
-        ic = np.random.uniform(0.02, 0.06)
-        sharpe = np.random.uniform(0.5, 2.0)
-        win_rate = np.random.uniform(0.5, 0.6)
-        
+        expr = factor.expression
+
+        # Check cache
+        if expr in self._metric_cache:
+            cached = self._metric_cache[expr].copy()
+            # Update the factor object
+            factor.ic = cached['ic']
+            factor.sharpe = cached['sharpe']
+            factor.win_rate = cached['win_rate']
+            return cached
+
+        try:
+            # Step 1: Compute factor values
+            factor_values = self.evaluator.evaluate(expr)
+            if factor_values.isna().all().all():
+                return self._empty_metrics()
+
+            # Step 2: Align factor values with forward returns
+            fwd = self._forward_returns
+            common_dates = factor_values.index.intersection(fwd.index)
+            common_codes = factor_values.columns.intersection(fwd.columns)
+            if len(common_dates) < 10 or len(common_codes) < 5:
+                return self._empty_metrics()
+
+            fv_aligned = factor_values.loc[common_dates, common_codes]
+            fr_aligned = fwd.loc[common_dates, common_codes]
+
+            # Step 3: Rank IC
+            ic, ic_ir = self._compute_rank_ic(fv_aligned, fr_aligned)
+
+            # Step 4: Quantile portfolio metrics
+            sharpe, win_rate, max_dd, long_short_ret = self._compute_quantile_metrics(
+                fv_aligned, fr_aligned
+            )
+
+            metrics = {
+                'ic': float(ic) if not np.isnan(ic) else 0.0,
+                'ic_ir': float(ic_ir) if not np.isnan(ic_ir) else 0.0,
+                'sharpe': float(sharpe) if not np.isnan(sharpe) else 0.0,
+                'win_rate': float(win_rate) if not np.isnan(win_rate) else 0.5,
+                'max_drawdown': float(max_dd) if not np.isnan(max_dd) else 0.0,
+                'long_short_ret': long_short_ret,
+                'factor_values': factor_values,
+            }
+
+            # Update the factor object
+            factor.ic = metrics['ic']
+            factor.sharpe = metrics['sharpe']
+            factor.win_rate = metrics['win_rate']
+
+            # Cache
+            self._metric_cache[expr] = {k: v for k, v in metrics.items()
+                                         if k not in ('long_short_ret', 'factor_values')}
+
+            return metrics
+
+        except Exception as e:
+            import traceback
+            print(f"  [backtest] Factor evaluation failed for '{expr}': {e}")
+            traceback.print_exc()
+            return self._empty_metrics()
+
+    def _empty_metrics(self) -> Dict:
+        """Return a safe empty-result dict."""
         return {
-            'ic': ic,
-            'sharpe': sharpe,
-            'win_rate': win_rate,
+            'ic': 0.0, 'ic_ir': 0.0, 'sharpe': 0.0,
+            'win_rate': 0.5, 'max_drawdown': 0.0,
+            'long_short_ret': pd.Series(dtype=float),
+            'factor_values': pd.DataFrame(),
         }
+
+    def clear_cache(self):
+        """Clear cached factor values and metrics."""
+        self._eval_cache.clear()
+        self._metric_cache.clear()
+
+    def evaluate_batch(
+        self,
+        factors: List['CandidateFactor'],
+        max_workers: int = 4,
+    ) -> List[Dict]:
+        """
+        Evaluate multiple factors in parallel using ThreadPoolExecutor.
+
+        This is MUCH faster than sequential evaluation when there are
+        many factors to evaluate per round.
+
+        Args:
+            factors: List of CandidateFactor objects to evaluate.
+            max_workers: Number of parallel workers (default: 4).
+
+        Returns:
+            List of metric dicts, same order as `factors`.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        # Thread-safe cache lock (optional, dict writes are atomic in CPython
+        # for single keys, but we guard for correctness)
+        cache_lock = threading.Lock()
+
+        def _evaluate_one(factor):
+            """Worker function: evaluate one factor."""
+            expr = factor.expression
+
+            # --- Check cache (thread-safe read) ---
+            with cache_lock:
+                if expr in self._metric_cache:
+                    cached = self._metric_cache[expr].copy()
+                    factor.ic = cached['ic']
+                    factor.sharpe = cached['sharpe']
+                    factor.win_rate = cached['win_rate']
+                    return cached
+
+            # --- Evaluate ---
+            try:
+                metrics = self.evaluate(factor)
+                # Cache the result (thread-safe write)
+                with cache_lock:
+                    if expr not in self._metric_cache:
+                        self._metric_cache[expr] = {
+                            k: v for k, v in metrics.items()
+                            if k not in ('long_short_ret', 'factor_values')
+                        }
+                return metrics
+            except Exception as e:
+                print(f"  [backtest] Batch eval failed for '{expr}': {e}")
+                return self._empty_metrics()
+
+        results = [None] * len(factors)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_evaluate_one, factors[i]): i
+                for i in range(len(factors))
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = self._empty_metrics()
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Rank IC
+    # ------------------------------------------------------------------
+
+    def _compute_rank_ic(
+        self, factor_values: pd.DataFrame, forward_returns: pd.DataFrame
+    ) -> Tuple[float, float]:
+        """
+        Compute Rank IC (cross-sectional Spearman correlation) and ICIR.
+
+        Vectorized: computes ranks for all time periods at once,
+        then uses a fast column-wise correlation to approximate per-period IC.
+        For strict per-period Spearman, falls back to a vectorized
+        row-level correlation using numpy.
+
+        Returns:
+            (mean_ic, ic_ir) where ic_ir = mean_ic / std_ic
+        """
+        # --- Fast path: vectorized rank IC ---
+        # Rank across columns (cross-sectional rank for each time t)
+        fv_ranks = factor_values.rank(axis=1, numeric_only=True, pct=False)
+        fr_ranks = forward_returns.rank(axis=1, numeric_only=True, pct=False)
+
+        # Compute Pearson correlation of ranks along each row (time t)
+        # corr = sum((fv_r - fv_r_mean) * (fr_r - fr_r_mean)) / (std_fv * std_fr)
+        # Vectorized over all time periods:
+        fv_mean = fv_ranks.mean(axis=1)
+        fr_mean = fr_ranks.mean(axis=1)
+        fv_centered = fv_ranks.subtract(fv_mean, axis=0)
+        fr_centered = fr_ranks.subtract(fr_mean, axis=0)
+
+        numerator = (fv_centered * fr_centered).sum(axis=1)
+        denom = (
+            np.sqrt((fv_centered ** 2).sum(axis=1))
+            * np.sqrt((fr_centered ** 2).sum(axis=1))
+        )
+        ic_series = numerator / denom
+
+        # Handle edge cases
+        ic_series = ic_series.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if ic_series.empty:
+            return 0.0, 0.0
+
+        ic_arr = ic_series.values
+        mean_ic = float(np.mean(ic_arr))
+        std_ic = float(np.std(ic_arr, ddof=1))
+        ic_ir = mean_ic / std_ic if std_ic > 0 else 0.0
+
+        return mean_ic, ic_ir
+
+    # ------------------------------------------------------------------
+    # Quantile portfolio metrics
+    # ------------------------------------------------------------------
+
+    def _compute_quantile_metrics(
+        self,
+        factor_values: pd.DataFrame,
+        forward_returns: pd.DataFrame,
+        n_quantiles: int = 5,
+    ) -> Tuple[float, float, float, pd.Series]:
+        """
+        Build a long-short quantile portfolio and compute performance metrics.
+
+        For each period:
+          1. Sort stocks by factor value and assign to n_quantiles
+          2. Top quantile = long, bottom quantile = short
+          3. Long-short return = equal-weighted top return - equal-weighted bottom return
+
+        Returns:
+            (annualized_sharpe, win_rate, max_drawdown, long_short_returns_series)
+        """
+        long_short_rets = []
+
+        for t in range(len(factor_values)):
+            fv = factor_values.iloc[t]
+            fr = forward_returns.iloc[t]
+
+            mask = ~(fv.isna() | fr.isna())
+            n_valid = mask.sum()
+            if n_valid < n_quantiles * 3:
+                continue
+
+            fv_valid = fv[mask]
+            fr_valid = fr[mask]
+
+            # Assign quantile labels (1 = lowest, n_quantiles = highest)
+            try:
+                labels = pd.qcut(fv_valid, q=n_quantiles, labels=False, duplicates='drop')
+            except ValueError:
+                continue
+
+            # Compute equal-weighted return per quantile
+            top_mask = labels == labels.max()
+            bot_mask = labels == labels.min()
+
+            top_ret = fr_valid[top_mask].mean()
+            bot_ret = fr_valid[bot_mask].mean()
+
+            long_short_rets.append(top_ret - bot_ret)
+
+        if not long_short_rets:
+            return 0.0, 0.5, 0.0, pd.Series(dtype=float)
+
+        ls_series = pd.Series(long_short_rets, name='long_short')
+        sharpe = self._annualized_sharpe(ls_series)
+        win_rate = float((ls_series > 0).mean())
+        max_dd = self._max_drawdown(ls_series)
+
+        return sharpe, win_rate, max_dd, ls_series
+
+    # ------------------------------------------------------------------
+    # Portfolio statistics
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _annualized_sharpe(returns: pd.Series, rf: float = 0.02) -> float:
+        """
+        Compute annualised Sharpe ratio.
+
+        Assumes daily returns; annualises with sqrt(252).
+        """
+        if len(returns) < 2:
+            return 0.0
+        excess = returns - rf / 252.0
+        mean_ret = float(excess.mean())
+        std_ret = float(excess.std(ddof=1))
+        if std_ret == 0:
+            return 0.0
+        return (mean_ret / std_ret) * np.sqrt(252)
+
+    @staticmethod
+    def _max_drawdown(returns: pd.Series) -> float:
+        """
+        Compute maximum drawdown from a return series.
+
+        Returns a negative number (e.g., -0.15 = 15% drawdown).
+        """
+        if len(returns) < 2:
+            return 0.0
+        cumulative = (1 + returns).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        return float(drawdown.min())
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def compute_factor_values(self, expression: str) -> pd.DataFrame:
+        """Compute raw factor values for a given expression."""
+        return self.evaluator.evaluate(expression)
+
+    def rank_ic(self, expression: str) -> Tuple[float, float]:
+        """Compute Rank IC and ICIR for a factor expression."""
+        fv = self.compute_factor_values(expression)
+        return self._compute_rank_ic(fv, self._forward_returns)
+
+    def quantile_returns(
+        self, expression: str, n_quantiles: int = 5
+    ) -> Dict[int, pd.Series]:
+        """
+        Compute equal-weighted return series for each quantile.
+
+        Returns:
+            Dict mapping quantile index → return Series.
+        """
+        fv = self.compute_factor_values(expression)
+        result = {}
+
+        for t in range(len(fv)):
+            fv_t = fv.iloc[t]
+            fr_t = self._forward_returns.iloc[t]
+            mask = ~(fv_t.isna() | fr_t.isna())
+            if mask.sum() < n_quantiles * 2:
+                continue
+            try:
+                labels = pd.qcut(fv_t[mask], q=n_quantiles, labels=False, duplicates='drop')
+            except ValueError:
+                continue
+            for q in sorted(set(labels)):
+                ret = fr_t[mask][labels == q].mean()
+                result.setdefault(q, []).append(ret)
+
+        return {q: pd.Series(rets, name=f'Q{q}') for q, rets in result.items()}
 
 
 class SelfEvolvingGenerator:
@@ -89,17 +857,19 @@ class SelfEvolvingGenerator:
     Self-evolving factor generator.
     
     Generates factors through iterative evolution:
-    1. Generate seed factors
+    1. Generate seed factors (using LLM)
     2. Backtest and evaluate
-    3. Reflect on failures
-    4. Generate improvements
+    3. Reflect on failures (using LLM)
+    4. Generate improvements (using LLM)
     5. Repeat until convergence
     """
     
     def __init__(
         self,
-        llm_model: str = "deepseek-chat",
+        llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
         n_seeds: int = 20,
+        api_key: str = "",
+        base_url: str = "http://180.163.156.38:53000/v1",
     ):
         """
         Initialize self-evolving generator.
@@ -107,11 +877,309 @@ class SelfEvolvingGenerator:
         Args:
             llm_model: LLM model to use
             n_seeds: Number of seed factors
+            api_key: API key for LLM service. If empty, reads from config or env.
+            base_url: API base URL
         """
         self.llm_model = llm_model
         self.n_seeds = n_seeds
         
-    def generate_seed_factors(self, n_factors: int = 20) -> List[CandidateFactor]:
+        # Initialize OpenAI client for LLM calls
+        self.client = None
+        self.use_llm = False
+        
+        if OPENAI_AVAILABLE:
+            # Try to get API key from config file if not provided
+            if not api_key:
+                try:
+                    import yaml
+                    with open("config/config.yaml", "r", encoding="utf-8") as f:
+                        config = yaml.safe_load(f)
+                        api_key = config.get("llm", {}).get("generator", {}).get("api_key", "")
+                        if not base_url or base_url == "http://180.163.156.38:53000/v1":
+                            base_url = config.get("llm", {}).get("generator", {}).get("base_url", base_url)
+                            llm_model = config.get("llm", {}).get("generator", {}).get("model", llm_model)
+                except Exception:
+                    pass
+            
+            # Fallback to environment variable
+            if not api_key:
+                api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            
+            if api_key:
+                try:
+                    self.client = OpenAI(api_key=api_key, base_url=base_url)
+                    # Test connection
+                    test_resp = self.client.chat.completions.create(
+                        model=llm_model,
+                        messages=[{"role": "user", "content": "hi"}],
+                        max_tokens=5,
+                    )
+                    if not hasattr(test_resp, "choices"):
+                        raise RuntimeError(f"API test failed: unexpected response type {type(test_resp).__name__}")
+                    self.use_llm = True
+                    print(f"  [evolve] LLM client initialized: {llm_model} @ {base_url}")
+                    print(f"  [evolve] Connection test passed.")
+                except Exception as e:
+                    print(f"  [evolve] Warning: API connection test failed: {e}")
+                    print(f"  [evolve] Falling back to rule-based mode.")
+                    self.client = None
+                    self.use_llm = False
+            else:
+                print(f"  [evolve] Warning: No API key found. Set api_key in config or DEEPSEEK_API_KEY env var.")
+                print(f"  [evolve] Falling back to rule-based mode.")
+                self.use_llm = False
+        else:
+            print(f"  [evolve] openai package not installed. Running in rule-based mode.")
+            self.use_llm = False
+        
+    def _call_llm(self, system_prompt: str, user_prompt: str,
+                  temperature: float = 0.7, expect_json: bool = True) -> str:
+        """
+        Call LLM and return response content.
+        
+        Args:
+            system_prompt: System prompt for LLM
+            user_prompt: User prompt for LLM
+            temperature: Sampling temperature
+            expect_json: Whether to expect JSON response
+            
+        Returns:
+            LLM response content as string
+        """
+        if not self.client:
+            raise RuntimeError("LLM client not initialized. Check API key.")
+        
+        kwargs = dict(
+            model=self.llm_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            timeout=180,   # ← 防止 LLM 无限挂起，3 分钟超时
+        )
+        if expect_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        
+        try:
+            resp = self.client.chat.completions.create(**kwargs)
+            
+            # Validate response shape
+            if not hasattr(resp, "choices"):
+                resp_type = type(resp).__name__
+                resp_preview = str(resp)[:200]
+                raise RuntimeError(
+                    f"Unexpected LLM response type '{resp_type}'. "
+                    f"Response preview: {resp_preview}"
+                )
+            
+            content = resp.choices[0].message.content
+            if content is None:
+                raise RuntimeError("LLM returned empty content (None).")
+            return content
+            
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"  [evolve] LLM call failed ({type(e).__name__}): {e}")
+            print(f"  [evolve] Traceback (last frame): {tb.splitlines()[-1] if tb else 'N/A'}")
+            raise
+    
+    @staticmethod
+    def _fix_parentheses(expr: str) -> str:
+        """
+        Auto-fix unbalanced parentheses in factor expressions.
+
+        LLMs often generate expressions with wrong paren counts (e.g. one too few
+        closing parens). This method counts '(' vs ')' and appends the missing
+        closing parens to the end of the expression.
+
+        Returns the original expression if parentheses are already balanced.
+        """
+        n_open = expr.count('(')
+        n_close = expr.count(')')
+        if n_open > n_close:
+            fixed = expr + ')' * (n_open - n_close)
+            print(f"  [evolve] Auto-fixed parentheses: {expr!r} → {fixed!r}")
+            return fixed
+        if n_close > n_open:
+            # More closing than opening — strip trailing excess ')'
+            stripped = expr.rstrip(')')
+            excess = n_close - n_open
+            if excess > 0:
+                fixed = stripped + ')' * (n_close - excess)
+                print(f"  [evolve] Auto-fixed parentheses: {expr!r} → {fixed!r}")
+                return fixed
+        return expr
+
+    def _save_factors_to_file(self, factors: List['CandidateFactor'], round_id: int, subdir: str = "self_evolve"):
+        """
+        Save factors to experiments/results/{subdir}/round_{round_id}/generated_factors.json
+        """
+        import os
+        import json
+        
+        save_dir = os.path.join("experiments", "results", subdir, f"round_{round_id}")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        factors_dicts = [asdict(f) for f in factors]
+        save_path = os.path.join(save_dir, "generated_factors.json")
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(factors_dicts, f, indent=2, ensure_ascii=False)
+        
+        print(f"  [evolve] Saved {len(factors)} factors to {save_path}")
+
+    def _generate_reflection(self, evaluated_factors: List['CandidateFactor'], top_factors: List['CandidateFactor'], round_id: int = 0) -> str:
+        """
+        Generate reflection text based on backtest results.
+        
+        Analyzes successful and failed factors to produce strategic reflection notes,
+        which will be injected into the next round's LLM prompt to guide factor generation.
+        
+        Args:
+            evaluated_factors: All factors evaluated in this round
+            top_factors: Top-performing factors (IC > 0)
+            round_id: Current evolution round number
+            
+        Returns:
+            Reflection text (multi-line string)
+        """
+        import re
+        
+        if not evaluated_factors:
+            return "No factors evaluated in this round."
+        
+        # --- 1. Categorize factors by performance ---
+        successful = [f for f in evaluated_factors if f.ic is not None and f.ic > 0.02]
+        moderate = [f for f in evaluated_factors if f.ic is not None and 0 <= f.ic <= 0.02]
+        failed = [f for f in evaluated_factors if f.ic is not None and f.ic < 0]
+        negative_ic = [f for f in evaluated_factors if f.ic is not None and f.ic < -0.01]
+        
+        lines = []
+        lines.append(f"=== Reflection for Round {round_id + 1} ===")
+        lines.append(f"Total factors evaluated: {len(evaluated_factors)}")
+        lines.append(f"Successful (IC > 0.02): {len(successful)}")
+        lines.append(f"Moderate (0 <= IC <= 0.02): {len(moderate)}")
+        lines.append(f"Failed (IC < 0): {len(failed)}")
+        lines.append("")
+        
+        # --- 2. Analyze successful factors: common patterns ---
+        if successful:
+            lines.append("--- Successful Factor Patterns ---")
+            
+            # Extract expression features
+            momentum_count = 0
+            value_count = 0
+            quality_count = 0
+            volatility_count = 0
+            growth_count = 0
+            liquidity_count = 0
+            combo_count = 0  # Factors with 2+ operator types
+            
+            for f in successful:
+                expr = f.expression.lower()
+                features = []
+                if any(k in expr for k in ['ts_delta', 'ts_rank', 'momentum', 'return_']):
+                    momentum_count += 1
+                    features.append('momentum')
+                if any(k in expr for k in ['pe', 'pb', 'ps', 'value', 'roe', 'roa']):
+                    value_count += 1
+                    features.append('value')
+                if any(k in expr for k in ['roe', 'roa', 'margin', 'quality', 'debt']):
+                    quality_count += 1
+                    features.append('quality')
+                if any(k in expr for k in ['std', 'vol', 'var', 'risk']):
+                    volatility_count += 1
+                    features.append('volatility')
+                if any(k in expr for k in ['growth', 'revenue', 'eps']):
+                    growth_count += 1
+                    features.append('growth')
+                if any(k in expr for k in ['turnover', 'volume', 'liq']):
+                    liquidity_count += 1
+                    features.append('liquidity')
+                if len(features) >= 2:
+                    combo_count += 1
+            
+            lines.append(f"Feature distribution in successful factors:")
+            if momentum_count > 0:
+                lines.append(f"  - Momentum-related: {momentum_count}")
+            if value_count > 0:
+                lines.append(f"  - Value-related: {value_count}")
+            if quality_count > 0:
+                lines.append(f"  - Quality-related: {quality_count}")
+            if volatility_count > 0:
+                lines.append(f"  - Volatility-related: {volatility_count}")
+            if growth_count > 0:
+                lines.append(f"  - Growth-related: {growth_count}")
+            if liquidity_count > 0:
+                lines.append(f"  - Liquidity-related: {liquidity_count}")
+            if combo_count > 0:
+                lines.append(f"  - Combined (2+ features): {combo_count} → Suggest mixing factor types in next generation")
+            
+            # Top 3 successful factor expressions
+            top3 = sorted(successful, key=lambda x: x.ic, reverse=True)[:3]
+            lines.append("")
+            lines.append("Top successful factor expressions:")
+            for f in top3:
+                sharpe_str = f"{f.sharpe:.2f}" if f.sharpe else "N/A"
+                lines.append(f"  - IC={f.ic:.4f}, Sharpe={sharpe_str}: {f.expression}")
+            
+            lines.append("")
+        
+        # --- 3. Analyze failed factors: root causes ---
+        if failed:
+            lines.append("--- Failed Factor Analysis ---")
+            
+            # Check common issues
+            neg_momentum = [f for f in failed if any(k in f.expression.lower() for k in ['ts_delta', 'momentum'])]
+            neg_value = [f for f in failed if any(k in f.expression.lower() for k in ['pe', 'pb', 'value'])]
+            neg_volatile = [f for f in failed if 'std' in f.expression.lower() or 'vol' in f.expression.lower()]
+            too_complex = [f for f in failed if len(re.findall(r'[+\-*/()]', f.expression)) > 10]
+            
+            if neg_momentum:
+                lines.append(f"  - {len(neg_momentum)} momentum factors have negative IC → Consider reversing sign or adjusting window")
+            if neg_value:
+                lines.append(f"  - {len(neg_value)} value factors have negative IC → Current market may not favor value style")
+            if neg_volatile:
+                lines.append(f"  - {len(neg_volatile)} volatility factors have negative IC → Volatility may be mis-priced")
+            if too_complex:
+                lines.append(f"  - {len(too_complex)} factors are overly complex (too many operators) → Simplify expressions")
+            
+            lines.append("")
+        
+        # --- 4. Market state hints (if available) ---
+        # Check if factors have market state info
+        if hasattr(self, '_last_market_state') and self._last_market_state:
+            ms = self._last_market_state
+            lines.append("--- Market State Context ---")
+            lines.append(f"  Volatility: {ms.get('vol', 'N/A')}, Liquidity: {ms.get('liq', 'N/A')}")
+            lines.append(f"  Trend: {ms.get('trend', 'N/A')}, Correlation: {ms.get('corr', 'N/A')}")
+            lines.append("")
+        
+        # --- 5. Strategic suggestions for next round ---
+        lines.append("--- Suggestions for Next Generation ---")
+        if successful:
+            best = max(successful, key=lambda x: x.ic or 0)
+            lines.append(f"  1. Try extending the successful pattern: {best.expression[:50]}...")
+            if combo_count > 0:
+                lines.append("  2. Increase factor combinations (momentum + value, quality + reversal)")
+            if len(successful) < 5:
+                lines.append("  3. Current successful factors are few → Increase generation diversity (higher temperature)")
+            else:
+                lines.append("  3. Sufficient successful factors → Try fine-tuning window sizes")
+        else:
+            lines.append("  1. No successful factors this round → Try completely different factor templates")
+            lines.append("  2. Consider lowering LLM temperature to get more conservative factors")
+        
+        if failed and len(failed) > len(successful):
+            lines.append("  4. High failure rate → Add more fundamental filters (pe > 0, roe > 0)")
+        
+        lines.append("")
+        lines.append("=== End of Reflection ===")
+        
+        return "\n".join(lines)
+
+    def generate_seed_factors(self, n_factors: int = 20) -> List['CandidateFactor']:
         """
         Generate seed factors using LLM.
         
@@ -123,17 +1191,190 @@ class SelfEvolvingGenerator:
         """
         print(f"Generating {n_factors} seed factors...")
         
+        # Try to use LLM to generate factors
+        if self.use_llm and self.client:
+            try:
+                seed_factors = self._generate_factors_via_llm(n_factors)
+                if seed_factors and len(seed_factors) >= 1:
+                    print(f"Generated {len(seed_factors)} seed factors via LLM")
+                    self._save_factors_to_file(seed_factors, round_id=0)
+                    return seed_factors[:n_factors]
+            except Exception as e:
+                print(f"  [evolve] LLM factor generation failed: {e}")
+                print(f"  [evolve] Falling back to rule-based generation.")
+        
+        # Fallback: rule-based generation
+        print(f"  [evolve] Using rule-based factor generation.")
+        return self._generate_factors_rule_based(n_factors)
+    
+    def _generate_factors_via_llm(self, n_factors: int) -> List[CandidateFactor]:
+        """
+        Generate factors using LLM.
+        
+        Args:
+            n_factors: Number of factors to generate
+            
+        Returns:
+            List of candidate factors
+        """
+        system_prompt = """You are a quantitative factor research expert specializing in A-share stock selection.
+Your task is to generate diverse, economically meaningful factor expressions for stock selection.
+
+Supported data sources:
+- open, high, low, close, volume, amount (price and volume data)
+- pe, pb, roe, market_cap (fundamental data)
+
+Supported functions (WorldQuant style):
+- rank(X): cross-sectional percentile rank [0, 1]
+- ts_rank(X, w): rolling time-series rank within window w
+- ts_corr(X, Y, w): rolling correlation between X and Y over window w
+- ts_mean(X, w): rolling mean over window w
+- ts_std(X, w): rolling standard deviation over window w
+- ts_min(X, w): rolling minimum over window w
+- ts_max(X, w): rolling maximum over window w
+- ts_sum(X, w): rolling sum over window w
+- ts_delta(X, w): X - delay(X, w)
+- ts_zscore(X, w): rolling z-score over window w
+- delay(X, d): lag by d periods
+- sign(X): element-wise sign
+- abs(X): element-wise absolute value
+- log(X): element-wise natural log
+- sqrt(X): element-wise square root
+
+Supported operators: +, -, *, /, ^
+
+Factor categories to cover:
+1. Momentum: price trend, volume confirmation, reversal
+2. Value: valuation ratios, mean reversion
+3. Quality: profitability, earnings quality, balance sheet strength
+4. Liquidity: trading volume, turnover, bid-ask spread
+5. Growth: earnings growth, revenue growth, analyst revisions
+
+Return a JSON array of objects, each with "expression" and "description" keys.
+Ensure expressions are valid and can be evaluated by the factor engine."""
+
+        # Build user_prompt with valid JSON example (avoid f-string escaping issues)
+        json_example = json.dumps([
+            {"expression": "rank(ts_corr(close, volume, 20))", "description": "Price-volume correlation momentum"},
+            {"expression": "-rank(pe)", "description": "Value factor based on P/E ratio"},
+            {"expression": "rank(ts_zscore(roe, 60))", "description": "Quality factor based on ROE z-score"}
+        ], ensure_ascii=False)
+
+        user_prompt = (
+            f"Please generate {n_factors} diverse factor expressions for A-share stock selection.\n"
+            + "Requirements:\n"
+            + "1. Factors should be diverse and cover different categories (momentum, value, quality, liquidity, growth)\n"
+            + "2. Expressions must be valid and use only supported functions and data sources\n"
+            + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
+            + "4. Each factor should have economic intuition\n"
+            + "5. You MUST return exactly " + str(n_factors) + " factors\n"
+            + "6. Return strictly as a JSON array, no other text, no markdown fences\n"
+            + "\n"
+            + "Example (valid JSON array):\n"
+            + json_example + "\n\n"
+            + f"Please generate {n_factors} factors now. Return only the JSON array."
+        )
+
+        try:
+            raw = self._call_llm(system_prompt, user_prompt, temperature=0.7, expect_json=True)
+            factors_json = json.loads(raw)
+
+            # Handle case where LLM returns a dict instead of a list
+            if isinstance(factors_json, dict):
+                # Try to extract the list from common keys
+                for key in ["factors", "factor", "data", "results", "expressions"]:
+                    if key in factors_json and isinstance(factors_json[key], list):
+                        factors_json = factors_json[key]
+                        break
+                else:
+                    # If no recognized key, check if this dict is a single factor
+                    if "expression" in factors_json:
+                        factors_json = [factors_json]
+                    else:
+                        raise ValueError(
+                            f"Unexpected JSON structure from LLM. "
+                            f"Keys: {list(factors_json.keys())[:5]}"
+                        )
+
+            seed_factors = []
+            for i, f in enumerate(factors_json):
+                if not isinstance(f, dict) or "expression" not in f:
+                    continue
+                expr = self._fix_parentheses(f["expression"])
+                factor = CandidateFactor(
+                    id=f"seed_llm_{i}",
+                    expression=expr,
+                    description=f.get("description", f"LLM-generated factor {i}"),
+                    generation=0,
+                )
+                seed_factors.append(factor)
+            
+            return seed_factors
+            
+        except json.JSONDecodeError as e:
+            print(f"  [evolve] Failed to parse LLM response as JSON: {e}")
+            print(f"  [evolve] Raw response: {raw[:200] if 'raw' in locals() else 'N/A'}")
+            raise
+        except Exception as e:
+            raise
+    
+    def _generate_factors_rule_based(self, n_factors: int) -> List[CandidateFactor]:
+        """
+        Generate factors using rule-based method (fallback when LLM is unavailable).
+        
+        Args:
+            n_factors: Number of factors to generate
+            
+        Returns:
+            List of candidate factors
+        """
+        # Template expressions for different factor categories
+        templates = [
+            # Momentum factors
+            ("rank(ts_corr(close, volume, 20))", "Price-volume correlation momentum"),
+            ("rank(ts_delta(close, 5))", "Short-term price momentum"),
+            ("rank(ts_delta(close, 20))", "Medium-term price momentum"),
+            ("rank(ts_zscore(close, 20))", "Mean-reversion based on z-score"),
+            ("rank(ts_rank(close, 10))", "Short-term ranking momentum"),
+            # Value factors
+            ("-rank(pe)", "Value factor based on P/E ratio"),
+            ("-rank(pb)", "Value factor based on P/B ratio"),
+            ("rank(1 / pe)", "Earnings yield factor"),
+            ("rank(1 / pb)", "Book-to-market factor"),
+            # Quality factors
+            ("rank(ts_zscore(roe, 60))", "ROE quality factor"),
+            ("rank(roe)", "Direct ROE factor"),
+            ("rank(market_cap)", "Size factor (large-cap)"),
+            ("-rank(market_cap)", "Size factor (small-cap)"),
+            # Liquidity factors
+            ("rank(ts_mean(volume, 20))", "Average trading volume"),
+            ("rank(volume / delay(volume, 1))", "Volume change rate"),
+            ("rank(abs(ts_delta(close, 1)) / volume)", "Price impact (illiquidity)"),
+            # Combined factors
+            ("rank(ts_corr(close, volume, 20)) * -rank(pe)", "Combined momentum-value factor"),
+            ("rank(ts_zscore(close, 20)) * rank(roe)", "Combined momentum-quality factor"),
+            ("rank(ts_delta(close, 10)) * -rank(market_cap)", "Combined momentum-size factor"),
+        ]
+        
         seed_factors = []
         for i in range(n_factors):
+            template_idx = i % len(templates)
+            expr, desc = templates[template_idx]
+            
+            # Add slight variation to avoid exact duplicates
+            if i >= len(templates):
+                # Modify window size for time-series functions
+                import re
+                expr = re.sub(r'(\d+)', lambda m: str(max(5, int(m.group(1)) + (i % 10 - 5))), expr)
+            
             factor = CandidateFactor(
-                id=f"seed_{i}",
-                expression=f"rank(ts_corr(close, volume, {10 + i}))",
-                description=f"Time series correlation factor {i}",
+                id=f"seed_rule_{i}",
+                expression=expr,
+                description=desc,
                 generation=0,
             )
             seed_factors.append(factor)
         
-        print(f"Generated {len(seed_factors)} seed factors")
         return seed_factors
     
     def evolve(
@@ -163,13 +1404,16 @@ class SelfEvolvingGenerator:
         for round_id in range(n_rounds):
             print(f"\nRound {round_id + 1}/{n_rounds}")
             
-            # Evaluate current factors
+            # Evaluate current factors (parallel batch evaluation)
+            print(f"  Evaluating {len(current_factors)} factors (parallel)...")
+            metrics_list = backtester.evaluate_batch(current_factors, max_workers=4)
+            
             evaluated_factors = []
-            for factor in current_factors:
-                metrics = backtester.evaluate(factor)
-                factor.ic = metrics['ic']
-                factor.sharpe = metrics['sharpe']
-                factor.win_rate = metrics['win_rate']
+            for i, factor in enumerate(current_factors):
+                metrics = metrics_list[i]
+                factor.ic = metrics.get('ic', 0.0)
+                factor.sharpe = metrics.get('sharpe', 0.0)
+                factor.win_rate = metrics.get('win_rate', 0.5)
                 evaluated_factors.append(factor)
                 
                 if factor.ic > best_ic:
@@ -178,8 +1422,12 @@ class SelfEvolvingGenerator:
             # Select top factors
             top_factors = sorted(evaluated_factors, key=lambda x: x.ic, reverse=True)[:10]
             
-            # Generate improvements
-            improved_factors = self._generate_improvements(top_factors)
+            # Generate reflection based on backtest results
+            reflection_notes = self._generate_reflection(evaluated_factors, top_factors, round_id)
+            print(f"\n  [evolve] Reflection notes for round {round_id + 1}:\n{reflection_notes}\n")
+            
+            # Generate improvements (with reflection notes)
+            improved_factors = self._generate_improvements(top_factors, round_id, reflection_notes)
             
             # Record evolution round
             round_record = EvolutionRound(
@@ -216,9 +1464,140 @@ class SelfEvolvingGenerator:
             total_rounds=len(evolution_history),
         )
     
-    def _generate_improvements(self, top_factors: List[CandidateFactor]) -> List[CandidateFactor]:
+    def _generate_improvements(self, top_factors: List['CandidateFactor'], round_id: int = 0, reflection_notes: str = "") -> List['CandidateFactor']:
         """
         Generate improved factors based on top performers.
+        
+        Args:
+            top_factors: Top-performing factors
+            
+        Returns:
+            List of improved factors
+        """
+        # Try to use LLM to generate improvements
+        if self.use_llm and self.client:
+            try:
+                improved_factors = self._generate_improvements_via_llm(top_factors, round_id, reflection_notes)
+                if improved_factors and len(improved_factors) >= len(top_factors) // 2:
+                    print(f"  [evolve] Generated {len(improved_factors)} improved factors via LLM")
+                    return improved_factors
+            except Exception as e:
+                print(f"  [evolve] LLM improvement generation failed: {e}")
+                print(f"  [evolve] Falling back to rule-based improvement.")
+        
+        # Fallback: rule-based improvement
+        print(f"  [evolve] Using rule-based factor improvement.")
+        return self._generate_improvements_rule_based(top_factors)
+    
+    def _generate_improvements_via_llm(self, top_factors: List['CandidateFactor'], round_id: int = 0, reflection_notes: str = "") -> List['CandidateFactor']:
+        """
+        Generate improved factors using LLM.
+        
+        Args:
+            top_factors: Top-performing factors
+            
+        Returns:
+            List of improved factors
+        """
+        system_prompt = """You are a quantitative factor research expert specializing in factor improvement.
+Your task is to analyze top-performing factors and generate improved versions.
+
+Supported operations for factor improvement:
+1. Parameter tuning: Adjust window sizes (e.g., change 20 to 10 or 40)
+2. Combination: Combine multiple good factors using arithmetic operations
+3. Nonlinear transformation: Apply log, sqrt, abs, sign to enhance signal
+4. Cross-sectional ranking: Apply rank() to normalize signals
+5. Time-series operations: Use ts_zscore, ts_rank, ts_mean for robustness
+6. Fundamental integration: Combine price signals with pe, pb, roe, market_cap
+
+Guidelines:
+- Improvements should be non-trivial (not just changing window size by 1)
+- Avoid overfitting: don't create overly complex expressions
+- Ensure expressions are valid and can be evaluated
+- Return a JSON array of objects with "expression" and "description" keys"""
+
+        # Build prompt with top factors and reflection notes
+        factors_str = "\n".join([
+            f"  {f.id}: {f.expression} (IC={f.ic:.4f}, Sharpe={f.sharpe:.2f}) - {f.description}"
+            for f in top_factors[:10]  # Only show top 10 to avoid prompt overflow
+        ])
+        
+        # Build reflection section
+        reflection_section = ""
+        if reflection_notes:
+            # Truncate to avoid prompt overflow (keep last 1500 chars)
+            notes_truncated = reflection_notes[-1500:] if len(reflection_notes) > 1500 else reflection_notes
+            reflection_section = f"""
+=== Reflection Notes from Previous Round ===
+{notes_truncated}
+
+Use these reflection notes to guide your improvements:
+- Avoid the failure patterns mentioned above
+- Extend the successful factor patterns
+- Consider the strategic suggestions when generating new factors
+=== End of Reflection Notes ===
+"""
+        
+        user_prompt = f"""Based on the following top-performing factors, generate improved versions.
+
+Top factors:
+{factors_str}
+{reflection_section}
+Requirements:
+1. Generate {len(top_factors)} improved factors
+2. Each improvement should be based on one or more of the top factors
+3. Improvements can include:
+   - Parameter tuning (change window sizes)
+   - Factor combination (combine 2-3 good factors)
+   - Adding fundamental data (pe, pb, roe, market_cap)
+   - Applying nonlinear transformations
+4. Ensure expressions are valid and diverse
+5. Return strictly as a JSON array
+
+Example format:
+[
+  {{"expression": "rank(ts_corr(close, volume, 10))", "description": "Improved momentum factor with shorter window"}},
+  {{"expression": "rank(ts_corr(close, volume, 20)) * -rank(pe)", "description": "Combined momentum-value factor"}}
+]
+
+Please generate improved factors now. Return only the JSON array, no other text."""
+
+        try:
+            raw = self._call_llm(system_prompt, user_prompt, temperature=0.8, expect_json=True)
+            factors_json = json.loads(raw)
+            
+            improved_factors = []
+            for i, f in enumerate(factors_json):
+                if not isinstance(f, dict) or "expression" not in f:
+                    continue
+                expr = self._fix_parentheses(f["expression"])
+                # Find parent factor
+                parent_id = top_factors[i % len(top_factors)].id if top_factors else None
+                
+                factor = CandidateFactor(
+                    id=f"improved_llm_{parent_id}_{i}" if parent_id else f"improved_llm_{i}",
+                    expression=expr,
+                    description=f.get("description", f"LLM-improved factor {i}"),
+                    parent_id=parent_id,
+                    generation=(top_factors[0].generation + 1) if top_factors else 1,
+                )
+                improved_factors.append(factor)
+            
+            # Save LLM-generated factors for this round (1-based: round_1, round_2, ...)
+            self._save_factors_to_file(improved_factors, round_id + 1)
+            
+            return improved_factors
+            
+        except json.JSONDecodeError as e:
+            print(f"  [evolve] Failed to parse LLM response as JSON: {e}")
+            print(f"  [evolve] Raw response: {raw[:200] if 'raw' in locals() else 'N/A'}")
+            raise
+        except Exception as e:
+            raise
+    
+    def _generate_improvements_rule_based(self, top_factors: List['CandidateFactor'], reflection_notes: str = "") -> List['CandidateFactor']:
+        """
+        Generate improved factors using rule-based method (fallback when LLM is unavailable).
         
         Args:
             top_factors: Top-performing factors
@@ -229,17 +1608,91 @@ class SelfEvolvingGenerator:
         improved_factors = []
         
         for i, factor in enumerate(top_factors):
-            # Generate mutation (in practice, use LLM)
-            improved = CandidateFactor(
-                id=f"improved_{factor.id}_{i}",
-                expression=f"rank({factor.expression} * rank(returns))",
-                description=f"Improved version of {factor.description}",
-                parent_id=factor.id,
-                generation=factor.generation + 1,
-            )
-            improved_factors.append(improved)
+            # Generate multiple improvement strategies
+            improvements = [
+                # Strategy 1: Adjust window size
+                self._adjust_window_size(factor.expression),
+                # Strategy 2: Add fundamental data
+                self._add_fundamental_signal(factor.expression),
+                # Strategy 3: Apply nonlinear transformation
+                self._apply_nonlinear_transform(factor.expression),
+                # Strategy 4: Combine with another top factor
+                self._combine_factors(factor.expression, top_factors[(i + 1) % len(top_factors)].expression) if len(top_factors) > 1 else factor.expression,
+            ]
+            
+            for j, improved_expr in enumerate(improvements):
+                if improved_expr and improved_expr != factor.expression:
+                    improved = CandidateFactor(
+                        id=f"improved_rule_{factor.id}_{i}_{j}",
+                        expression=improved_expr,
+                        description=f"Rule-based improvement of {factor.description} (strategy {j+1})",
+                        parent_id=factor.id,
+                        generation=factor.generation + 1,
+                    )
+                    improved_factors.append(improved)
         
         return improved_factors
+    
+    def _adjust_window_size(self, expression: str) -> str:
+        """Adjust window size in time-series functions."""
+        import re
+        import random
+        random.seed(42)  # For reproducibility
+        
+        # Find all numeric arguments in functions like ts_corr(..., w), ts_mean(..., w)
+        # Pattern matches numbers after a comma (window sizes)
+        def adjust_match(m):
+            num_str = m.group(0)
+            num = int(num_str)
+            # Only adjust numbers in the 5-60 range (likely window sizes)
+            if 5 <= num <= 60:
+                adjustment = random.randint(-10, 10)
+                return str(max(5, num + adjustment))
+            return num_str
+        
+        # Simple approach: find all numbers and adjust those that look like window sizes
+        # This is a simplification - in practice, we should parse the expression properly
+        words = expression.split('(')
+        result = []
+        for i, word in enumerate(words):
+            if i > 0:  # Not the first word
+                # Find numbers after commas
+                parts = word.split(',')
+                for j in range(1, len(parts)):  # Skip first part (function name or first arg)
+                    # Extract leading number
+                    num_match = re.match(r'\s*(\d+)', parts[j])
+                    if num_match:
+                        num = int(num_match.group(1))
+                        if 5 <= num <= 60:
+                            adjustment = random.randint(-10, 10)
+                            new_num = max(5, num + adjustment)
+                            parts[j] = parts[j].replace(str(num), str(new_num), 1)
+                result.append(','.join(parts))
+            else:
+                result.append(word)
+        
+        return '('.join(result)
+    
+    def _add_fundamental_signal(self, expression: str) -> str:
+        """Add fundamental signal to factor expression."""
+        import random
+        fundamental = random.choice(['pe', 'pb', 'roe', 'market_cap'])
+        if random.random() < 0.5:
+            return f"rank({expression}) * -rank({fundamental})"
+        else:
+            return f"rank({expression}) + rank(-{fundamental})"
+    
+    def _apply_nonlinear_transform(self, expression: str) -> str:
+        """Apply nonlinear transformation to factor expression."""
+        import random
+        transform = random.choice(['log', 'sqrt', 'abs', 'sign'])
+        return f"{transform}({expression})"
+    
+    def _combine_factors(self, expr1: str, expr2: str) -> str:
+        """Combine two factor expressions."""
+        import random
+        op = random.choice(['*', '+'])
+        return f"rank({expr1}) {op} rank({expr2})"
     
     def _check_convergence(self, history: List[EvolutionRound]) -> bool:
         """
@@ -267,33 +1720,54 @@ if __name__ == '__main__':
     
     # Generate sample data
     np.random.seed(42)
-    n_dates = 100
+    n_dates = 252
     n_stocks = 50
     
     dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
     stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
     
-    prices = pd.DataFrame(
-        10 + np.cumsum(np.random.randn(n_dates, n_stocks) * 0.02, axis=0),
-        index=dates,
-        columns=stock_codes,
+    # Price data (random walk with drift)
+    close_prices = pd.DataFrame(
+        10 + np.cumsum(np.random.randn(n_dates, n_stocks) * 0.02 + 0.0005, axis=0),
+        index=dates, columns=stock_codes,
+    )
+    volume_data = pd.DataFrame(
+        np.abs(np.random.randn(n_dates, n_stocks) * 1e6 + 5e6),
+        index=dates, columns=stock_codes,
     )
     
-    # Initialize generator
-    generator = SelfEvolvingGenerator()
+    # Initialize backtester with full data
+    backtester = FactorBacktester(
+        prices=close_prices,
+        volume=volume_data,
+        forward_period=20,
+    )
     
-    # Generate seed factors
-    seed_factors = generator.generate_seed_factors(10)
+    # Test expression evaluation
+    print("Testing expression evaluator...")
+    expr1 = "rank(ts_corr(close, volume, 20))"
+    fv1 = backtester.compute_factor_values(expr1)
+    print(f"  {expr1}: shape={fv1.shape}, nan={fv1.isna().sum().sum()}")
     
-    # Initialize backtester
-    backtester = FactorBacktester(prices)
+    expr2 = "rank(ts_delta(close, 5))"
+    fv2 = backtester.compute_factor_values(expr2)
+    print(f"  {expr2}: shape={fv2.shape}, nan={fv2.isna().sum().sum()}")
     
-    # Run evolution
-    result = generator.evolve(seed_factors, backtester, n_rounds=5)
+    expr3 = "ts_zscore(close, 20) * -1"
+    fv3 = backtester.compute_factor_values(expr3)
+    print(f"  {expr3}: shape={fv3.shape}, nan={fv3.isna().sum().sum()}")
     
-    print(f"\nEvolution Complete!")
-    print(f"  Total rounds: {result.total_rounds}")
-    print(f"  Best IC: {result.best_ic:.4f}")
-    print(f"  Number of best factors: {len(result.best_factors)}")
+    # Test full evaluation
+    print("\nTesting factor evaluation...")
+    from dataclasses import dataclass
+    TestFactor = type('TestFactor', (), {
+        '__init__': lambda self, e: setattr(self, 'expression', e),
+    })
+    
+    for expr in [expr1, expr2, expr3]:
+        f = TestFactor(expr)
+        m = backtester.evaluate(f)
+        print(f"  {expr}: IC={m['ic']:.4f}, Sharpe={m['sharpe']:.2f}, "
+              f"WinRate={m['win_rate']:.2%}, MaxDD={m['max_drawdown']:.2%}")
     
     print("\n=== Demo Complete ===")

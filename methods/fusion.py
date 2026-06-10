@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Factor Fusion & Portfolio Construction
 ========================================
@@ -77,7 +78,7 @@ class FactorNormalizer:
         for date in result.index:
             row = result.loc[date].dropna()
             if len(row) < 5:
-                result.loc[date] = np.nan
+                # 有效值太少，跳过归一化，保留原值（不设为NaN）
                 continue
 
             if self.method == "zscore":
@@ -142,6 +143,7 @@ class FactorInfo:
     ic: float = 0.0
     ic_std: float = 0.0
     sharpe: float = 0.0
+    debate_score: float = 0.0  # 0-10, from multi-agent debate
     values: Optional[pd.DataFrame] = None  # index=date, columns=stock_code
 
     @property
@@ -215,22 +217,15 @@ class FactorFusion:
             weights = raw_weights
 
         # 3. 归一化各因子值 + 加权求和
-        first_date = None
-        for f in factors:
-            fv = factor_values[f.name]
-            fv_normalized = self.normalizer.normalize(fv, industry)
-            if first_date is None:
-                first_date = fv_normalized.index
-            else:
-                first_date = first_date.intersection(fv_normalized.index)
-
         weighted = None
+        # Align all factor DataFrames to a common date index
+        common_dates = factor_values[factors[0].name].index
+        for fv in factor_values.values():
+            common_dates = common_dates.intersection(fv.index)
+
         for f in factors:
             fv = self.normalizer.normalize(factor_values[f.name], industry)
             w = weights.get(f.name, 1.0 / n)
-
-            # 对齐日期
-            common_dates = first_date.intersection(fv.index)
             fv_aligned = fv.loc[common_dates] * w
 
             if weighted is None:
@@ -252,34 +247,47 @@ class FactorFusion:
         return composite_scores, meta
 
     def _compute_weights(self, factors: list[FactorInfo]) -> dict[str, float]:
-        """根据策略计算各因子的原始权重"""
+        """根据策略计算各因子的原始权重（含辩论分数融合）"""
         n = len(factors)
         names = [f.name for f in factors]
 
+        # Compute raw weights by strategy
         if self.strategy == "equal":
-            return {name: 1.0 / n for name in names}
-
+            weights = {name: 1.0 / n for name in names}
         elif self.strategy == "ic_weighted":
             ics = np.array([abs(f.ic) for f in factors])
             total = ics.sum()
             if total < 1e-8:
-                return {name: 1.0 / n for name in names}
-            return {f.name: abs(f.ic) / total for f in factors}
-
+                weights = {name: 1.0 / n for name in names}
+            else:
+                weights = {f.name: abs(f.ic) / total for f in factors}
         elif self.strategy == "icir_weighted":
             icirs = np.array([max(f.icir, 0.0) for f in factors])
             total = icirs.sum()
             if total < 1e-8:
-                return {name: 1.0 / n for name in names}
-            return {f.name: icirs[i] / total for i, f in enumerate(factors)}
-
+                weights = {name: 1.0 / n for name in names}
+            else:
+                weights = {f.name: icirs[i] / total for i, f in enumerate(factors)}
         elif self.strategy == "decay_weighted":
-            # 按时间衰减（假设列表顺序由新到旧）
             decay_weights = np.exp(-0.3 * np.arange(n))
             total = decay_weights.sum()
-            return {f.name: decay_weights[i] / total for i, f in enumerate(factors)}
+            weights = {f.name: decay_weights[i] / total for i, f in enumerate(factors)}
+        else:
+            weights = {name: 1.0 / n for name in names}
 
-        return {name: 1.0 / n for name in names}
+        # Blend with debate scores (if any factor has a non-zero debate score)
+        debate_scores = np.array([getattr(f, 'debate_score', 0.0) for f in factors])
+        if debate_scores.max() > 0:
+            # Normalize to [0,1], then blend: final = raw * (0.3 + 0.7 * norm)
+            norm = np.clip(debate_scores, 0.0, 10.0) / 10.0  # [0,1]
+            blend_factor = 0.3 + 0.7 * norm  # [0.3, 1.0]
+            for i, f in enumerate(factors):
+                weights[f.name] *= blend_factor[i]
+            # Renormalize
+            total = sum(weights.values())
+            weights = {k: v / total for k, v in weights.items()}
+
+        return weights
 
     def _apply_corr_penalty(
         self,
@@ -403,22 +411,43 @@ class PortfolioConstructor:
         """
         portfolios = []
         rebalance_dates = self._get_rebalance_dates(composite_scores)
+        if len(rebalance_dates) == 0:
+            return portfolios
 
+        skipped_no_scores = 0
+        skipped_no_prices = 0
         for i, date in enumerate(rebalance_dates):
             scores = composite_scores.loc[date].dropna()
-            if len(scores) < self.config.top_n:
+            if len(scores) == 0:
+                skipped_no_scores += 1
                 continue
 
-            # 过滤停牌
-            if date in prices.index:
-                valid_prices = prices.loc[date].dropna()
-                scores = scores[scores.index.isin(valid_prices.index)]
+            actual_top_n = min(self.config.top_n, len(scores))
 
-            if len(scores) < self.config.top_n:
+            # 过滤停牌：用 get_loc 精确匹配，避免 loc 返回全 NaN 行
+            if isinstance(date, pd.Timestamp):
+                try:
+                    loc_idx = prices.index.get_loc(date)
+                    row = prices.iloc[loc_idx]
+                except KeyError:
+                    row = pd.Series(index=prices.columns, dtype=float)
+            else:
+                row = prices.loc[date] if date in prices.index else pd.Series(index=prices.columns, dtype=float)
+            valid_prices = row.dropna()
+
+            if len(valid_prices) > 0:
+                scores = scores[scores.index.isin(valid_prices.index)]
+            else:
+                # All stocks have missing prices — skip this date
+                skipped_no_prices += 1
+                continue
+
+            if len(scores) < actual_top_n:
+                skipped_no_scores += 1
                 continue
 
             # 选择 Top-N
-            top_scores = scores.nlargest(self.config.top_n)
+            top_scores = scores.nlargest(actual_top_n)
 
             # 分配权重
             weights = self._allocate_weights(top_scores, market_cap, date, industry)
@@ -501,7 +530,12 @@ class PortfolioConstructor:
     @staticmethod
     def _get_rebalance_dates(scores: pd.DataFrame) -> list:
         """获取调仓日期列表"""
-        return sorted(scores.dropna(how="all", thresh=10).index.tolist())
+        n_cols = scores.shape[1]
+        thresh = max(1, n_cols // 10)
+        valid = scores.dropna(thresh=thresh)
+        if len(valid) == 0 and n_cols > 0:
+            valid = scores.dropna(thresh=1)
+        return sorted(valid.index.tolist())
 
     @staticmethod
     def _compute_turnover(new: pd.Series, old: pd.Series) -> float:

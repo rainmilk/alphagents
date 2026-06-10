@@ -1,8 +1,9 @@
+# -*- coding: utf-8 -*-
 """
 Data Loader Module
 
 This module handles:
-1. Loading stock data from various sources (Tushare, AkShare, local files)
+1. Loading stock data from various sources (Tushare, AkShare, local files, westock)
 2. Preprocessing (missing values, outliers, normalization)
 3. Feature engineering (technical indicators, fundamental features)
 4. Train/test splitting
@@ -12,6 +13,7 @@ Date: 2026-06-07
 """
 
 import os
+import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
@@ -20,6 +22,961 @@ import yaml
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_path(universe: str, start_date: str, end_date: str) -> str:
+    """Build a consistent cache file path."""
+    os.makedirs('data', exist_ok=True)
+    return f"data/cache_{universe}_{start_date}_{end_date}.pkl"
+
+
+def _save_cache(cache_file: str, price_data, fundamental_data, industry_data):
+    """Persist loaded data to a pickle cache. Skips if price data is all-NaN."""
+    close = price_data.get('close')
+    if close is not None and close.isna().all().all():
+        print(f"  [cache] Refusing to cache all-NaN price data")
+        return
+    with open(cache_file, 'wb') as f:
+        pd.to_pickle((price_data, fundamental_data, industry_data), f)
+
+
+def _load_cache(cache_file: str):
+    """Load data from a pickle cache. Returns None if cache doesn't exist."""
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            return pd.read_pickle(f)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Raw data persistence helpers
+# ---------------------------------------------------------------------------
+
+RAW_DATA_DIR = "data/raw"
+
+def _ensure_raw_dir(subdir: str) -> str:
+    """Create raw data subdirectory and return its path."""
+    path = os.path.join(RAW_DATA_DIR, subdir)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _save_raw_csv(df: pd.DataFrame, relpath: str, index: bool = True):
+    """Save a DataFrame as CSV to data/raw/... with utf-8-sig encoding."""
+    full_path = os.path.join(RAW_DATA_DIR, relpath)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    df.to_csv(full_path, index=index, encoding='utf-8-sig')
+    n_rows, n_cols = df.shape
+    print(f"  [raw] Saved {full_path}  ({n_rows} rows x {n_cols} cols)")
+
+def _save_raw_parquet(df: pd.DataFrame, relpath: str):
+    """Save a DataFrame as Parquet to data/raw/... (fast & compact)."""
+    full_path = os.path.join(RAW_DATA_DIR, relpath)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    df.to_parquet(full_path)
+    n_rows, n_cols = df.shape
+    print(f"  [raw] Saved {full_path}  ({n_rows} rows x {n_cols} cols)")
+
+def _generate_column_mapping_json(output_path: str = "data/column_mapping.json"):
+    """
+    Generate a comprehensive JSON file documenting the field mapping
+    between each data source's raw column names and the project's
+    standardised field names.
+    """
+    mapping = {
+        "description": (
+            "A-share multi-source data field mapping. "
+            "Documents how each data provider's raw column names map to "
+            "the project's canonical field names used in price_data / "
+            "fundamental_data / industry_series."
+        ),
+        "version": "1.0",
+        "canonical_fields": {
+            "price": {
+                "open":   {"type": "float64", "unit": "CNY",     "desc": "Open price"},
+                "high":   {"type": "float64", "unit": "CNY",     "desc": "Highest price"},
+                "low":    {"type": "float64", "unit": "CNY",     "desc": "Lowest price"},
+                "close":  {"type": "float64", "unit": "CNY",     "desc": "Close price"},
+                "volume": {"type": "float64", "unit": "shares",  "desc": "Trading volume (shares)"},
+                "amount": {"type": "float64", "unit": "CNY",     "desc": "Trading amount"},
+            },
+            "fundamental": {
+                "pe":         {"type": "float64", "unit": "倍",    "desc": "P/E ratio (TTM)"},
+                "pb":         {"type": "float64", "unit": "倍",    "desc": "P/B ratio"},
+                "roe":        {"type": "float64", "unit": "ratio", "desc": "Return on Equity"},
+                "market_cap": {"type": "float64", "unit": "亿元",  "desc": "Total market cap"},
+            },
+            "industry": {
+                "code":          {"type": "str",     "desc": "Stock code"},
+                "industry_name": {"type": "str",     "desc": "Industry classification"},
+            },
+        },
+        "sources": {
+            "akshare": {
+                "description": "AkShare open-source Python library (free, no token).",
+                "endpoints": {
+                    "stock_zh_a_hist": {
+                        "description": "Individual stock daily K-line (unadjusted).",
+                        "url_hint": "ak.stock_zh_a_hist(symbol, period='daily', start_date=..., end_date=..., adjust='')",
+                        "columns": {
+                            "日期":   {"canonical": "date",      "type": "datetime", "nullable": False},
+                            "开盘":   {"canonical": "open",      "type": "float64",  "nullable": True},
+                            "收盘":   {"canonical": "close",     "type": "float64",  "nullable": True},
+                            "最高":   {"canonical": "high",      "type": "float64",  "nullable": True},
+                            "最低":   {"canonical": "low",       "type": "float64",  "nullable": True},
+                            "成交量": {"canonical": "volume",    "type": "int64",    "nullable": True,   "note": "unit: shares"},
+                            "成交额": {"canonical": "amount",    "type": "float64",  "nullable": True,   "note": "unit: CNY"},
+                            "振幅":   {"canonical": "amplitude", "type": "float64",  "nullable": True,   "note": "%"},
+                            "涨跌幅": {"canonical": "pct_change","type": "float64",  "nullable": True,   "note": "%"},
+                            "涨跌额": {"canonical": "change",    "type": "float64",  "nullable": True,   "note": "CNY"},
+                            "换手率": {"canonical": "turnover",  "type": "float64",  "nullable": True,   "note": "%"},
+                        },
+                    },
+                    "stock_zh_a_spot_em": {
+                        "description": "Real-time A-share snapshot (used for fundamental data fill).",
+                        "url_hint": "ak.stock_zh_a_spot_em()",
+                        "columns": {
+                            "代码":         {"canonical": "code",                 "type": "str"},
+                            "名称":         {"canonical": "name",                 "type": "str"},
+                            "最新价":       {"canonical": "latest_price",         "type": "float64"},
+                            "今开":         {"canonical": "open",                 "type": "float64"},
+                            "最高":         {"canonical": "high",                 "type": "float64"},
+                            "最低":         {"canonical": "low",                  "type": "float64"},
+                            "昨收":         {"canonical": "prev_close",           "type": "float64"},
+                            "市盈率-动态":   {"canonical": "pe",                   "type": "float64",  "note": "TTM P/E"},
+                            "市净率":       {"canonical": "pb",                   "type": "float64"},
+                            "总市值":       {"canonical": "market_cap_raw",       "type": "float64",  "note": "unit: CNY; divided by 1e8 → canonical(亿元)"},
+                            "流通市值":     {"canonical": "circulating_market_cap","type": "float64", "note": "unit: CNY"},
+                            "成交量":       {"canonical": "volume",               "type": "int64"},
+                            "成交额":       {"canonical": "amount",               "type": "float64"},
+                            "换手率":       {"canonical": "turnover",             "type": "float64",  "note": "%"},
+                            "涨跌幅":       {"canonical": "pct_change",           "type": "float64",  "note": "%"},
+                            "量比":         {"canonical": "volume_ratio",         "type": "float64"},
+                            "60日涨跌幅":   {"canonical": "pct_change_60d",       "type": "float64"},
+                            "年初至今涨跌幅":{"canonical": "pct_change_ytd",      "type": "float64"},
+                        },
+                    },
+                    "stock_industry_category_rsri": {
+                        "description": "Shenwan industry classification.",
+                        "url_hint": "ak.stock_industry_category_rsri()",
+                        "columns": {
+                            "代码": {"canonical": "code", "type": "str"},
+                            "名称": {"canonical": "name", "type": "str"},
+                            "行业": {"canonical": "industry_name", "type": "str"},
+                        },
+                    },
+                },
+            },
+            "tushare": {
+                "description": "Tushare Pro API (requires token).",
+                "endpoints": {
+                    "daily": {
+                        "description": "Daily K-line (already adjusted).",
+                        "url_hint": "pro.daily(ts_code=..., start_date=..., end_date=...)",
+                        "columns": {
+                            "ts_code":    {"canonical": "code",       "type": "str"},
+                            "trade_date": {"canonical": "date",       "type": "datetime"},
+                            "open":       {"canonical": "open",       "type": "float64"},
+                            "high":       {"canonical": "high",       "type": "float64"},
+                            "low":        {"canonical": "low",        "type": "float64"},
+                            "close":      {"canonical": "close",      "type": "float64"},
+                            "pre_close":  {"canonical": "prev_close", "type": "float64"},
+                            "change":     {"canonical": "change",     "type": "float64"},
+                            "pct_chg":    {"canonical": "pct_change", "type": "float64", "note": "%"},
+                            "vol":        {"canonical": "volume",     "type": "float64", "note": "unit: lots (=100 shares); loader uses as-is"},
+                            "amount":     {"canonical": "amount",     "type": "float64", "note": "unit: 千元; loader uses as-is"},
+                        },
+                    },
+                    "daily_basic": {
+                        "description": "Daily fundamental indicators.",
+                        "url_hint": "pro.daily_basic(ts_code=..., trade_date=..., fields='ts_code,pe_ttm,pb,roe,total_mv')",
+                        "columns": {
+                            "ts_code":    {"canonical": "code",       "type": "str"},
+                            "trade_date": {"canonical": "date",       "type": "datetime"},
+                            "pe_ttm":     {"canonical": "pe",         "type": "float64", "note": "TTM P/E"},
+                            "pb":         {"canonical": "pb",         "type": "float64"},
+                            "roe":        {"canonical": "roe",        "type": "float64", "note": "raw is %; loader divides by 100"},
+                            "total_mv":   {"canonical": "market_cap", "type": "float64", "note": "unit: 万元; loader divides by 10000 → 亿元"},
+                        },
+                    },
+                    "stock_basic": {
+                        "description": "Stock basic info + industry classification.",
+                        "url_hint": "pro.stock_basic(exchange='', list_status='L', fields='ts_code,industry')",
+                        "columns": {
+                            "ts_code":  {"canonical": "code",          "type": "str"},
+                            "industry": {"canonical": "industry_name", "type": "str"},
+                        },
+                    },
+                },
+            },
+            "westock": {
+                "description": "WorkBuddy built-in westock-data skill.",
+                "endpoints": {
+                    "get_daily_kline": {
+                        "description": "Per-stock daily K-line.",
+                        "url_hint": "westock.get_daily_kline(code, start, end, fields=[...])",
+                        "columns": {
+                            "open":   {"canonical": "open",   "type": "float64"},
+                            "high":   {"canonical": "high",   "type": "float64"},
+                            "low":    {"canonical": "low",    "type": "float64"},
+                            "close":  {"canonical": "close",  "type": "float64"},
+                            "volume": {"canonical": "volume", "type": "float64"},
+                            "amount": {"canonical": "amount", "type": "float64"},
+                        },
+                    },
+                    "get_fundamentals": {
+                        "description": "Batch fundamental data.",
+                        "url_hint": "westock.get_fundamentals(codes, factor, start, end)",
+                        "columns": {
+                            "pe":         {"canonical": "pe",         "type": "float64"},
+                            "pb":         {"canonical": "pb",         "type": "float64"},
+                            "roe":        {"canonical": "roe",        "type": "float64"},
+                            "market_cap": {"canonical": "market_cap", "type": "float64"},
+                        },
+                    },
+                    "get_industry_classification": {
+                        "description": "Industry classification dict.",
+                        "url_hint": "westock.get_industry_classification(codes)",
+                        "columns": {
+                            "code":          {"canonical": "code",          "type": "str"},
+                            "industry_name": {"canonical": "industry_name", "type": "str"},
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else "data", exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
+    print(f"  [raw] Column mapping saved to {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Real data loader (westock / AkShare / Tushare)
+# ---------------------------------------------------------------------------
+
+def load_real_data(
+    universe: str = "hs300",
+    start_date: str = "2022-01-01",
+    end_date: str = "2024-12-31",
+    source: str = "westock",
+    force_refresh: bool = False,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], pd.Series]:
+    """
+    Load real A-share market data from the configured source.
+
+    This function tries sources in order:
+      1. Local pickle cache (fastest)
+      2. westock (WorkBuddy built-in A-share data)
+      3. AkShare (open-source Python library)
+      4. Tushare (requires token)
+
+    Args:
+        universe: Stock universe ('hs300', 'zz500', 'all_a')
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        source: Preferred source ('westock', 'akshare', 'tushare', 'auto')
+        force_refresh: Skip cache and re-download
+
+    Returns:
+        Tuple of (price_data, fundamental_data, industry_series)
+        - price_data: Dict of DataFrames with keys [open, high, low, close, volume, amount]
+        - fundamental_data: Dict of DataFrames with keys [pe, pb, roe, market_cap]
+        - industry_series: Series, index=stock_code, value=industry_name
+    """
+    # Generate column mapping JSON for documentation (idempotent)
+    _generate_column_mapping_json()
+
+    cache_file = _cache_path(universe, start_date, end_date)
+
+    # 1. Try cache first
+    if not force_refresh:
+        cached = _load_cache(cache_file)
+        if cached is not None:
+            price_data, _, _ = cached
+            close = price_data.get('close')
+            if close is not None and close.isna().all().all():
+                # Cache is corrupted (all NaN) — discard and re-fetch
+                print(f"  [cache] Corrupted (all NaN), discarding {cache_file}")
+                os.remove(cache_file)
+            else:
+                print(f"  [cache] Loaded from {cache_file}")
+                return cached
+
+    # 2. Try westock (WorkBuddy native A-share data)
+    if source in ("westock", "auto"):
+        try:
+            result = _load_from_westock(universe, start_date, end_date)
+            if result is not None:
+                print(f"  [westock] Data loaded successfully")
+                _save_cache(cache_file, *result)
+                return result
+        except Exception as e:
+            print(f"  [westock] Failed: {e}")
+
+    # 3. Try AkShare
+    if source in ("akshare", "auto"):
+        try:
+            result = _load_from_akshare(universe, start_date, end_date)
+            if result is not None:
+                print(f"  [akshare] Data loaded successfully")
+                _save_cache(cache_file, *result)
+                return result
+        except Exception as e:
+            print(f"  [akshare] Failed: {e}")
+
+    # 4. Try Tushare
+    if source in ("tushare", "auto"):
+        try:
+            result = _load_from_tushare(universe, start_date, end_date)
+            if result is not None:
+                print(f"  [tushare] Data loaded successfully")
+                _save_cache(cache_file, *result)
+                return result
+        except Exception as e:
+            print(f"  [tushare] Failed: {e}")
+
+    # 5. Fallback: generate synthetic data (same shape as real data would have)
+    print(f"  [fallback] No real data source available, generating synthetic data")
+    # 智能解析 n_stocks 从 universe 字符串
+    import re
+    m = re.search(r'(\d+)', universe)
+    if m:
+        n_stocks = int(m.group(1))
+    else:
+        n_stocks = {'hs300': 300, 'zz500': 500, 'all_a': 1000}.get(universe, 100)
+    print(f"  [fallback] universe='{universe}' → n_stocks={n_stocks}")
+    return _generate_synthetic_data(n_stocks, start_date, end_date)
+
+
+def _load_from_westock(
+    universe: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[Tuple]:
+    """
+    Load data via westock-data skill (WorkBuddy built-in).
+    
+    westock-data provides: daily kline, fundamentals, industry classification
+    for A-share stocks. This function uses the westock-data skill's
+    Python API to batch-fetch data.
+    
+    Note: westock-data is available as a skill in WorkBuddy. This function
+    is designed to be called from a WorkBuddy session where the skill is loaded.
+    When running standalone, it falls back to synthetic data.
+    """
+    try:
+        # Attempt to use westock's Python API
+        # The westock-data skill exposes a Python SDK at runtime
+        import importlib
+        try:
+            westock = importlib.import_module('westock')
+        except ImportError:
+            # westock SDK not installed — this is expected in standalone runs
+            return None
+        
+        # Get universe stock list
+        if universe == 'hs300':
+            stocks = westock.get_index_constituents('000300.SH')
+        elif universe == 'zz500':
+            stocks = westock.get_index_constituents('000905.SH')
+        else:
+            stocks = westock.get_all_stocks()
+        
+        stock_codes = [s['code'] for s in stocks[:300]]  # cap at 300 for performance
+        n_stocks = len(stock_codes)
+        
+        if n_stocks == 0:
+            return None
+
+        # Save stock list as raw data
+        _save_raw_csv(pd.DataFrame({'code': stock_codes}), 'westock/stock_list.csv', index=False)
+
+        dates = pd.date_range(start_date, end_date, freq='B')
+        n_days = len(dates)
+        
+        # Build price data
+        price_data = {}
+        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            price_data[field] = pd.DataFrame(
+                np.full((n_days, n_stocks), np.nan),
+                index=dates, columns=stock_codes
+            )
+        
+        # Fetch daily kline for each stock (batched)
+        batch_size = 50
+        for i in range(0, n_stocks, batch_size):
+            batch = stock_codes[i:i + batch_size]
+            for code in batch:
+                try:
+                    kline = westock.get_daily_kline(
+                        code, start_date, end_date,
+                        fields=['open', 'high', 'low', 'close', 'volume', 'amount']
+                    )
+                    if kline is not None and not kline.empty:
+                        kline.index = pd.to_datetime(kline.index)
+                        # Save raw kline per stock
+                        try:
+                            _save_raw_csv(kline.sort_index(), f'westock/kline/{code}.csv', index=True)
+                        except Exception:
+                            pass
+                        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+                            if field in kline.columns:
+                                common_dates = dates.intersection(kline.index)
+                                price_data[field].loc[common_dates, code] = \
+                                    kline.loc[common_dates, field].values
+                except Exception:
+                    continue
+        
+        # Fill missing
+        for field in price_data:
+            price_data[field] = price_data[field].ffill().bfill()
+
+        # Validate: if close data is still all NaN, return None to fall through
+        if price_data['close'].isna().all().all():
+            print(f"  [westock] All price data is NaN — falling back to next source")
+            return None
+        
+        # Fundamental data — try westock fundamentals API
+        fundamental_data = {}
+        # Initialize with NaN; real values will be filled in below
+        for factor in ['pe', 'pb', 'roe', 'market_cap']:
+            fundamental_data[factor] = pd.DataFrame(
+                np.nan, index=dates, columns=stock_codes
+            )
+        try:
+            for factor in ['pe', 'pb', 'roe', 'market_cap']:
+                fund_df = westock.get_fundamentals(stock_codes, factor, start_date, end_date)
+                if fund_df is not None and not fund_df.empty:
+                    fund_df.index = pd.to_datetime(fund_df.index)
+                    fundamental_data[factor] = fund_df.reindex(index=dates, columns=stock_codes)
+                    # Save raw fundamentals per factor
+                    try:
+                        _save_raw_csv(fund_df, f'westock/fundamentals/{factor}.csv', index=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Keep NaN-initialized DataFrames; ffill/bfill applied below
+
+        # Forward/back fill missing fundamentals (use most recent available value)
+        for factor in fundamental_data:
+            fundamental_data[factor] = fundamental_data[factor].ffill().bfill()
+        
+        # Industry classification
+        try:
+            industry_map = westock.get_industry_classification(stock_codes)
+            industry_series = pd.Series(industry_map)
+            # Save raw industry classification
+            try:
+                _save_raw_csv(
+                    pd.DataFrame({'code': stock_codes, 'industry': [industry_map.get(c, '') for c in stock_codes]}),
+                    'westock/industry.csv', index=False
+                )
+            except Exception:
+                pass
+        except Exception:
+            industries = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Materials']
+            np.random.seed(42)
+            industry_series = pd.Series(
+                np.random.choice(industries, size=n_stocks),
+                index=stock_codes
+            )
+        
+        return price_data, fundamental_data, industry_series
+
+    except Exception as e:
+        print(f"  [westock] Exception: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Tushare real data loader
+# ---------------------------------------------------------------------------
+
+def _load_from_tushare(
+    universe: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[Tuple]:
+    """
+    Load real A-share data via Tushare Pro API.
+
+    Requirements:
+      pip install tushare
+      export TUSHARE_TOKEN="your_token"   # or set in config.yaml
+
+    Tushare returns data at stock-level; this function loops over constituents
+    and assembles the project's canonical dict-of-DataFrames format.
+
+    Returns (price_data, fundamental_data, industry_series) on success,
+    None on any failure / missing token.
+    """
+    try:
+        import tushare as ts
+        import os
+        import time
+
+        token = os.environ.get('TUSHARE_TOKEN', '')
+        if not token:
+            cfg_path = 'config/config.yaml'
+            if os.path.exists(cfg_path):
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    cfg = yaml.safe_load(f) or {}
+                token = cfg.get('data', {}).get('tushare_token', '')
+        if not token:
+            print("  [tushare] TUSHARE_TOKEN not set, skipping")
+            return None
+
+        ts.set_token(token)
+        pro = ts.pro_api()
+        print("  [tushare] API initialized")
+    except Exception as e:
+        print(f"  [tushare] Init failed: {e}")
+        return None
+
+    try:
+        # ---- 1. Get stock list for the universe ----
+        if universe == 'hs300':
+            try:
+                import akshare as ak
+                df_cons = ak.index_stock_cons_csindex(symbol="000300")
+                raw_codes = df_cons['成分券代码'].tolist()
+            except Exception:
+                df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
+                raw_codes = df_basic['ts_code'].tolist()[:300]
+        elif universe == 'zz500':
+            try:
+                import akshare as ak
+                df_cons = ak.index_stock_cons_csindex(symbol="000905")
+                raw_codes = df_cons['成分券代码'].tolist()
+            except Exception:
+                df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
+                raw_codes = df_basic['ts_code'].tolist()[:500]
+        else:
+            df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
+            raw_codes = df_basic['ts_code'].tolist()
+
+        if not raw_codes:
+            print("  [tushare] Empty stock list")
+            return None
+
+        stock_codes = [c for c in raw_codes if isinstance(c, str) and len(c) > 0][:300]
+        n_stocks = len(stock_codes)
+        print(f"  [tushare] {n_stocks} stocks to fetch")
+
+        # Save stock list as raw data
+        _save_raw_csv(pd.DataFrame({'code': stock_codes}), 'tushare/stock_list.csv', index=False)
+
+        # ---- 2. Date range ----
+        dates = pd.date_range(start_date, end_date, freq='B')
+        n_days = len(dates)
+        if n_days == 0:
+            return None
+
+        # ---- 3. Initialize price_data DataFrames ----
+        price_data = {}
+        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            price_data[field] = pd.DataFrame(np.nan, index=dates, columns=stock_codes)
+
+        # ---- 4. Fetch daily kline per stock ----
+        print(f"  [tushare] Fetching daily kline ({n_stocks} stocks)...")
+        sd = start_date.replace('-', '')
+        ed = end_date.replace('-', '')
+
+        for i, code in enumerate(stock_codes):
+            try:
+                df = pro.daily(ts_code=code, start_date=sd, end_date=ed)
+                if df is None or df.empty:
+                    continue
+                df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
+                df = df.sort_values('trade_date').set_index('trade_date')
+                # Save raw kline per stock (Tushare English column names preserved)
+                try:
+                    _save_raw_csv(df.sort_index(), f'tushare/kline/{code}.csv', index=True)
+                except Exception:
+                    pass
+                col_map = {'open': 'open', 'high': 'high', 'low': 'low',
+                           'close': 'close', 'volume': 'vol', 'amount': 'amount'}
+                for field, src in col_map.items():
+                    if src in df.columns:
+                        common = dates.intersection(df.index)
+                        if len(common) > 0:
+                            price_data[field].loc[common, code] = df.loc[common, src].values
+            except Exception:
+                pass
+
+            if (i + 1) % 50 == 0:
+                print(f"  [tushare] Kline progress: {i + 1}/{n_stocks}")
+            time.sleep(0.2)  # rate limit
+
+        # ---- 5. Forward/back fill missing price data ----
+        for field in price_data:
+            price_data[field] = price_data[field].ffill().bfill()
+
+        # Validate: if close data is still all NaN, return None to fall through
+        if price_data['close'].isna().all().all():
+            print(f"  [tushare] All price data is NaN — falling back to next source")
+            return None
+
+        # ---- 6. Fundamental data ----
+        print("  [tushare] Fetching fundamentals...")
+        fundamental_data = {}
+        for field in ['pe', 'pb', 'roe', 'market_cap']:
+            fundamental_data[field] = pd.DataFrame(np.nan, index=dates, columns=stock_codes)
+
+        # daily_basic: fetch by date (more efficient than by stock)
+        daily_basic_all = []  # collect for raw save
+        try:
+            date_samples = [d.strftime('%Y%m%d') for d in dates[::max(1, n_days // 20)]][:20]
+            for d in date_samples:
+                try:
+                    df_b = pro.daily_basic(ts_code=','.join(stock_codes),
+                                            trade_date=d,
+                                            fields='ts_code,pe_ttm,pb,roe,total_mv')
+                    if df_b is None or df_b.empty:
+                        continue
+                    daily_basic_all.append(df_b)
+                    dt = pd.Timestamp(d[:4] + '-' + d[4:6] + '-' + d[6:])
+                    for _, row in df_b.iterrows():
+                        code = row['ts_code']
+                        if code not in stock_codes:
+                            continue
+                        if 'pe_ttm' in row and pd.notna(row['pe_ttm']):
+                            fundamental_data['pe'].loc[dt, code] = float(row['pe_ttm'])
+                        if 'pb' in row and pd.notna(row['pb']):
+                            fundamental_data['pb'].loc[dt, code] = float(row['pb'])
+                        if 'roe' in row and pd.notna(row['roe']):
+                            fundamental_data['roe'].loc[dt, code] = float(row['roe']) / 100.0
+                        if 'total_mv' in row and pd.notna(row['total_mv']):
+                            fundamental_data['market_cap'].loc[dt, code] = float(row['total_mv']) / 10000.0
+                except Exception:
+                    continue
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+        # Save combined daily_basic raw data
+        if daily_basic_all:
+            try:
+                df_daily_basic_combined = pd.concat(daily_basic_all, ignore_index=True)
+                _save_raw_csv(df_daily_basic_combined, 'tushare/daily_basic.csv', index=False)
+            except Exception:
+                pass
+
+        # Fill missing fundamentals (forward/back fill; leave remaining as NaN)
+        for field in fundamental_data:
+            fundamental_data[field] = fundamental_data[field].ffill().bfill()
+
+        # ---- 7. Industry classification ----
+        print("  [tushare] Fetching industry classification...")
+        industry_dict = {}
+        try:
+            df_ind = pro.stock_basic(ts_code=','.join(stock_codes),
+                                      fields='ts_code,industry')
+            # Save raw industry classification
+            try:
+                _save_raw_csv(df_ind, 'tushare/industry_raw.csv', index=False)
+            except Exception:
+                pass
+            for _, row in df_ind.iterrows():
+                if pd.notna(row.get('industry', None)):
+                    industry_dict[row['ts_code']] = str(row['industry'])
+        except Exception:
+            pass
+
+        # Fallback for missing industries
+        all_industries = ['Technology', 'Finance', 'Healthcare', 'Consumer',
+                          'Energy', 'Materials', 'Industrial', 'Telecom', 'Utility']
+        np.random.seed(42)
+        for code in stock_codes:
+            if code not in industry_dict:
+                industry_dict[code] = np.random.choice(all_industries)
+
+        industry_series = pd.Series(industry_dict)
+
+        print(f"  [tushare] Data loaded: {n_stocks} stocks x {n_days} days")
+        return price_data, fundamental_data, industry_series
+
+    except Exception as e:
+        print(f"  [tushare] Error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# AkShare real data loader
+# ---------------------------------------------------------------------------
+
+def _load_from_akshare(
+    universe: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[Tuple]:
+    """
+    Load real A-share data via AkShare (free, no token required).
+
+    Install: pip install akshare
+
+    Returns (price_data, fundamental_data, industry_series) on success,
+    None on any failure.
+    """
+    try:
+        import akshare as ak
+        import time
+    except ImportError:
+        print("  [akshare] Not installed. Run: pip install akshare")
+        return None
+
+    try:
+        # ---- 1. Get stock list ----
+        if universe == 'hs300':
+            df_cons = ak.index_stock_cons_csindex(symbol="000300")
+            raw_codes = df_cons['成分券代码'].tolist()
+        elif universe == 'zz500':
+            df_cons = ak.index_stock_cons_csindex(symbol="000905")
+            raw_codes = df_cons['成分券代码'].tolist()
+        else:
+            df_spot = ak.stock_zh_a_spot_em()
+            raw_codes = df_spot['代码'].tolist() if '代码' in df_spot.columns else []
+
+        if not raw_codes:
+            print("  [akshare] Empty stock list")
+            return None
+
+        stock_codes = [str(c).strip() for c in raw_codes if str(c).strip()][:300]
+        n_stocks = len(stock_codes)
+        if n_stocks == 0:
+            return None
+
+        print(f"  [akshare] {n_stocks} stocks to fetch")
+
+        # Save stock list as raw data
+        _save_raw_csv(pd.DataFrame({'code': stock_codes}), 'akshare/stock_list.csv', index=False)
+
+        # ---- 2. Date range ----
+        dates = pd.date_range(start_date, end_date, freq='B')
+        n_days = len(dates)
+        if n_days == 0:
+            return None
+
+        # ---- 3. Initialize DataFrames ----
+        price_data = {}
+        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            price_data[field] = pd.DataFrame(np.nan, index=dates, columns=stock_codes)
+
+        # ---- 4. Fetch daily kline per stock ----
+        print(f"  [akshare] Fetching daily kline...")
+        sd_ak = start_date.replace('-', '')
+        ed_ak = end_date.replace('-', '')
+
+        col_map = {
+            'open': '开盘',
+            'high': '最高',
+            'low': '最低',
+            'close': '收盘',
+            'volume': '成交量',
+            'amount': '成交额',
+        }
+
+        for i, code in enumerate(stock_codes):
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=sd_ak,
+                    end_date=ed_ak,
+                    adjust=""
+                )
+                if df is None or df.empty:
+                    continue
+                date_col = '日期' if '日期' in df.columns else df.columns[0]
+                df[date_col] = pd.to_datetime(df[date_col])
+                df = df.sort_values(date_col).set_index(date_col)
+                # Save raw kline per stock (AkShare Chinese column names preserved)
+                try:
+                    _save_raw_csv(df.sort_index(), f'akshare/kline/{code}.csv', index=True)
+                except Exception:
+                    pass
+                for field, cn_col in col_map.items():
+                    if cn_col in df.columns:
+                        common = dates.intersection(df.index)
+                        if len(common) > 0:
+                            price_data[field].loc[common, code] = df.loc[common, cn_col].values
+            except Exception:
+                pass
+
+            if (i + 1) % 100 == 0:
+                print(f"  [akshare] Kline progress: {i + 1}/{n_stocks}")
+
+        # ---- 5. Fill missing ----
+        for field in price_data:
+            price_data[field] = price_data[field].ffill().bfill()
+
+        # Validate: if close data is still all NaN, return None to fall through
+        if price_data['close'].isna().all().all():
+            print(f"  [akshare] All price data is NaN — falling back to next source")
+            return None
+
+        # ---- 6. Fundamental data ----
+        # Initialize with NaN; real values filled from spot data below
+        print("  [akshare] Building fundamental data...")
+        fundamental_data = {}
+        for field in ['pe', 'pb', 'roe', 'market_cap']:
+            fundamental_data[field] = pd.DataFrame(
+                np.nan, index=dates, columns=stock_codes
+            )
+
+        # Try to fetch real PE/PB/total_mv from real-time spot data
+        # stock_zh_a_spot_em() returns the latest snapshot; we broadcast it to all dates
+        # (fundamental data changes slowly, so this is a reasonable approximation for
+        # backtesting when no historical daily fundamental feed is available)
+        try:
+            df_spot = ak.stock_zh_a_spot_em()
+            # Save raw spot snapshot
+            try:
+                _save_raw_csv(df_spot, 'akshare/spot_snapshot.csv', index=False)
+            except Exception:
+                pass
+            code_col = '代码' if '代码' in df_spot.columns else df_spot.columns[0]
+            pe_col   = '市盈率-动态' if '市盈率-动态' in df_spot.columns else None
+            pb_col   = '市净率'      if '市净率'      in df_spot.columns else None
+            mc_col   = '总市值'      if '总市值'      in df_spot.columns else None
+
+            if code_col in df_spot.columns:
+                for _, row in df_spot.iterrows():
+                    code = str(row[code_col]).strip()
+                    if code not in stock_codes:
+                        continue
+                    # PE (TTM dynamic)
+                    if pe_col and pd.notna(row.get(pe_col)):
+                        try:
+                            fundamental_data['pe'].loc[:, code] = float(row[pe_col])
+                        except Exception:
+                            pass
+                    # PB
+                    if pb_col and pd.notna(row.get(pb_col)):
+                        try:
+                            fundamental_data['pb'].loc[:, code] = float(row[pb_col])
+                        except Exception:
+                            pass
+                    # Market cap (总市值, unit: 元 → 亿元)
+                    if mc_col and pd.notna(row.get(mc_col)):
+                        try:
+                            fundamental_data['market_cap'].loc[:, code] = float(row[mc_col]) / 1e8
+                        except Exception:
+                            pass
+            print(f"  [akshare] Spot fundamental coverage: "
+                  f"pe={fundamental_data['pe'].notna().any(axis=0).sum()}/{n_stocks} stocks")
+        except Exception as e:
+            print(f"  [akshare] Spot fundamental fetch failed: {e}")
+
+        # Forward/back fill missing fundamentals
+        for field in fundamental_data:
+            fundamental_data[field] = fundamental_data[field].ffill().bfill()
+
+        # ---- 7. Industry classification ----
+        print("  [akshare] Fetching industry classification...")
+        industry_dict = {}
+        try:
+            df_ind = ak.stock_industry_category_rsri()
+            if df_ind is not None and not df_ind.empty:
+                # Save raw industry classification
+                try:
+                    _save_raw_csv(df_ind, 'akshare/industry_raw.csv', index=False)
+                except Exception:
+                    pass
+                code_col = '代码' if '代码' in df_ind.columns else str(df_ind.columns[0])
+                ind_col = '行业' if '行业' in df_ind.columns else str(df_ind.columns[-1])
+                for _, row in df_ind.iterrows():
+                    code = str(row[code_col]).strip()
+                    if code in stock_codes:
+                        industry_dict[code] = str(row[ind_col])
+        except Exception:
+            pass
+
+        all_industries = ['Technology', 'Finance', 'Healthcare', 'Consumer',
+                          'Energy', 'Materials', 'Industrial']
+        np.random.seed(42)
+        for code in stock_codes:
+            if code not in industry_dict:
+                industry_dict[code] = np.random.choice(all_industries)
+
+        industry_series = pd.Series(industry_dict)
+
+        print(f"  [akshare] Data loaded: {n_stocks} stocks x {n_days} days")
+        return price_data, fundamental_data, industry_series
+
+    except Exception as e:
+        print(f"  [akshare] Error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data fallback
+# ---------------------------------------------------------------------------
+
+def _generate_synthetic_data(
+    n_stocks: int,
+    start_date: str,
+    end_date: str,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], pd.Series]:
+    """
+    Generate realistic synthetic data when no real data source is available.
+    
+    This is a fallback for when westock/AkShare/Tushare are all unavailable.
+    """
+    np.random.seed(42)
+    dates = pd.date_range(start_date, end_date, freq='B')
+    n_days = len(dates)
+    stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
+    
+    # Price data with realistic random walk
+    price_data = {}
+    for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+        if col in ['open', 'high', 'low', 'close']:
+            base_price = 10 + np.random.randn(n_stocks) * 5
+            returns = np.random.randn(n_days, n_stocks) * 0.02
+            prices = base_price * np.exp(np.cumsum(returns, axis=0))
+            price_data[col] = pd.DataFrame(prices, index=dates, columns=stock_codes)
+        else:
+            volume = np.abs(np.random.randn(n_days, n_stocks) * 1e6)
+            price_data[col] = pd.DataFrame(volume, index=dates, columns=stock_codes)
+    
+    # Synthetic fundamentals with realistic A-share distributions
+    # PE(TTM): log-normal, median ~20, always positive
+    fundamental_data = {
+        'pe': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.6 + np.log(20)),
+            index=dates, columns=stock_codes
+        ),
+        # PB: log-normal, median ~2, always positive
+        'pb': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.5 + np.log(2)),
+            index=dates, columns=stock_codes
+        ),
+        # ROE: clipped normal, median ~10%, range -50%~80%
+        'roe': pd.DataFrame(
+            np.clip(np.random.randn(n_days, n_stocks) * 0.08 + 0.10, -0.5, 0.8),
+            index=dates, columns=stock_codes
+        ),
+        # Market cap (亿元): log-normal, median ~50亿, always positive
+        'market_cap': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 1.2 + np.log(50)),
+            index=dates, columns=stock_codes
+        ),
+    }
+
+    industries = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Materials', 'Industrial']
+    industry_series = pd.Series(
+        np.random.choice(industries, size=n_stocks),
+        index=stock_codes
+    )
+    
+    return price_data, fundamental_data, industry_series
 
 
 class DataLoader:
@@ -36,7 +993,7 @@ class DataLoader:
         Args:
             config_path: Path to configuration file
         """
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
         self.data_config = self.config['data']
@@ -52,142 +1009,48 @@ class DataLoader:
         start_date: str = None,
         end_date: str = None,
         universe: str = None,
+        force_refresh: bool = False,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
         """
         Load stock data for the specified period and universe.
-        
+
         Args:
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
             universe: Stock universe (hs300, zz500, all_a)
-            
+            force_refresh: Skip cache and re-download
+
         Returns:
             Tuple of (price_data, fundamental_data, industry_series)
-            - price_data: DataFrame, shape (n_days, n_stocks)
+            - price_data: Dict of DataFrames with keys [open, high, low, close, volume, amount]
             - fundamental_data: Dict of DataFrames
             - industry_series: Series, index = stock codes
         """
         start_date = start_date or self.data_config['universe']['start_date']
         end_date = end_date or self.data_config['universe']['end_date']
         universe = universe or self.data_config['universe']['index']
-        
+        source = self.data_config.get('source', 'auto')
+
         print(f"Loading data from {start_date} to {end_date}, universe: {universe}")
-        
-        # Try to load from local cache first
-        cache_path = f"data/cache_{universe}_{start_date}_{end_date}.pkl"
-        if os.path.exists(cache_path):
-            print(f"Loading from cache: {cache_path}")
-            with open(cache_path, 'rb') as f:
-                return pd.read_pickle(f)
-        
-        # Load from data source
-        if self.data_config['source'] == 'tushare':
-            price_data, fundamental_data, industry_data = self._load_from_tushare(
-                start_date, end_date, universe
-            )
-        elif self.data_config['source'] == 'akshare':
-            price_data, fundamental_data, industry_data = self._load_from_akshare(
-                start_date, end_date, universe
-            )
-        else:
-            raise ValueError(f"Unsupported data source: {self.data_config['source']}")
-        
+
+        # Use the centralized real-data loader (handles cache + fallback)
+        price_data, fundamental_data, industry_data = load_real_data(
+            universe=universe,
+            start_date=start_date,
+            end_date=end_date,
+            source=source,
+            force_refresh=force_refresh,
+        )
+
         # Preprocess
         price_data = self._preprocess_price_data(price_data)
         fundamental_data = self._preprocess_fundamental_data(fundamental_data)
-        
-        # Save to cache
-        os.makedirs('data', exist_ok=True)
-        with open(cache_path, 'wb') as f:
-            pd.to_pickle((price_data, fundamental_data, industry_data), f)
-        
+
         self.price_data = price_data
         self.fundamental_data = fundamental_data
         self.industry_data = industry_data
-        
+
         return price_data, fundamental_data, industry_data
-    
-    def _load_from_tushare(
-        self,
-        start_date: str,
-        end_date: str,
-        universe: str,
-    ) -> Tuple[pd.DataFrame, Dict, pd.Series]:
-        """
-        Load data from Tushare API.
-        
-        Note: This is a mock implementation. In practice, you need to:
-        1. Install tushare: pip install tushare
-        2. Set your token: ts.set_token('your_token')
-        3. Replace mock data with real API calls
-        """
-        print("Loading from Tushare (mock data)...")
-        
-        # Generate mock data for demonstration
-        dates = pd.date_range(start_date, end_date, freq='B')  # Business days
-        
-        # Get stock list
-        if universe == 'hs300':
-            n_stocks = 300
-            stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
-        elif universe == 'zz500':
-            n_stocks = 500
-            stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
-        else:
-            n_stocks = 1000
-            stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
-        
-        # Generate mock price data
-        np.random.seed(42)
-        n_days = len(dates)
-        
-        # Price data (simulated)
-        price_data = {}
-        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
-            if col in ['open', 'high', 'low', 'close']:
-                # Simulate price series with random walk
-                base_price = 10 + np.random.randn(n_stocks) * 5
-                returns = np.random.randn(n_days, n_stocks) * 0.02
-                prices = base_price * np.exp(np.cumsum(returns, axis=0))
-                price_data[col] = pd.DataFrame(prices, index=dates, columns=stock_codes)
-            else:
-                # Volume and amount
-                volume = np.abs(np.random.randn(n_days, n_stocks) * 1e6)
-                price_data[col] = pd.DataFrame(volume, index=dates, columns=stock_codes)
-        
-        # Fundamental data (mock)
-        fundamental_data = {
-            'pe': pd.DataFrame(np.abs(np.random.randn(n_days, n_stocks) * 20 + 15), index=dates, columns=stock_codes),
-            'pb': pd.DataFrame(np.abs(np.random.randn(n_days, n_stocks) * 3 + 1), index=dates, columns=stock_codes),
-            'roe': pd.DataFrame(np.random.randn(n_days, n_stocks) * 0.1 + 0.1, index=dates, columns=stock_codes),
-            'market_cap': pd.DataFrame(np.random.randn(n_days, n_stocks) * 1e9 + 5e9, index=dates, columns=stock_codes),
-        }
-        
-        # Industry data (mock)
-        industries = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Materials', 'Industrial']
-        industry_series = pd.Series(
-            np.random.choice(industries, size=n_stocks),
-            index=stock_codes
-        )
-        
-        return price_data, fundamental_data, industry_series
-    
-    def _load_from_akshare(
-        self,
-        start_date: str,
-        end_date: str,
-        universe: str,
-    ) -> Tuple[pd.DataFrame, Dict, pd.Series]:
-        """
-        Load data from AkShare API.
-        
-        Note: This is a mock implementation. In practice, you need to:
-        1. Install akshare: pip install akshare
-        2. Replace mock data with real API calls
-        """
-        print("Loading from AkShare (mock data)...")
-        # Similar to _load_from_tushare, but using AkShare API
-        return self._load_from_tushare(start_date, end_date, universe)
     
     def _preprocess_price_data(self, price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
@@ -204,9 +1067,9 @@ class DataLoader:
         for col, df in price_data.items():
             # Fill missing values
             if self.preprocessing_config['fill_method'] == 'forward':
-                df = df.fillna(method='ffill')
+                df = df.ffill()
             elif self.preprocessing_config['fill_method'] == 'backward':
-                df = df.fillna(method='bfill')
+                df = df.bfill()
             elif self.preprocessing_config['fill_method'] == 'interpolate':
                 df = df.interpolate(method='linear')
             
@@ -234,7 +1097,7 @@ class DataLoader:
         
         for col, df in fundamental_data.items():
             # Fill missing values with forward fill (use latest available)
-            df = df.fillna(method='ffill').fillna(method='bfill')
+            df = df.ffill().bfill()
             processed[col] = df
         
         return processed
@@ -331,34 +1194,83 @@ class DataLoader:
         self,
         test_ratio: float = 0.2,
         method: str = 'chronological',
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        train_end_date: str = None,
+        test_start_date: str = None,
+    ) -> Tuple[Dict, Dict]:
         """
-        Split data into train and test sets.
+        Split ALL loaded data into train and test sets.
+        
+        This splits the full price_data dict (all columns: open/high/low/close/volume/amount),
+        fundamental_data, and industry_data — NOT just close prices.
         
         Args:
-            test_ratio: Ratio of test data
+            test_ratio: Ratio of test data (used only when train_end_date is not given)
             method: Split method ('chronological', 'rolling')
+            train_end_date: Explicit train/test split date (YYYY-MM-DD).
+                         If given, overrides test_ratio.
+            test_start_date: Explicit test start date. If None, derived from train_end_date.
             
         Returns:
-            Tuple of (train_data, test_data)
+            Tuple of (train_data_dict, test_data_dict)
+            Each dict has keys: 'price_data', 'fundamental_data', 'industry_data'
         """
         if self.price_data is None:
             raise ValueError("Price data not loaded. Call load_data() first.")
         
         close_prices = self.price_data['close']
         n_days = len(close_prices)
+        dates = close_prices.index
         
-        if method == 'chronological':
-            split_idx = int(n_days * (1 - test_ratio))
-            train_data = close_prices.iloc[:split_idx]
-            test_data = close_prices.iloc[split_idx:]
-        elif method == 'rolling':
-            # For rolling window cross-validation
-            # This returns the full data, actual splitting is done in experiment runner
-            train_data = close_prices
-            test_data = close_prices
+        # --- Determine split index ---
+        if train_end_date is not None:
+            # Use explicit date boundary
+            train_end = pd.Timestamp(train_end_date)
+            split_idx = int(np.searchsorted(dates, train_end))
+            if split_idx >= n_days:
+                raise ValueError(f"train_end_date {train_end_date} is at or after the last date {dates[-1]}")
+            if split_idx <= 0:
+                raise ValueError(f"train_end_date {train_end_date} is before the first date {dates[0]}")
         else:
-            raise ValueError(f"Unsupported split method: {method}")
+            split_idx = int(n_days * (1 - test_ratio))
+        
+        # --- Split price_data (ALL columns) ---
+        train_price = {}
+        test_price = {}
+        for col in self.price_data:
+            train_price[col] = self.price_data[col].iloc[:split_idx]
+            test_price[col] = self.price_data[col].iloc[split_idx:]
+        
+        # --- Split fundamental_data (all keys) ---
+        train_fund = {}
+        test_fund = {}
+        if self.fundamental_data:
+            for key in self.fundamental_data:
+                df = self.fundamental_data[key]
+                train_fund[key] = df.iloc[:split_idx]
+                test_fund[key] = df.iloc[split_idx:]
+        
+        # --- Split industry_data (Series) ---
+        train_industry = None
+        test_industry = None
+        if self.industry_data is not None:
+            # industry_data is typically a Series or DataFrame with stock codes as index
+            # It's cross-sectional, not time-series — use the latest available for both
+            train_industry = self.industry_data
+            test_industry = self.industry_data
+        
+        train_data = {
+            'price_data': train_price,
+            'fundamental_data': train_fund,
+            'industry_data': train_industry,
+        }
+        test_data = {
+            'price_data': test_price,
+            'fundamental_data': test_fund,
+            'industry_data': test_industry,
+        }
+        
+        print(f"  [split] Train: {train_price['close'].index[0].date()} ~ {train_price['close'].index[-1].date()} ({len(train_price['close'])} days)")
+        print(f"  [split] Test:  {test_price['close'].index[0].date()} ~ {test_price['close'].index[-1].date()} ({len(test_price['close'])} days)")
         
         return train_data, test_data
 
@@ -377,7 +1289,7 @@ def load_sample_data(n_stocks: int = 100, n_days: int = 1000) -> Tuple[pd.DataFr
     np.random.seed(42)
     
     # Generate dates
-    dates = pd.date_range('2020-01-01', periods=n_days, freq='B')
+    dates = pd.date_range('2023-01-01', periods=n_days, freq='B')
     stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
     
     # Price data
@@ -392,12 +1304,24 @@ def load_sample_data(n_stocks: int = 100, n_days: int = 1000) -> Tuple[pd.DataFr
             volume = np.abs(np.random.randn(n_days, n_stocks) * 1e6)
             price_data[col] = pd.DataFrame(volume, index=dates, columns=stock_codes)
     
-    # Fundamental data
+    # Fundamental data — same realistic distributions as _generate_synthetic_data
     fundamental_data = {
-        'pe': pd.DataFrame(np.abs(np.random.randn(n_days, n_stocks) * 20 + 15), index=dates, columns=stock_codes),
-        'pb': pd.DataFrame(np.abs(np.random.randn(n_days, n_stocks) * 3 + 1), index=dates, columns=stock_codes),
-        'roe': pd.DataFrame(np.random.randn(n_days, n_stocks) * 0.1 + 0.1, index=dates, columns=stock_codes),
-        'market_cap': pd.DataFrame(np.random.randn(n_days, n_stocks) * 1e9 + 5e9, index=dates, columns=stock_codes),
+        'pe': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.6 + np.log(20)),
+            index=dates, columns=stock_codes
+        ),
+        'pb': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.5 + np.log(2)),
+            index=dates, columns=stock_codes
+        ),
+        'roe': pd.DataFrame(
+            np.clip(np.random.randn(n_days, n_stocks) * 0.08 + 0.10, -0.5, 0.8),
+            index=dates, columns=stock_codes
+        ),
+        'market_cap': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 1.2 + np.log(50)),
+            index=dates, columns=stock_codes
+        ),
     }
     
     # Industry data

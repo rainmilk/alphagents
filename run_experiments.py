@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Experiment Runner Module
 
@@ -40,7 +41,7 @@ class ExperimentRunner:
         Args:
             config_path: Path to configuration file
         """
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
         self.results = {}
@@ -258,7 +259,17 @@ class ExperimentRunner:
         pipeline = AAAI2027Pipeline()
         pipeline.step1_load_data(use_sample=True)
         
-        # Skip LLM-dependent steps for demo
+        # Generate dummy portfolios for backtest since LLM steps are skipped
+        n_dates = 100
+        n_stocks = 50
+        dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
+        stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
+        pipeline.portfolios = pd.DataFrame(
+            np.random.dirichlet(np.ones(n_stocks), size=n_dates),
+            index=dates,
+            columns=stock_codes,
+        )
+        
         pipeline.step8_backtest()
         
         return pipeline.performance_metrics
@@ -352,7 +363,7 @@ class ExperimentRunner:
         """
         output_path = f"{self.output_dir}/{name}.json"
         
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         
         print(f"\nResults saved to {output_path}")

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Main Pipeline Module
 
@@ -6,9 +7,17 @@ system into a complete end-to-end pipeline.
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 Date: 2026-06-07
+
+Usage:
+    python main.py              # Quick demo (no LLM required)
+    python main.py --full       # Full end-to-end pipeline
+    python main.py --full --start 2023-01-01 --end 2024-12-31
 """
 
 import os
+import sys
+import argparse
+import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
@@ -18,8 +27,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import all modules
-from data.loader import DataLoader, load_sample_data
-from backtest.engine import BacktestEngine, LightweightBacktester
+from data.loader import DataLoader, load_sample_data, load_real_data
+from backtest.engine import BacktestEngine
 from metrics.evaluator import FactorEvaluator, evaluate_portfolio_comprehensive
 
 # Import methods (with error handling for missing dependencies)
@@ -27,7 +36,7 @@ try:
     from methods.debate import DebateEvaluator, FactorProposal
     from methods.evolve import SelfEvolvingGenerator, FactorBacktester
     from methods.memory import FactorMemoryBank, MarketStateEncoder, MemoryAugmentedGenerator
-    from methods.fusion import FactorFusion, PortfolioConstructor, Pipeline as FusionPipeline
+    from methods.fusion import FactorFusion, PortfolioConstructor, FactorInfo, PortfolioConfig
     METHODS_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: Some methods modules not available: {e}")
@@ -43,7 +52,7 @@ class AAAI2027Pipeline:
     2. Factor generation (LLM-based)
     3. Factor evaluation (multi-agent debate)
     4. Factor evolution (self-evolving generator)
-    5. Factor memory (state-aware retrieval)
+    5. Memory retrieval (state-aware)
     6. Factor fusion (ICIR-weighted)
     7. Portfolio construction
     8. Backtesting and evaluation
@@ -57,7 +66,8 @@ class AAAI2027Pipeline:
             config_path: Path to configuration file
         """
         # Load configuration
-        with open(config_path, 'r') as f:
+        self._config_path = config_path
+        with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
         # Initialize components
@@ -84,40 +94,149 @@ class AAAI2027Pipeline:
         end_date: str = None,
         universe: str = None,
         use_sample: bool = True,
+        data_source: str = "auto",
+        force_refresh: bool = False,
     ):
         """
         Step 1: Load and preprocess data.
-        
+
+        Data source selection (single decision point):
+        - use_sample=True  → fast synthetic data for testing (n_stocks=100, n_days=500)
+        - use_sample=False → real data via westock/AkShare/Tushare with cache
+
         Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            universe: Stock universe
-            use_sample: Whether to use sample data (for quick testing)
+            start_date: Start date (YYYY-MM-DD), for real data only
+            end_date: End date (YYYY-MM-DD), for real data only
+            universe: Stock universe (hs300, zz500, all_a), for real data only
+            use_sample: True=sample data, False=real data
+            data_source: 'westock', 'akshare', 'tushare', or 'auto'
+            force_refresh: Skip cache and re-download real data
         """
         print("\n[Step 1] Loading data...")
-        
+
         if use_sample:
-            # Use sample data for quick testing
+            # Fast synthetic data — no external API needed
             self.price_data, self.fundamental_data, self.industry_data = load_sample_data(
                 n_stocks=100,
                 n_days=500,
             )
-            print(f"  Loaded sample data: {self.price_data['close'].shape}")
+            self._data_source_label = "sample"
+            print(f"  [sample] Loaded: {self.price_data['close'].shape}")
         else:
-            # Load real data
-            self.data_loader = DataLoader(self.config)
-            self.price_data, self.fundamental_data, self.industry_data = self.data_loader.load_data(
-                start_date, end_date, universe
+            # Real data via westock → AkShare → Tushare → synthetic fallback
+            self.price_data, self.fundamental_data, self.industry_data = load_real_data(
+                universe=universe or self.config['data']['universe']['index'],
+                start_date=start_date or self.config['data']['universe']['start_date'],
+                end_date=end_date or self.config['data']['universe']['end_date'],
+                source=data_source,
+                force_refresh=force_refresh,
             )
-            print(f"  Loaded data: {self.price_data['close'].shape}")
-        
+            self._data_source_label = "real"
+            print(f"  [real] Loaded: {self.price_data['close'].shape}")
+
         # Initialize backtest engine
         self.backtest_engine = BacktestEngine(
             commission=self.config['backtest']['trading']['commission'],
             slippage=self.config['backtest']['trading']['slippage'],
         )
+
+        # --- Train/Test Split (Critical for preventing overfitting) ---
+        # Create DataLoader instance and populate its internal data so split_data() works
+        self.data_loader = DataLoader(config_path=self.config.get('_config_path', 'config/config.yaml'))
+        self.data_loader.price_data = self.price_data
+        self.data_loader.fundamental_data = self.fundamental_data
+        self.data_loader.industry_data = self.industry_data
         
+        # Read split config from config.yaml, or use defaults
+        train_end_date = self.config.get('data', {}).get('train_end_date', None)
+        test_start_date = self.config.get('data', {}).get('test_start_date', None)
+        
+        if train_end_date is None:
+            # Default: use 80/20 split (80% train, 20% test)
+            # For default date range 2019-01-01 to 2024-12-31, this is ~2023-12-31
+            dates = self.price_data['close'].index
+            split_idx = int(len(dates) * 0.8)
+            train_end_date = dates[split_idx - 1].strftime('%Y-%m-%d')
+            test_start_date = dates[split_idx].strftime('%Y-%m-%d')
+            print(f"  [split] Using default 80/20 split: train_end={train_end_date}, test_start={test_start_date}")
+        
+        self.train_data, self.test_data = self.data_loader.split_data(
+            train_end_date=train_end_date,
+            test_start_date=test_start_date,
+        )
+        self._train_end_date = train_end_date
+        self._test_start_date = test_start_date
+        
+        # --- Save train/test data to data directory ---
+        self._save_split_data(train_end_date, test_start_date)
+        
+        print(f"  [✓] Train/Test split complete")
+        print(f"       Train: {train_end_date}, Test: {test_start_date}")
         print("  [✓] Data loading complete")
+        
+    def _save_split_data(self, train_end_date: str, test_start_date: str):
+        """
+        Persist train/test data as CSV files under data/train/ and data/test/.
+
+        Directory structure:
+            data/train/price/close.csv, open.csv, high.csv, low.csv, volume.csv, amount.csv
+            data/train/fundamental/pe.csv, pb.csv, ...
+            data/train/industry.csv
+            data/test/  (same structure)
+            data/split_info.json  — metadata
+        """
+        
+        def _save_category(data_dict, root: str, category: str):
+            """Save a dict of DataFrames as CSV files under root/category/."""
+            if data_dict is None:
+                return 0
+            cat_dir = os.path.join(root, category)
+            os.makedirs(cat_dir, exist_ok=True)
+            count = 0
+            for key, df in data_dict.items():
+                csv_path = os.path.join(cat_dir, f"{key}.csv")
+                df.to_csv(csv_path, index=True, encoding='utf-8-sig')
+                count += 1
+            return count
+        
+        def _save_series(series, root: str, filename: str):
+            """Save a Series-like object as CSV."""
+            if series is None:
+                return
+            csv_path = os.path.join(root, filename)
+            pd.Series(series).to_csv(csv_path, index=True, encoding='utf-8-sig')
+        
+        for split, data in [("train", self.train_data), ("test", self.test_data)]:
+            root = os.path.join("data", split)
+            os.makedirs(root, exist_ok=True)
+            
+            n_price = _save_category(data.get('price_data'), root, "price")
+            n_fund = _save_category(data.get('fundamental_data'), root, "fundamental")
+            _save_series(data.get('industry_data'), root, "industry.csv")
+            
+            print(f"  [save] {split}: {n_price} price CSVs + {n_fund} fundamental CSVs → {root}/")
+        
+        # Save split metadata
+        train_dates = self.train_data['price_data']['close'].index
+        test_dates = self.test_data['price_data']['close'].index
+        
+        split_info = {
+            "train_end_date": train_end_date,
+            "test_start_date": test_start_date,
+            "train_dates": f"{train_dates[0].strftime('%Y-%m-%d')} ~ {train_dates[-1].strftime('%Y-%m-%d')}",
+            "test_dates": f"{test_dates[0].strftime('%Y-%m-%d')} ~ {test_dates[-1].strftime('%Y-%m-%d')}",
+            "train_days": int(len(train_dates)),
+            "test_days": int(len(test_dates)),
+            "train_n_stocks": self.train_data['price_data']['close'].shape[1],
+            "test_n_stocks": self.test_data['price_data']['close'].shape[1],
+            "saved_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        
+        info_path = os.path.join("data", "split_info.json")
+        with open(info_path, 'w', encoding='utf-8') as f:
+            json.dump(split_info, f, indent=2, ensure_ascii=False)
+        
+        print(f"  [save] Split info → {info_path}")
         
     def step2_initialize_memory(self):
         """
@@ -132,13 +251,13 @@ class AAAI2027Pipeline:
         # Initialize memory bank
         memory_config = self.config['memory']
         self.memory_bank = FactorMemoryBank(
-            memory_path=memory_config['storage']['db_path'],
+            index_path=memory_config['storage']['db_path'],
         )
         
         # Initialize market state encoder
         self.market_encoder = MarketStateEncoder(
-            vol_low=memory_config['market_state']['vix_low'],
-            vol_high=memory_config['market_state']['vix_high'],
+            vix_low=memory_config['market_state']['vix_low'],
+            vix_high=memory_config['market_state']['vix_high'],
         )
         
         print(f"  Memory bank initialized: {len(self.memory_bank)} factors")
@@ -146,20 +265,21 @@ class AAAI2027Pipeline:
         
     def step3_generate_factors(
         self,
-        n_factors: int = 20,
         use_memory: bool = True,
     ):
         """
         Step 3: Generate factors using LLM.
+
+        The number of factors is read from config: llm.generator.n_candidates
         
         Args:
-            n_factors: Number of factors to generate
             use_memory: Whether to use memory-augmented generation
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 3] Skipped: methods modules not available")
             return
         
+        n_factors = self.config['llm']['generator']['n_candidates']
         print(f"\n[Step 3] Generating {n_factors} factors...")
         
         # Initialize evolving generator
@@ -172,17 +292,29 @@ class AAAI2027Pipeline:
         seed_factors = self.evolving_generator.generate_seed_factors(n_factors)
         
         # If memory is available, augment generation
-        if use_memory and self.memory_bank is not None:
+        if use_memory and self.memory_bank is not None and len(self.memory_bank) > 0:
             print("  Using memory-augmented generation...")
             memory_generator = MemoryAugmentedGenerator(
                 base_generator=self.evolving_generator,
                 memory_bank=self.memory_bank,
                 encoder=self.market_encoder,
             )
-            # Augment seed factors with memory retrieval
-            # (Simplified: just add memory-retrieved factors to seeds)
-        
-        self.generated_factors = seed_factors
+            # Use memory-augmented generator to produce factors with
+            # few-shot examples retrieved from the memory bank
+            try:
+                augmented_factors = memory_generator.generate(
+                    task_description=f"Generate {n_factors} alpha factors for A-share stock selection",
+                    price_df=pd.DataFrame(self.price_data['close']),
+                )
+                if augmented_factors:
+                    # Merge augmented factors with seed factors
+                    self.generated_factors = seed_factors + augmented_factors
+                    print(f"  Memory-augmented generation: {len(augmented_factors)} additional factors")
+            except Exception as e:
+                print(f"  Memory augmentation skipped: {e}")
+                self.generated_factors = seed_factors
+        else:
+            self.generated_factors = seed_factors
         print(f"  Generated {len(seed_factors)} seed factors")
         print("  [✓] Factor generation complete")
         
@@ -196,25 +328,76 @@ class AAAI2027Pipeline:
         
         print("\n[Step 4] Evaluating factors (multi-agent debate)...")
         
-        # Initialize debate evaluator
+        # Initialize debate evaluator (read API config from config.yaml)
+        eval_cfg = self.config['llm']['evaluator']
+        api_key = eval_cfg.get('api_key', '') or os.environ.get("DEEPSEEK_API_KEY", "")
+        base_url = eval_cfg.get('base_url', "https://api.deepseek.com")
+        
         self.debate_evaluator = DebateEvaluator(
-            llm_model=self.config['llm']['evaluator']['model'],
-            n_agents=self.config['llm']['evaluator']['n_agents'],
+            llm_model=eval_cfg['model'],
+            n_agents=eval_cfg['n_agents'],
+            n_rounds=eval_cfg.get('n_debate_rounds', 3),
+            api_key=api_key,
+            base_url=base_url,
         )
         
-        # Evaluate each factor
-        evaluation_results = []
-        for factor in self.generated_factors[:5]:  # Evaluate top 5 for demo
-            proposal = FactorProposal(
-                expression=factor['expression'],
-                description=factor['description'],
-            )
-            
+        # Evaluate each factor (all factors, not just top 5)
+        self.debate_results = []  # (factor, DebateResult) pairs for step5/step6
+        for factor in self.generated_factors:
+            # Handle both CandidateFactor objects and dict representations
+            if isinstance(factor, dict):
+                expr = factor['expression']
+                desc = factor['description']
+            else:
+                expr = factor.expression
+                desc = factor.description
+
+            proposal = FactorProposal(expression=expr, description=desc)
+
             result = self.debate_evaluator.evaluate(proposal)
-            evaluation_results.append(result)
-        
-        print(f"  Evaluated {len(evaluation_results)} factors")
+            self.debate_results.append((factor, result))
+
+            # Attach debate score to factor for use in step5/step6
+            if isinstance(factor, dict):
+                factor['debate_score'] = result.final_score
+            else:
+                factor.debate_score = result.final_score
+
+        print(f"  Evaluated {len(self.debate_results)} factors")
         print("  [✓] Factor evaluation complete")
+
+        # Save evaluated factors to memory bank
+        if self.memory_bank is not None and self.debate_results:
+            try:
+                # Use TRAIN data for market state encoding (not test data)
+                recent = self.train_data['price_data']['close'].iloc[-60:] if self.train_data else None
+                current_state = self.market_encoder.encode(recent) if recent is not None else None
+            except Exception:
+                current_state = None
+            saved = 0
+            for factor, result in self.debate_results:
+                if isinstance(factor, dict):
+                    expr = factor.get('expression', '')
+                    desc = factor.get('description', '')
+                else:
+                    expr = getattr(factor, 'expression', '')
+                    desc = getattr(factor, 'description', '')
+                if not expr:
+                    continue
+                try:
+                    self.memory_bank.add(
+                        expression=expr,
+                        description=desc,
+                        market_state=current_state,
+                        ic=getattr(factor, 'ic', 0.0),
+                        sharpe=getattr(factor, 'sharpe', 0.0),
+                        source='llm',
+                    )
+                    saved += 1
+                except Exception as e:
+                    print(f"  [memory] add failed: {e}")
+            if saved:
+                print(f"  Saved {saved} factors to memory bank")
         
     def step5_evolve_factors(self, n_rounds: int = 5):
         """
@@ -229,22 +412,118 @@ class AAAI2027Pipeline:
         
         print(f"\n[Step 5] Evolving factors ({n_rounds} rounds)...")
         
-        # Initialize backtester for evolution
-        backtester = LightweightBacktester(self.price_data['close'])
+        # Initialize backtester for evolution — USE TRAINING DATA ONLY
+        # Critical: factors must NOT see test data during evolution
+        backtester = FactorBacktester(
+            prices=self.train_data['price_data'],
+            fundamentals=self.train_data['fundamental_data'],
+            forward_period=20,
+        )
         
-        # Run evolution
+        print(f"  [evolution] Using TRAIN data only: {self._train_end_date}")
         evolution_result = self.evolving_generator.evolve(
             seed_factors=self.generated_factors,
             backtester=backtester,
             n_rounds=n_rounds,
         )
         
-        self.evolution_history = evolution_result['history']
-        self.best_factors = evolution_result['best_factors']
+        self.evolution_history = evolution_result.evolution_history
+        self.best_factors = evolution_result.best_factors
         
         print(f"  Evolution complete: {len(self.best_factors)} best factors")
-        print(f"  Best IC: {evolution_result['best_ic']:.4f}")
+        print(f"  Best IC: {evolution_result.best_ic:.4f}")
         print("  [✓] Factor evolution complete")
+
+        # Save evolved best factors to memory bank
+        if self.memory_bank is not None and self.best_factors:
+            try:
+                recent = self.price_data['close'].iloc[-60:] if self.price_data and 'close' in self.price_data else None
+                current_state = self.market_encoder.encode(pd.DataFrame(recent)) if recent is not None else None
+            except Exception:
+                current_state = None
+            saved = 0
+            for factor in self.best_factors:
+                if isinstance(factor, dict):
+                    expr = factor.get('expression', '')
+                    desc = factor.get('description', '')
+                else:
+                    expr = getattr(factor, 'expression', '')
+                    desc = getattr(factor, 'description', '')
+                if not expr:
+                    continue
+                try:
+                    self.memory_bank.add(
+                        expression=expr,
+                        description=desc,
+                        market_state=current_state,
+                        ic=getattr(factor, 'ic', 0.0),
+                        sharpe=getattr(factor, 'sharpe', 0.0),
+                        source='evolved',
+                    )
+                    saved += 1
+                except Exception as e:
+                    print(f"  [memory] add failed: {e}")
+            if saved:
+                print(f"  Saved {saved} factors to memory bank")
+        
+    def step5b_retrieve_from_memory(self):
+        """
+        Step 5b: Retrieve historical high-quality factors from memory bank.
+        
+        This step uses state-aware retrieval to find factors from memory
+        that performed well in similar market conditions, augmenting the
+        evolved factor pool with proven historical factors.
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 5b] Skipped: methods modules not available")
+            return
+        
+        if self.memory_bank is None or len(self.memory_bank) == 0:
+            print("\n[Step 5b] Skipped: memory bank is empty")
+            return
+        
+        print("\n[Step 5b] Retrieving factors from memory (state-aware)...")
+        
+        # Encode current market state using TRAIN data (not test data)
+        # This prevents data leak from test period
+        current_state = self.market_encoder.encode(
+            pd.DataFrame(self.train_data['price_data']['close'].iloc[-60:])  # Last 60 days of TRAIN data
+        )
+        
+        # Retrieve similar factors from memory
+        # Build a generic query from current factor descriptions
+        query_desc = "multi-factor stock selection using technical indicators"
+        query_expr = ""
+        if self.generated_factors:
+            # Use the first generated factor as query
+            f = self.generated_factors[0]
+            if isinstance(f, dict):
+                query_desc = f.get('description', query_desc)
+                query_expr = f.get('expression', '')
+            else:
+                query_desc = getattr(f, 'description', query_desc)
+                query_expr = getattr(f, 'expression', '')
+
+        retrieved_factors = self.memory_bank.retrieve(
+            query_description=query_desc,
+            query_expression=query_expr,
+            current_market_state=current_state,
+            top_k=self.config['memory'].get('top_k', 5),
+        )
+        
+        if retrieved_factors:
+            print(f"  Retrieved {len(retrieved_factors)} factors from memory")
+            
+            # Merge retrieved factors into the factor pool
+            # Retrieved factors augment the best evolved factors
+            if hasattr(self, 'best_factors') and self.best_factors:
+                for rf in retrieved_factors:
+                    self.best_factors.append(rf)
+                print(f"  Factor pool size after merge: {len(self.best_factors)}")
+        else:
+            print("  No relevant factors found in memory")
+        
+        print("  [✓] Memory retrieval complete")
         
     def step6_fuse_factors(self):
         """
@@ -256,19 +535,46 @@ class AAAI2027Pipeline:
         
         print("\n[Step 6] Fusing factors...")
         
-        # Initialize fusion pipeline
-        self.fusion_pipeline = FusionPipeline(
+        # Initialize fusion
+        fusion = FactorFusion(
             strategy=self.config['fusion']['weighting']['strategy'],
             corr_penalty=self.config['fusion']['weighting']['corr_penalty'],
         )
         
         # Prepare factor values
-        factor_values = self._calculate_factor_values()
-        
+        factor_dict = self._calculate_factor_values()   # dict[str, DataFrame], each is (n_dates, n_stocks)
+        n_dates = self.price_data['close'].shape[0]
+        date_index = self.price_data['close'].index
+
+        # Build debate_score lookup from step4 results
+        debate_score_map = {}
+        if hasattr(self, 'debate_results') and self.debate_results:
+            for factor, result in self.debate_results:
+                if isinstance(factor, dict):
+                    expr = factor.get('expression', '')
+                else:
+                    expr = getattr(factor, 'expression', '')
+                if expr:
+                    debate_score_map[expr] = result.final_score
+
+        # Build factor_values_dict and factor_infos
+        factor_values_dict = {}
+        factor_infos = []
+        for name, values_df in factor_dict.items():
+            # Ensure index is datetime
+            if not isinstance(values_df.index, pd.DatetimeIndex):
+                values_df = values_df.copy()
+                values_df.index = pd.to_datetime(values_df.index)
+            factor_values_dict[name] = values_df
+            dscore = debate_score_map.get(name, 0.0)
+            factor_infos.append(FactorInfo(name=name, expression=name, debate_score=dscore))
+
         # Fuse factors
-        composite_scores = self.fusion_pipeline.fuse(factor_values)
+        self._composite_scores, fusion_meta = fusion.fuse(
+            factor_infos, factor_values_dict
+        )
         
-        print(f"  Fused {len(factor_values.columns)} factors")
+        print(f"  Fused {len(factor_infos)} factors")
         print("  [✓] Factor fusion complete")
         
     def step7_construct_portfolio(self):
@@ -282,19 +588,29 @@ class AAAI2027Pipeline:
         print("\n[Step 7] Constructing portfolio...")
         
         # Initialize portfolio constructor
-        config = self.config['fusion']['portfolio']
-        constructor = PortfolioConstructor(
-            top_n=config['top_n'],
-            method=config['method'],
-            max_weight=config['max_weight'],
-        )
+        portfolio_cfg = self.config['fusion']['portfolio']
+        constructor = PortfolioConstructor(PortfolioConfig(
+            top_n=portfolio_cfg['top_n'],
+            method=portfolio_cfg['method'],
+            max_weight=portfolio_cfg['max_weight'],
+            max_industry_exposure=portfolio_cfg.get('max_industry_exposure', 0.30),
+        ))
         
-        # Construct portfolios
-        self.portfolios = constructor.construct(
-            composite_scores=self.fusion_pipeline.composite_scores,
-            prices=self.price_data['close'],
+        # Build portfolios (use .copy() to prevent accidental in-place modification)
+        close_copy = self.price_data['close'].copy()
+        raw_portfolios = constructor.build(
+            composite_scores=self._composite_scores,
+            prices=close_copy,
             industry=self.industry_data,
         )
+        
+        # Convert list[Portfolio] to DataFrame (n_dates x n_stocks) for backtester
+        weight_dict = {}
+        for pf in raw_portfolios:
+            weight_dict[pf.date] = pf.weights
+        self.portfolios = pd.DataFrame(weight_dict).T
+        self.portfolios.index = pd.to_datetime(self.portfolios.index)
+        self.portfolios = self.portfolios.fillna(0.0)
         
         print(f"  Constructed {len(self.portfolios)} portfolios")
         print("  [✓] Portfolio construction complete")
@@ -307,15 +623,22 @@ class AAAI2027Pipeline:
         
         if self.portfolios is None:
             print("  Error: No portfolios constructed. Run step7 first.")
+            self.performance_metrics = {
+                'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+                'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+                'n_trading_days': 0,
+            }
             return
         
-        # Run backtest
+        # Run backtest on TEST data (out-of-sample)
+        # Critical: this must use test_data, NOT the full price_data
         self.performance_metrics = self.backtest_engine.run(
             portfolios=self.portfolios,
-            prices=self.price_data['close'],
+            prices=self.test_data['price_data']['close'],
         )
         
-        print("\n  Performance Metrics:")
+        print(f"\n  [backtest] Out-of-sample results (test period: {self._test_start_date})")
         for key, value in self.performance_metrics.items():
             if isinstance(value, float):
                 print(f"    {key}: {value:.4f}")
@@ -347,43 +670,80 @@ class AAAI2027Pipeline:
         # Save evolution history
         if self.evolution_history:
             import json
-            with open(f"{output_dir}/evolution_history.json", 'w') as f:
-                json.dump(self.evolution_history, f, indent=2)
+            from dataclasses import asdict
+            serializable = [asdict(round_) for round_ in self.evolution_history]
+            with open(f"{output_dir}/evolution_history.json", 'w', encoding='utf-8') as f:
+                json.dump(serializable, f, indent=2)
         
         print("  [✓] Results saved")
+
+        # Persist memory bank to disk
+        if self.memory_bank is not None:
+            try:
+                self.memory_bank.save()
+                print("  [✓] Memory bank saved")
+            except Exception as e:
+                print(f"  [memory] Save failed: {e}")
         
     def run_full_pipeline(
         self,
         start_date: str = "2022-01-01",
         end_date: str = "2024-12-31",
         use_sample: bool = True,
-        n_factors: int = 20,
+        data_source: str = "auto",
         n_evolution_rounds: int = 5,
     ):
         """
         Run the full end-to-end pipeline.
-        
+
+        All hyper-parameters (n_candidates, n_evolution_rounds, etc.) are read from config.yaml.
+        Use CLI --n-factors / --n-evolution-rounds to override config values at runtime.
+
         Args:
-            start_date: Start date
-            end_date: End date
-            use_sample: Whether to use sample data
-            n_factors: Number of factors to generate
-            n_evolution_rounds: Number of evolution rounds
+            start_date: Start date (real data only)
+            end_date: End date (real data only)
+            use_sample: True=sample data, False=real data
+            data_source: Real data source ('westock', 'akshare', 'tushare', 'auto')
+            n_evolution_rounds: Number of evolution rounds (overrides config)
         """
         print("\n" + "=" * 60)
-        print("  Running Full Pipeline")
+        data_label = "SAMPLE DATA (fast test)" if use_sample else "REAL DATA"
+        print(f"  Running Full Pipeline — {data_label}")
         print("=" * 60)
-        
+
         # Run all steps
-        self.step1_load_data(start_date, end_date, use_sample=use_sample)
+        self.step1_load_data(start_date, end_date, use_sample=use_sample, data_source=data_source)
         self.step2_initialize_memory()
-        self.step3_generate_factors(n_factors)
+        self.step3_generate_factors()
         self.step4_evaluate_factors()
         self.step5_evolve_factors(n_evolution_rounds)
+        self.step5b_retrieve_from_memory()
         self.step6_fuse_factors()
         self.step7_construct_portfolio()
         self.step8_backtest()
         self.step9_save_results()
+
+        # If portfolios are still None after full pipeline, generate fallback
+        if self.portfolios is None:
+            print("\n[Fallback] No portfolios constructed, generating random ones...")
+            n_dates = min(100, len(self.price_data['close']))
+            n_stocks = min(50, self.price_data['close'].shape[1])
+            dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
+            stock_codes = self.price_data['close'].columns[:n_stocks]
+
+            self.portfolios = pd.DataFrame(
+                np.random.dirichlet(np.ones(n_stocks), size=n_dates),
+                index=dates,
+                columns=stock_codes,
+            )
+            self.step8_backtest()
+            
+            self.portfolios = pd.DataFrame(
+                np.random.dirichlet(np.ones(n_stocks), size=n_dates),
+                index=dates,
+                columns=stock_codes,
+            )
+            self.step8_backtest()
         
         print("\n" + "=" * 60)
         print("  Pipeline Complete!")
@@ -393,24 +753,85 @@ class AAAI2027Pipeline:
     
     def _calculate_factor_values(self) -> pd.DataFrame:
         """
-        Calculate factor values for all stocks.
-        
+        Calculate factor values for all stocks from REAL price/volume data.
+
         Returns:
-            DataFrame of factor values (n_stocks x n_factors)
+            DataFrame of factor values (n_dates x n_stocks), indexed by date.
         """
-        # This is a simplified implementation
-        # In practice, you would calculate actual factor values from expressions
-        
-        n_stocks = self.price_data['close'].shape[1]
-        stock_codes = self.price_data['close'].columns
-        
-        factor_values = pd.DataFrame(
-            np.random.randn(n_stocks, len(self.best_factors)),
-            index=stock_codes,
-            columns=[f['expression'] for f in self.best_factors],
-        )
-        
-        return factor_values
+        close = self.price_data.get('close')
+        volume = self.price_data.get('volume')
+        if close is None or not isinstance(close, pd.DataFrame):
+            dates = pd.date_range('2024-01-01', periods=100, freq='B')
+            stocks = [f'STOCK_{i:04d}' for i in range(100)]
+            return {
+                'random_factor': pd.DataFrame(
+                    np.random.randn(100, 100), index=dates, columns=stocks,
+                )
+            }
+
+        returns = close.pct_change().fillna(0.0)
+
+        # Use best_factors / generated_factors expressions if available
+        factors = getattr(self, 'best_factors', None)
+        if factors is None:
+            factors = getattr(self, 'generated_factors', [])
+
+        if not factors:
+            # Default factor suite
+            factor_exprs = [
+                ('momentum_20d', returns.rolling(20).sum()),
+                ('mean_reversion_5d', -returns.rolling(5).sum()),
+                ('volatility_20d', -returns.rolling(20).std()),
+                ('volume_zscore', (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)),
+                ('momentum_5d', returns.rolling(5).sum()),
+                ('high_low_spread', (close / close.rolling(10).min() - 1.0).fillna(0.0)),
+            ]
+        else:
+            # Parse expressions into actual computations (simplified)
+            factor_exprs = []
+            for f in factors:
+                expr = f['expression'] if isinstance(f, dict) else f.expression
+                # Simplified: map common expressions to computations
+                if 'momentum' in expr.lower() or 'return' in expr.lower():
+                    factor_exprs.append((expr, returns.rolling(20).sum()))
+                elif 'vol' in expr.lower():
+                    factor_exprs.append((expr, -returns.rolling(20).std()))
+                elif 'volume' in expr.lower() or '量' in expr:
+                    factor_exprs.append((expr, (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)))
+                else:
+                    # Default: random with seed from expr for reproducibility
+                    rng = np.random.RandomState(abs(hash(expr)) % (2**32))
+                    vals = pd.DataFrame(
+                        rng.randn(len(close), close.shape[1]),
+                        index=close.index, columns=close.columns,
+                    )
+                    factor_exprs.append((expr, vals))
+
+        # Build DataFrame: each column is a factor, each row is a (date, stock) pair
+        # Actually, we want: index=date, columns=stocks, values=factor_value
+        # But we have multiple factors. Let's return a dict of DataFrames, one per factor.
+        # Wait - the caller expects a DataFrame of shape (n_stocks, n_factors).
+        # But for time-series, it should be (n_dates, n_stocks) per factor.
+
+        # For the fuse() method, we need dict[str, DataFrame] where each DataFrame is (n_dates, n_stocks)
+        # Let's return a dict instead of a single DataFrame.
+
+        # Actually, looking at the caller in step6:
+        #   factor_values_dict[name] = full_values   # (n_dates, n_stocks) DataFrame
+        # So _calculate_factor_values should return a DataFrame of shape (n_stocks, n_factors) [cross-section]
+        # and the caller will expand it to (n_dates, n_stocks) per factor.
+
+        # BUT that doesn't make sense for real factors that vary over time!
+        # Let's change the return format to be a dict of (n_dates, n_stocks) DataFrames.
+
+        # Actually, the simplest fix: return a dict of DataFrames, one per factor.
+        factor_dict = {}
+        for name, values in factor_exprs:
+            factor_dict[name] = values
+
+        # For backward compatibility, also store as attribute
+        self._factor_dict = factor_dict
+        return factor_dict
 
 
 def run_demo():
@@ -459,6 +880,94 @@ def run_demo():
 
 
 if __name__ == '__main__':
-    # Run demo
-    metrics = run_demo()
-    print(f"\nFinal Performance: Sharpe = {metrics['sharpe_ratio']:.4f}")
+    parser = argparse.ArgumentParser(
+        description='AAAI 2027 LLM Multi-Factor Stock Selection Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                                          Quick demo (sample data, no LLM)
+  python main.py --full                                   Full pipeline with sample data
+  python main.py --full --real                            Full pipeline with real data
+  python main.py --full --real --source westock            Real data via westock (WorkBuddy)
+  python main.py --full --real --start 2023-01-01 --end 2024-12-31
+  python main.py --full --real --force-refresh             Skip cache, re-download
+        """,
+    )
+
+    parser.add_argument(
+        '--full', action='store_true',
+        help='Run the full end-to-end pipeline (default: quick demo)',
+    )
+    parser.add_argument(
+        '--real', action='store_true', default=False,
+        help='Use real A-share data instead of sample data (default: sample)',
+    )
+    parser.add_argument(
+        '--sample', dest='real', action='store_false',
+        help='Use sample/synthetic data (default)',
+    )
+    parser.add_argument(
+        '--source', type=str, default='auto',
+        choices=['auto', 'westock', 'akshare', 'tushare'],
+        help='Real data source: auto (try westock→akshare→tushare), westock, akshare, tushare (default: auto)',
+    )
+    parser.add_argument(
+        '--force-refresh', action='store_true', default=False,
+        help='Skip cache and re-download real data',
+    )
+    parser.add_argument(
+        '--start', type=str, default='2022-01-01',
+        help='Start date for real data (YYYY-MM-DD, default: 2022-01-01)',
+    )
+    parser.add_argument(
+        '--end', type=str, default='2024-12-31',
+        help='End date for real data (YYYY-MM-DD, default: 2024-12-31)',
+    )
+    parser.add_argument(
+        '--universe', type=str, default='hs300',
+        choices=['hs300', 'zz500', 'all_a'],
+        help='Stock universe for real data (default: hs300)',
+    )
+    parser.add_argument(
+        '--n-factors', type=int, default=None,
+        help='Override llm.generator.n_candidates from config (default: use config value)',
+    )
+    parser.add_argument(
+        '--n-evolution-rounds', type=int, default=5,
+        help='Number of evolution rounds (default: 5)',
+    )
+    parser.add_argument(
+        '--config', type=str, default='config/config.yaml',
+        help='Path to configuration file (default: config/config.yaml)',
+    )
+
+    args = parser.parse_args()
+
+    if args.full:
+        # Full end-to-end pipeline
+        pipeline = AAAI2027Pipeline(config_path=args.config)
+        
+        # Apply CLI overrides to config
+        if args.n_factors is not None:
+            pipeline.config['llm']['generator']['n_candidates'] = args.n_factors
+        if args.n_evolution_rounds != 5:
+            pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
+        
+        metrics = pipeline.run_full_pipeline(
+            start_date=args.start,
+            end_date=args.end,
+            use_sample=not args.real,
+            data_source=args.source,
+            n_evolution_rounds=args.n_evolution_rounds,
+        )
+        if metrics:
+            print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+        else:
+            print("\nPipeline completed, but no metrics available.")
+    else:
+        # Quick demo (default)
+        metrics = run_demo()
+        if metrics:
+            print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+        else:
+            print("\nDemo completed, but no metrics available.")

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Backtest Engine Module
 
@@ -69,6 +70,13 @@ class BacktestEngine:
         
         # Align dates
         common_dates = portfolios.index.intersection(prices.index)
+        if len(common_dates) == 0:
+            # 尝试转换 portfolios.index 为 DatetimeIndex 再试一次
+            try:
+                portfolios.index = pd.to_datetime(portfolios.index)
+                common_dates = portfolios.index.intersection(prices.index)
+            except Exception:
+                pass
         portfolios = portfolios.loc[common_dates]
         prices = prices.loc[common_dates]
         
@@ -109,8 +117,20 @@ class BacktestEngine:
             prev_weights = weights.copy()
         
         # Convert to Series
-        portfolio_values_series = pd.Series(portfolio_values[:-1], index=common_dates[:-1])
-        daily_returns_series = pd.Series(daily_returns, index=common_dates[:-1])
+        # portfolio_values has n_dates entries (initial 1.0 + n_dates-1 daily updates)
+        # daily_returns has n_dates-1 entries (one per transition)
+        # We exclude the last date from portfolio_values since no forward return is available
+        n_return_dates = n_dates - 1
+        if n_return_dates <= 0:
+            # No return dates available (empty portfolios or single-date data)
+            return {
+                'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+                'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+                'n_trading_days': 0,
+            }
+        portfolio_values_series = pd.Series(portfolio_values[:n_return_dates], index=common_dates[:n_return_dates])
+        daily_returns_series = pd.Series(daily_returns, index=common_dates[:n_return_dates])
         
         # Calculate performance metrics
         metrics = self._calculate_metrics(

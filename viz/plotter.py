@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Visualization Module
 
@@ -8,6 +9,7 @@ Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 Date: 2026-06-07
 """
 
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,7 +19,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Set style
-plt.style.use('seaborn-v0_8-darkgrid')
+try:
+    plt.style.use('seaborn-v0_8-darkgrid')
+except (OSError, ValueError):
+    try:
+        plt.style.use('seaborn-darkgrid')
+    except (OSError, ValueError):
+        plt.style.use('ggplot')  # fallback
 sns.set_palette("husl")
 
 
@@ -402,6 +410,35 @@ def generate_all_figures():
     visualizer.plot_baseline_comparison(baseline_results)
     
     print("\nAll figures generated successfully!")
+
+
+if __name__ == '__main__':
+    """
+    Standalone entry point: generate all figures for the paper.
+    
+    Usage:
+        python viz/plotter.py
+        python viz/plotter.py --output paper/figures
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Generate figures for AAAI 2027 paper',
+    )
+    parser.add_argument(
+        '--output', type=str, default='paper/figures',
+        help='Output directory for figures (default: paper/figures)',
+    )
+    args = parser.parse_args()
+    
+    print("=" * 60)
+    print("  Generating Figures for AAAI 2027 Paper")
+    print("=" * 60)
+    
+    generate_all_figures()
+    
+    print(f"\nFigures saved to {args.output}/")
+    print("=" * 60)
 
 
 if __name__ == '__main__':

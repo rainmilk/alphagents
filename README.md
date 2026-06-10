@@ -3,7 +3,8 @@
 ## Overview
 
 This is the complete codebase for the AAAI 2027 paper:  
-**"LLM-Driven Self-Evolving Multi-Factor Stock Selection with State-Aware Memory"**
+**"LLM-Driven Self-Evolving Multi-Factor Stock Selection with State-Aware Memory"**  
+(MASE: Memory-Augmented Self-Evolving Framework)
 
 ## Project Structure
 
@@ -11,25 +12,33 @@ This is the complete codebase for the AAAI 2027 paper:
 AAAI2027_LLM_MultiFactor/
 ├── config/                 # Configuration files
 │   └── config.yaml        # Main configuration
-├── data/                  # Data loading and preprocessing
-│   └── loader.py          # Data loader module
+├── data/                  # Data loading and output
+│   ├── loader.py          # Data loader (sample / real A-share data)
+│   ├── raw/               # Raw data (AkShare kline CSVs)
+│   ├── train/             # Train split CSVs (price/fundamental/industry)
+│   ├── test/              # Test split CSVs (price/fundamental/industry)
+│   └── memory_bank.json/  # Factor memory bank snapshots
 ├── methods/               # Core methods (4 modules)
 │   ├── debate.py         # Multi-agent debate evaluator
 │   ├── evolve.py         # Self-evolving factor generator
-│   ├── memory.py         # Factor memory bank
-│   └── fusion.py         # Factor fusion and portfolio construction
+│   ├── memory.py         # State-aware factor memory bank (FAISS)
+│   └── fusion.py         # ICIR-weighted factor fusion + portfolio construction
 ├── backtest/              # Backtest engine
 │   └── engine.py         # Backtest simulation
 ├── metrics/               # Evaluation metrics
 │   └── evaluator.py      # Comprehensive metrics
 ├── viz/                   # Visualization tools
-│   └── plotter.py        # Plotting functions
+│   └── plotter.py        # Plotting functions (standalone runnable)
 ├── experiments/           # Experiment results
-│   └── results/          # Output directory
+│   ├── results/          # Fixed output directory (portfolios, baselines, etc.)
+│   └── {yyyymmdd}/       # Date-stamped run outputs
+│       └── debate/       # Debate expert opinions (JSON)
 ├── paper/                 # Paper-related files
 │   └── figures/          # Generated figures
-├── main.py                # Main pipeline
+├── main.py                # Main pipeline (argparse CLI)
 ├── run_experiments.py     # Experiment runner
+├── test_train_test_split.py # Train/test split verification script
+├── sync_evolve_to_feishu.py # Feishu sync helper
 ├── requirements.txt       # Dependencies
 └── README.md             # This file
 ```
@@ -53,12 +62,29 @@ pip install -r requirements.txt
 
 ### 3. (Optional) Install LLM APIs
 
-For full functionality, you need API access to:
+For full LLM-driven functionality, you need API access to:
 - OpenAI GPT-4o (for factor evaluation)
 - DeepSeek (for factor generation)
 - Sentence Transformers (for factor embedding)
 
 ## Usage
+
+### Data Source Selection
+
+The pipeline supports two data modes controlled by a single switch:
+
+| Mode | Flag | Data | Use Case |
+|---|---|---|---|
+| **Sample** (default) | `--sample` or no flag | Synthetic random walk data (100 stocks × 500 days) | Fast testing, CI, no external API needed |
+| **Real** | `--real` | A-share data via westock → AkShare → Tushare → synthetic fallback | Production, paper experiments |
+
+**Real data source chain** (automatic fallback):
+1. **westock** — WorkBuddy built-in A-share data (preferred, no extra setup)
+2. **AkShare** — Open-source Python library (`pip install akshare`)
+3. **Tushare** — Requires token (`pip install tushare`, set `TUSHARE_TOKEN`)
+4. **Synthetic** — Final fallback (same shape, random data)
+
+Real data is cached to `data/cache_*.pkl` after first load. Use `--force-refresh` to skip cache.
 
 ### Quick Demo (No LLM Required)
 
@@ -68,25 +94,65 @@ Run a quick demo without LLM calls:
 python main.py
 ```
 
-This will run the pipeline with sample data and random portfolios.
+This runs the pipeline with sample data and random portfolios.
 
-### Full Pipeline
+### Full Pipeline (Sample Data)
 
-Run the complete end-to-end pipeline:
+Run the complete end-to-end pipeline with synthetic data:
 
 ```bash
 python main.py --full
 ```
 
-This will:
-1. Load data
-2. Generate factors using LLM
-3. Evaluate factors (multi-agent debate)
-4. Evolve factors (self-improving)
-5. Retrieve from memory (state-aware)
-6. Fuse factors (ICIR-weighted)
-7. Construct portfolio
-8. Backtest and evaluate
+### Full Pipeline (Real A-Share Data)
+
+```bash
+# Auto-detect best available source
+python main.py --full --real
+
+# Specify data source
+python main.py --full --real --source westock
+python main.py --full --real --source akshare
+
+# Custom date range + universe
+python main.py --full --real --start 2023-01-01 --end 2024-12-31 --universe hs300
+
+# Skip cache, force re-download
+python main.py --full --real --force-refresh
+```
+
+### Pipeline Steps (--full mode)
+
+1. **Load data** — sample or real A-share data with preprocessing; saves train/test splits as CSVs to `data/train/` and `data/test/`
+2. **Initialize memory** — FAISS-backed factor memory bank
+3. **Generate factors** — LLM-driven seed factor generation
+4. **Evaluate factors** — Multi-agent debate (5 experts)
+5. **Evolve factors** — Self-improving iterative evolution
+6. **Retrieve from memory** — State-aware top-k factor retrieval
+7. **Fuse factors** — ICIR-weighted fusion with correlation penalty
+8. **Construct portfolio** — Top-N portfolio with risk constraints
+9. **Backtest & save** — Performance metrics + evolution history
+
+### CLI Reference
+
+```
+python main.py [OPTIONS]
+
+Options:
+  --full                   Run full end-to-end pipeline (default: quick demo)
+  --real                   Use real A-share data (default: sample data)
+  --sample                 Use sample/synthetic data (default)
+  --source {auto,westock,akshare,tushare}
+                           Real data source (default: auto)
+  --force-refresh          Skip cache, re-download real data
+  --start DATE             Start date for real data (default: 2022-01-01)
+  --end DATE               End date for real data (default: 2024-12-31)
+  --universe {hs300,zz500,all_a}
+                           Stock universe for real data (default: hs300)
+  --n-factors N            Number of factors (default: from config.yaml n_candidates)
+  --n-evolution-rounds N   Number of evolution rounds (default: 5)
+  --config PATH            Path to config file (default: config/config.yaml)
+```
 
 ### Run Experiments
 
@@ -96,7 +162,7 @@ Run all experiments for the paper:
 python run_experiments.py
 ```
 
-This will run:
+This runs:
 - Main experiment (5 runs)
 - Ablation studies (remove each component)
 - Baseline comparisons
@@ -121,23 +187,24 @@ Implements structured debate among 5 expert agents:
 - Volatility Expert
 - Growth Expert
 
-Each agent evaluates factors independently, then engages in structured debate.
+Each agent evaluates factors independently (Phase 1), then engages in structured debate rounds (Phase 2) with full reproducibility. All expert opinions — scores, reasoning, concerns, strengths, and per-round consensus — are saved to `experiments/{yyyymmdd}/debate/debate_factors_result.json` for post-hoc analysis.
 
 ### 2. Self-Evolving Factor Generator (`methods/evolve.py`)
 
 Generates factors through iterative evolution:
 - Generate seed factors (LLM)
-- Backtest and evaluate
+- Backtest and evaluate via `FactorBacktester`
 - Reflect on failures
 - Generate improvements
 - Repeat until convergence
+- Returns `EvolutionResult` (dataclass with `EvolutionRound` history)
 
-### 3. Factor Memory Bank (`methods/memory.py`)
+### 3. State-Aware Factor Memory Bank (`methods/memory.py`)
 
 Stores and retrieves historical high-quality factors:
-- Encode market state (4 dimensions)
+- Encode market state (4 dimensions: vix, trend, dispersion, turnover)
 - Embed factors (Sentence-BERT)
-- Retrieve similar factors (state-aware)
+- Retrieve similar factors (state-aware, FAISS `IndexFlatIP`)
 - Update quality scores (online learning)
 
 ### 4. Factor Fusion & Portfolio Construction (`methods/fusion.py`)
@@ -146,7 +213,7 @@ Fuses multiple factors into a composite score:
 - Normalize factors (Z-score/Rank)
 - Weight by ICIR (dynamic)
 - Penalize correlations
-- Construct portfolio (Top-N)
+- Construct portfolio via `PortfolioConstructor` (Top-N, returns `list[Portfolio]` dataclass)
 - Apply risk constraints
 
 ## Configuration
@@ -161,18 +228,23 @@ Edit `config/config.yaml` to customize:
 
 ## Results
 
-All results are saved to `experiments/results/`:
+All results are saved to `experiments/results/` (fixed) and `experiments/{yyyymmdd}/` (date-stamped per-run):
 - `performance_metrics.csv`: Main results
+- `portfolios.csv`: Portfolio weights
+- `evolution_history.json`: Evolution round history (serialized from dataclass)
 - `ablation_studies.json`: Ablation study results
 - `baseline_comparisons.json`: Baseline comparison results
-- `evolution_history.json`: Evolution history
+- `self_evolve/round_*/generated_factors.json`: Factor evolution snapshots
+- `debate/debate_factors_result.json`: All expert opinions (scores, reasoning, concerns, strengths) across independent evaluation and debate rounds
+
+Train/test data persists as CSVs under `data/train/` and `data/test/` with `data/split_info.json` metadata.
 
 ## Paper Writing
 
 The paper is structured as follows:
 1. **Introduction**: Motivation and contributions
 2. **Related Work**: LLM for finance, factor selection
-3. **Methodology**: 4 core modules
+3. **Methodology**: 4 core modules (MASE framework)
 4. **Experiments**: Main results, ablation, baselines
 5. **Conclusion**: Summary and future work
 
@@ -193,6 +265,21 @@ export DEEPSEEK_API_KEY="your_key"
 ### Issue: "Out of memory"
 
 Reduce the number of stocks or factors in `config.yaml`.
+
+### Issue: "No real data source available"
+
+The pipeline falls back to synthetic data automatically. To use real data:
+1. **westock**: Available inside WorkBuddy sessions — no setup needed
+2. **AkShare**: `pip install akshare`
+3. **Tushare**: Register at tushare.pro, set `TUSHARE_TOKEN` env var
+
+### Issue: "UnicodeDecodeError: 'gbk' codec can't decode"
+
+All source files now include `# -*- coding: utf-8 -*-` declarations and all `open()` calls specify `encoding='utf-8'`. This error should no longer occur.
+
+### Issue: "TypeError: Object of type XXX is not JSON serializable"
+
+Evolution history uses `dataclasses.asdict()` for serialization. All dataclass objects (`EvolutionRound`, `CandidateFactor`, `Portfolio`) are now properly handled.
 
 ## Citation
 

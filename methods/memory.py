@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Factor Memory Bank (因子记忆库)
 =================================
@@ -484,6 +485,10 @@ class FactorMemoryBank:
         self._faiss_index = None
         self._embeddings_cache: dict[str, np.ndarray] = {}  # factor_id -> embedding
 
+    def __len__(self) -> int:
+        """Return number of stored factors."""
+        return len(self.factors)
+
     # ── Public API ────────────────────────────
 
     def add(
@@ -530,7 +535,7 @@ class FactorMemoryBank:
         # 更新向量索引
         emb = self.embedder.embed(description, expression)
         self._embeddings_cache[factor_id] = emb
-        self._update_faiss_index()
+        self._update_faiss_index(new_embedding=emb)
 
         print(f"[MemoryBank] Added factor {factor_id}: {expression[:60]}...")
         return factor_id
@@ -589,10 +594,10 @@ class FactorMemoryBank:
 
         # 5. 综合得分
         final_scores = []
-        for sim, ss in zip(similarities, state_scores):
+        for idx, (sim, ss) in enumerate(zip(similarities, state_scores)):
             score = (1 - state_weight) * sim + state_weight * ss
             # 质量评分作为乘法权重
-            quality = candidates[similarities.index(sim)].quality_score()
+            quality = candidates[idx].quality_score()
             final_scores.append(score * quality)
 
         # 6. 排序并返回 top-k
@@ -638,7 +643,7 @@ class FactorMemoryBank:
         else:
             # 保存原始 embeddings
             embeddings = {fid: emb.tolist() for fid, emb in self._embeddings_cache.items()}
-            with open(p / "embeddings.json", "w") as f:
+            with open(p / "embeddings.json", "w", encoding="utf-8") as f:
                 json.dump(embeddings, f)
 
         print(f"[MemoryBank] Saved {len(self.factors)} factors to {p}")
@@ -660,7 +665,7 @@ class FactorMemoryBank:
             import faiss
             self._faiss_index = faiss.read_index(str(p / "faiss.index"))
         elif (p / "embeddings.json").exists():
-            with open(p / "embeddings.json", "r") as f:
+            with open(p / "embeddings.json", "r", encoding="utf-8") as f:
                 embeddings = json.load(f)
             self._embeddings_cache = {k: np.array(v, dtype=np.float32) for k, v in embeddings.items()}
 
@@ -690,19 +695,30 @@ class FactorMemoryBank:
         self._embeddings_cache[f.factor_id] = emb
         return emb
 
-    def _update_faiss_index(self):
-        """重建 FAISS 索引（新增因子后调用）"""
+    def _update_faiss_index(self, new_embedding: Optional[np.ndarray] = None):
+        """更新 FAISS 索引（新增因子后调用）。
+        
+        如果是首次创建则重建索引；如果已有索引则增量添加新向量，
+        避免 O(n²) 的全量重建。
+        """
         if not self.use_faiss:
             return
         try:
             import faiss
             dim = 384  # Sentence-BERT MiniLM 维度
-            self._faiss_index = faiss.IndexFlatIP(dim)  # Inner Product（余弦相似度）
-            if self._embeddings_cache:
-                embs = np.array(list(self._embeddings_cache.values()), dtype=np.float32)
-                # 归一化（使内积 = 余弦相似度）
-                faiss.normalize_L2(embs)
-                self._faiss_index.add(embs)
+            
+            if self._faiss_index is None:
+                # 首次创建：全量构建
+                self._faiss_index = faiss.IndexFlatIP(dim)
+                if self._embeddings_cache:
+                    embs = np.array(list(self._embeddings_cache.values()), dtype=np.float32)
+                    faiss.normalize_L2(embs)
+                    self._faiss_index.add(embs)
+            elif new_embedding is not None:
+                # 增量添加：仅添加新向量
+                emb = new_embedding.copy().reshape(1, -1).astype(np.float32)
+                faiss.normalize_L2(emb)
+                self._faiss_index.add(emb)
         except ImportError:
             self.use_faiss = False
 
