@@ -143,11 +143,30 @@ class MarketStateEncoder:
         """
         Parameters
         ----------
-        price_df : pd.DataFrame, columns=['close', ...], index=date
+        price_df : pd.DataFrame
+            Either:
+              - columns=['close', ...], index=date  (single-asset price series)
+              - columns=stock_codes, index=date (multi-stock cross-sectional)
+                In this case, a market index proxy is computed automatically
+                via cross-sectional mean.
         vix : float, optional. 如果为 None，用 price_df['close'] 的滚动波动率代替
         shibor : float, optional. 如果为 None，默认 NORMAL
         corr_matrix : pd.DataFrame, optional. 个股收益率相关性矩阵；如果为 None，默认 MEDIUM
         """
+        # --- Normalize input: accept both single-asset and multi-stock shapes ---
+        if price_df is not None and "close" not in price_df.columns:
+            # Multi-stock DataFrame: compute market index proxy (cross-sectional mean)
+            if len(price_df.columns) > 0:
+                market_close = price_df.mean(axis=1)
+                price_df = pd.DataFrame({"close": market_close})
+            else:
+                # Empty DataFrame: return conservative defaults
+                return MarketState(
+                    vol=VolRegime.MEDIUM,
+                    liquidity=LiquidityRegime.NORMAL,
+                    trend=TrendRegime.SIDEWAYS,
+                    correlation=CorrelationRegime.MEDIUM,
+                )
         # 1. Volatility regime
         if vix is not None:
             vol = self._vol_from_vix(vix)

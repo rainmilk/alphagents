@@ -17,6 +17,9 @@ import re
 import warnings
 import os
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
 # Try to import scipy for Spearman rank correlation; fall back to pandas-only
@@ -75,7 +78,8 @@ _TOKEN_RE = re.compile(
     r'\s*(?:'
     r'(?P<number>\d+\.?\d*(?:[eE][+-]?\d+)?)'  # number
     r'|(?P<ident>[a-zA-Z_]\w*)'                   # identifier / function name
-    r'|(?P<op>[+\-*/^])'                           # operator
+    r'|(?P<cmp>[<>!=]=|[<>!=])'                   # comparison operators: >=, <=, ==, !=, >, <, !
+    r'|(?P<op>[+\-*/^])'                          # arithmetic operator
     r'|(?P<paren>[()])'                            # parentheses
     r'|(?P<comma>,)'                               # comma
     r'|(?P<invalid>\S+)'                           # catch-all
@@ -98,6 +102,8 @@ def _tokenize(expr: str) -> List[tuple]:
             tokens.append(('NUMBER', float(value)))
         elif kind == 'ident':
             tokens.append(('IDENT', value))
+        elif kind == 'cmp':
+            tokens.append(('CMP', value))
         elif kind == 'op':
             tokens.append(('OP', value))
         elif kind == 'paren':
@@ -129,6 +135,7 @@ class _FactorExprEvaluator:
         ts_sum(X, w)     — rolling sum
         ts_delta(X, w)   — X - delay(X, w)
         ts_zscore(X, w)  — rolling z-score
+        ts_decay(X, w)   — exponential weighted moving average (EWMA)
         delay(X, d)      — lag by d periods
         sign(X)          — element-wise sign
         abs(X)           — element-wise absolute value
@@ -150,9 +157,23 @@ class _FactorExprEvaluator:
 
     def evaluate(self, expr: str) -> pd.DataFrame:
         """Parse and evaluate a factor expression."""
+        # --- Input validation ---
+        if not expr or not expr.strip():
+            raise ValueError("Empty factor expression")
+
         self._tokens = _tokenize(expr)
         self._pos = 0
-        result = self._parse_expression()
+
+        if not self._tokens:
+            raise ValueError(f"No valid tokens in expression: {repr(expr)}")
+
+        try:
+            result = self._parse_expression()
+        except ValueError as e:
+            raise ValueError(
+                f"Parse error in expression '{expr}': {e}"
+            ) from e
+
         # Ensure result is a DataFrame (not a scalar or Series)
         if isinstance(result, (int, float)):
             # Broadcast scalar to same shape as first data source
@@ -177,17 +198,37 @@ class _FactorExprEvaluator:
         return tok
 
     def _parse_expression(self) -> pd.DataFrame:
-        """expression := term (('+' | '-') term)*"""
-        left = self._parse_term()
+        """expression := comparison (('+' | '-') comparison)*"""
+        left = self._parse_comparison()
         while self._peek()[0] == 'OP' and self._peek()[1] in ('+', '-'):
             op = self._advance()[1]
-            right = self._parse_term()
+            right = self._parse_comparison()
             if op == '+':
                 left = left + right
             else:
                 left = left - right
         return left
 
+
+    def _parse_comparison(self) -> pd.DataFrame:
+        """comparison := term (CMP term)*"""
+        left = self._parse_term()
+        while self._peek()[0] == "CMP":
+            op = self._advance()[1]
+            right = self._parse_term()
+            if op == ">":
+                left = (left > right).astype(float)
+            elif op == "<":
+                left = (left < right).astype(float)
+            elif op == ">=":
+                left = (left >= right).astype(float)
+            elif op == "<=":
+                left = (left <= right).astype(float)
+            elif op == "==":
+                left = (left == right).astype(float)
+            elif op == "!=":
+                left = (left != right).astype(float)
+        return left
     def _parse_term(self) -> pd.DataFrame:
         """term := factor (('*' | '/') factor)*"""
         left = self._parse_unary()
@@ -202,13 +243,14 @@ class _FactorExprEvaluator:
 
     def _parse_unary(self) -> pd.DataFrame:
         """unary := ('+' | '-')? atom"""
-        if self._peek()[0] == 'OP' and self._peek()[1] == '-':
-            self._advance()
-            return -self._parse_unary()
-        if self._peek()[0] == 'OP' and self._peek()[1] == '+':
-            self._advance()
-            return self._parse_unary()
-        return self._parse_atom()
+        sign = 1
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('+', '-'):
+            if self._advance()[1] == '-':
+                sign = -sign
+        result = self._parse_atom()
+        if sign == -1:
+            return -result
+        return result
 
     def _parse_atom(self) -> pd.DataFrame:
         """atom := NUMBER | IDENT ['(' args ')'] | '(' expression ')' | POWER"""
@@ -232,6 +274,19 @@ class _FactorExprEvaluator:
             if self._peek()[0] == 'PAREN' and self._peek()[1] == '(':
                 return self._parse_func_call(name)
             # Otherwise it's a data column
+
+            # Handle special literals: NaN / Inf / -Inf
+            uname = name.upper()
+            if uname == "NAN":
+                template = next(iter(self._data.values()))
+                return pd.DataFrame(np.nan, index=template.index, columns=template.columns)
+            if uname == "INF":
+                template = next(iter(self._data.values()))
+                return pd.DataFrame(np.inf, index=template.index, columns=template.columns)
+            if uname == "-INF":
+                template = next(iter(self._data.values()))
+                return pd.DataFrame(-np.inf, index=template.index, columns=template.columns)
+
             return self._lookup_data(name)
 
         raise ValueError(f"Unexpected token {tok}")
@@ -277,11 +332,13 @@ class _FactorExprEvaluator:
             'ts_sum':     (2, 2),
             'ts_delta':   (2, 2),
             'ts_zscore':  (2, 2),
+            'ts_decay':   (2, 2),
             'delay':      (2, 2),
             'sign':       (1, 1),
             'abs':        (1, 1),
             'log':        (1, 1),
             'sqrt':       (1, 1),
+            'if':         (3, 3),
         }
 
         if name in arity_map:
@@ -337,7 +394,7 @@ class _FactorExprEvaluator:
     def _fn_ts_corr(x: pd.DataFrame, y: pd.DataFrame, window) -> pd.DataFrame:
         """Rolling Pearson correlation between x and y (per stock)."""
         w = _FactorExprEvaluator._safe_int(window)
-        return x.rolling(window=w, min_periods=max(5, w // 2)).corr(y)
+        return x.rolling(window=w, min_periods=max(10, w)).corr(y)
 
     @staticmethod
     def _fn_ts_mean(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -347,7 +404,7 @@ class _FactorExprEvaluator:
     @staticmethod
     def _fn_ts_std(x: pd.DataFrame, window) -> pd.DataFrame:
         w = _FactorExprEvaluator._safe_int(window)
-        return x.rolling(window=w, min_periods=max(2, w // 2)).std(ddof=0)
+        return x.rolling(window=w, min_periods=max(5, w * 2 // 3)).std(ddof=0)
 
     @staticmethod
     def _fn_ts_min(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -372,8 +429,8 @@ class _FactorExprEvaluator:
     @staticmethod
     def _fn_ts_zscore(x: pd.DataFrame, window) -> pd.DataFrame:
         w = _FactorExprEvaluator._safe_int(window)
-        mean = x.rolling(window=w, min_periods=max(2, w // 2)).mean()
-        std = x.rolling(window=w, min_periods=max(2, w // 2)).std(ddof=0)
+        mean = x.rolling(window=w, min_periods=max(5, w * 2 // 3)).mean()
+        std = x.rolling(window=w, min_periods=max(5, w * 2 // 3)).std(ddof=0)
         return (x - mean) / std.replace(0, np.nan)
 
     @staticmethod
@@ -397,6 +454,18 @@ class _FactorExprEvaluator:
     def _fn_sqrt(x: pd.DataFrame) -> pd.DataFrame:
         return np.sqrt(x.clip(lower=0))
 
+    @staticmethod
+    def _fn_ts_decay(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Exponential weighted moving average (EWMA / decay)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        return x.ewm(span=w, adjust=False, min_periods=max(3, w // 2)).mean()
+
+
+
+    @staticmethod
+    def _fn_if(cond: pd.DataFrame, x: pd.DataFrame, y: pd.DataFrame) -> pd.DataFrame:
+        """if(cond, x, y) — element-wise ternary: return x where cond!=0, else y."""
+        return x.where(cond != 0, y)
 
 # ---------------------------------------------------------------------------
 # FactorBacktester — lightweight factor backtesting engine
@@ -435,6 +504,9 @@ class FactorBacktester:
         volume: Optional[pd.DataFrame] = None,
         fundamentals: Optional[Dict[str, pd.DataFrame]] = None,
         forward_period: int = _DEFAULT_FORWARD_PERIOD,
+        use_qlib: bool = False,
+        qlib_provider_uri: Optional[str] = None,
+        qlib_topk: int = 50,
     ):
         """
         Initialize the backtester.
@@ -445,6 +517,9 @@ class FactorBacktester:
             volume: Volume DataFrame, used only when prices is a DataFrame (legacy API).
             fundamentals: Optional dict of fundamental DataFrames (pe, pb, roe, market_cap).
             forward_period: Forward return horizon in trading days.
+            use_qlib: If True, use Qlib's professional backtesting for IC/metrics.
+            qlib_provider_uri: Qlib data path (only used when use_qlib=True).
+            qlib_topk: Portfolio size for Qlib backtest (only used when use_qlib=True).
         """
         # ---- Normalise price_data ----
         if isinstance(prices, dict):
@@ -455,6 +530,11 @@ class FactorBacktester:
                 self.price_data['volume'] = volume.copy()
         else:
             raise TypeError(f"prices must be dict or DataFrame, got {type(prices)}")
+
+        # Qlib integration flags
+        self.use_qlib = use_qlib
+        self.qlib_provider_uri = qlib_provider_uri
+        self.qlib_topk = qlib_topk
 
         # Pad missing price fields with empty DataFrames
         for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
@@ -512,6 +592,9 @@ class FactorBacktester:
         """
         Evaluate a candidate factor.
 
+        If self.use_qlib is True, delegates to evaluate_qlib() for
+        professional backtesting via Microsoft Qlib.
+
         Args:
             factor: CandidateFactor with .expression set.
 
@@ -519,6 +602,14 @@ class FactorBacktester:
             Dict with keys: ic, ic_ir, sharpe, win_rate, max_drawdown,
                             long_short_ret, factor_values.
         """
+        # Delegate to Qlib if enabled
+        if self.use_qlib:
+            return self.evaluate_qlib(
+                factor,
+                provider_uri=self.qlib_provider_uri,
+                topk=self.qlib_topk,
+            )
+
         expr = factor.expression
 
         # Check cache
@@ -577,7 +668,7 @@ class FactorBacktester:
 
         except Exception as e:
             import traceback
-            print(f"  [backtest] Factor evaluation failed for '{expr}': {e}")
+            logger.warning("Factor evaluation failed for '%s': %s", expr, e)
             traceback.print_exc()
             return self._empty_metrics()
 
@@ -589,6 +680,124 @@ class FactorBacktester:
             'long_short_ret': pd.Series(dtype=float),
             'factor_values': pd.DataFrame(),
         }
+
+    def evaluate_qlib(
+        self,
+        factor: 'CandidateFactor',
+        factor_values: Optional[pd.DataFrame] = None,
+        provider_uri: Optional[str] = None,
+        topk: int = 50,
+    ) -> Dict:
+        """
+        Evaluate a candidate factor using Qlib's professional backtesting.
+
+        Uses Qlib's TopkDropoutStrategy + BacktestExecutor for realistic
+        portfolio simulation with signal delay and trading costs.
+
+        Args:
+            factor: CandidateFactor with .expression set.
+            factor_values: Pre-computed factor values (optional; computed if None).
+            provider_uri: Qlib data path (default: ~/.qlib/qlib_data/cn_data).
+            topk: Number of stocks in portfolio.
+
+        Returns:
+            Dict with keys: ic, ic_ir, rank_ic, rank_icir,
+                            long_short_sharpe, long_short_return,
+                            win_rate, max_drawdown
+        """
+        from backtest.qlib_backtester import QlibBacktester
+
+        expr = factor.expression
+
+        # Compute factor values if not provided
+        if factor_values is None:
+            try:
+                factor_values = self.compute_factor_values(expr)
+            except Exception as e:
+                logger.warning("Qlib eval: failed to compute factor values for '%s': %s", expr, e)
+                return self._empty_metrics()
+
+        if factor_values.empty or factor_values.isna().all().all():
+            return self._empty_metrics()
+
+        # Get date bounds from data
+        close_df = self.price_data.get('close')
+        if close_df is None or close_df.empty:
+            return self._empty_metrics()
+
+        start_time = str(close_df.index[0].date())
+        end_time = str(close_df.index[-1].date())
+
+        # Convert stock codes to Qlib format (SH600000 / SZ000001)
+        factor_values_qlib = self._to_qlib_codes(factor_values)
+
+        # Run Qlib evaluation
+        bt = QlibBacktester(
+            provider_uri=provider_uri or '~/.qlib/qlib_data/cn_data',
+            topk=topk,
+        )
+        qlib_metrics = bt.evaluate_factor(
+            factor_values_qlib,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        # Update factor object with Qlib metrics
+        factor.ic = qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0))
+        # Map long_short_sharpe to sharpe for compatibility
+        factor.sharpe = qlib_metrics.get('long_short_sharpe', 0.0)
+        factor.win_rate = qlib_metrics.get('win_rate', 0.5)
+
+        # Normalize output to match standard evaluate() return format
+        return {
+            'ic': qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0)),
+            'ic_ir': qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0)),
+            'sharpe': qlib_metrics.get('long_short_sharpe', 0.0),
+            'win_rate': qlib_metrics.get('win_rate', 0.5),
+            'max_drawdown': qlib_metrics.get('max_drawdown', 0.0),
+            'long_short_ret': pd.Series(dtype=float),  # Qlib handles internally
+            'factor_values': factor_values,             # Computed locally
+        }
+
+    def _to_qlib_codes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert stock codes to Qlib format (SH600000 / SZ000001).
+
+        Recognizes common A-share code formats:
+          - 600000.SH, 000001.SZ → SH600000, SZ000001
+          - SH600000, SZ000001   → unchanged (already Qlib format)
+          - 600000, 000001       → SH600000, SZ000001 (inferred from first digit)
+        """
+        new_cols = []
+        for col in df.columns:
+            col_str = str(col).strip()
+            # Already Qlib format?
+            if col_str.startswith(('SH', 'SZ', 'BJ')) and len(col_str) == 8:
+                new_cols.append(col_str)
+                continue
+
+            # Remove .SH/.SZ/.BJ suffix
+            for suffix in ('.SH', '.SZ', '.BJ', '.sh', '.sz', '.bj'):
+                if col_str.endswith(suffix):
+                    code = col_str[:-len(suffix)]
+                    market = suffix.upper().replace('.', '')
+                    new_cols.append(f'{market}{code}')
+                    break
+            else:
+                # Bare number — infer market from first digit
+                if col_str.startswith('6'):
+                    new_cols.append(f'SH{col_str}')
+                elif col_str.startswith(('0', '3')):
+                    new_cols.append(f'SZ{col_str}')
+                elif col_str.startswith(('8', '4')):
+                    new_cols.append(f'BJ{col_str}')
+                else:
+                    # Unknown format, keep as-is
+                    new_cols.append(col_str)
+
+        result = df.copy()
+        result.columns = new_cols
+        return result
 
     def clear_cache(self):
         """Clear cached metrics."""
@@ -622,7 +831,7 @@ class FactorBacktester:
                 try:
                     results.append(self.evaluate(factor))
                 except Exception as e:
-                    print(f"  [backtest] Eval failed for '{factor.expression}': {e}")
+                    logger.warning("Eval failed for '%s': %s", factor.expression, e)
                     results.append(self._empty_metrics())
             return results
 
@@ -653,7 +862,7 @@ class FactorBacktester:
                         }
                 return metrics
             except Exception as e:
-                print(f"  [backtest] Batch eval failed for '{expr}': {e}")
+                logger.warning("Batch eval failed for '%s': %s", expr, e)
                 return self._empty_metrics()
 
         results = [None] * len(factors)
@@ -819,7 +1028,12 @@ class FactorBacktester:
 
     def compute_factor_values(self, expression: str) -> pd.DataFrame:
         """Compute raw factor values for a given expression."""
-        return self.evaluator.evaluate(expression)
+        try:
+            return self.evaluator.evaluate(expression)
+        except ValueError as e:
+            raise ValueError(
+                f"Failed to compute factor values for '{expression}': {e}"
+            ) from e
 
     def rank_ic(self, expression: str) -> Tuple[float, float]:
         """Compute Rank IC and ICIR for a factor expression."""

@@ -147,6 +147,65 @@ class BacktestEngine:
         
         return metrics
     
+    def run_qlib(
+        self,
+        factor_values: pd.DataFrame,
+        start_time: str,
+        end_time: str,
+        provider_uri: Optional[str] = None,
+        topk: Optional[int] = None,
+        **kwargs,
+    ) -> Dict:
+        """
+        Run backtest using Qlib's professional framework.
+
+        This delegates to QlibBacktester for a full portfolio simulation
+        with realistic signal delay, trading costs, and risk controls.
+
+        Args:
+            factor_values: DataFrame of factor values (dates × Qlib-format stock codes)
+            start_time: Backtest start date (YYYY-MM-DD)
+            end_time: Backtest end date (YYYY-MM-DD)
+            provider_uri: Qlib data path (default from config or ~/.qlib/qlib_data/cn_data)
+            topk: Number of stocks in portfolio (default 50)
+            **kwargs: Passed to QlibBacktester constructor
+
+        Returns:
+            Dict of performance metrics compatible with run() output
+        """
+        from .qlib_backtester import QlibBacktester
+
+        bt_kwargs = {
+            'commission': self.commission,
+            'slippage': self.slippage,
+        }
+        if provider_uri:
+            bt_kwargs['provider_uri'] = provider_uri
+        if topk:
+            bt_kwargs['topk'] = topk
+        bt_kwargs.update(kwargs)
+
+        qlib_bt = QlibBacktester(**bt_kwargs)
+        result = qlib_bt.run(factor_values, start_time, end_time)
+
+        # Store results in engine state for compatibility
+        self.qlib_metrics = result
+
+        # Map to our standard metric names where possible
+        mapped = {
+            'total_return': result.get('total_return', 0),
+            'annual_return': result.get('annual_return', 0),
+            'annual_volatility': result.get('annual_volatility', 0),
+            'sharpe_ratio': result.get('sharpe', 0),
+            'max_drawdown': result.get('max_drawdown', 0),
+            'calmar_ratio': result.get('calmar_ratio', 0),
+            'information_ratio': result.get('information_ratio', 0),
+            'win_rate': result.get('win_rate', 0.5),
+            'avg_turnover': result.get('turnover', 0),
+            'n_trading_days': 0,  # Qlib handles this internally
+        }
+        return mapped
+
     def _calculate_metrics(
         self,
         portfolio_values: pd.Series,

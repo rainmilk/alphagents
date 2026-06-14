@@ -4,8 +4,13 @@
 # ==================== Data Configuration ====================
 data:
   # Data source
-  source: "tushare"  # or "akshare", "westock", "auto"
+  source: "tushare"  # or "akshare", "westock", "qlib", "auto"
   tushare_token: "bc3ab6199bac87d1f17ec1ad5aca6d9c1f28382c12325b943622f275"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
+  
+  # Qlib config (used when source="qlib" or "auto")
+  qlib:
+    provider_uri: "qlib_data/cn_data"  # Qlib data directory (auto-download if missing)
+    auto_download: true  # auto-download cn_data if not found
   
   # Stock universe
   universe:
@@ -165,6 +170,15 @@ backtest:
   # Benchmark
   benchmark:
     name: "hs300"
+
+  # Qlib backtesting engine (optional, pip install qlib)
+  qlib:
+    enable: false         # set to true to use Qlib for backtesting
+    topk: 50              # number of stocks in portfolio
+    n_drop: 5             # stocks replaced per rebalance
+    limit_threshold: 0.095  # A-share price limit (9.5%)
+    hold_thresh: 1        # minimum holding days
+    freq: "day"           # rebalance frequency ("day" or "week")
 
 # ==================== Experiment Configuration ====================
 experiment:

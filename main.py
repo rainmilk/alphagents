@@ -134,6 +134,7 @@ class AAAI2027Pipeline:
                 end_date=end_date or self.config['data']['universe']['end_date'],
                 source=data_source,
                 force_refresh=force_refresh,
+                config=self.config,
             )
             self._data_source_label = "real"
             print(f"  [real] Loaded: {self.price_data['close'].shape}")
@@ -315,9 +316,13 @@ class AAAI2027Pipeline:
             # Use memory-augmented generator to produce factors with
             # few-shot examples retrieved from the memory bank
             try:
+                # Build market index proxy for state encoding (use TRAIN data only)
+                close_source = self.train_data['price_data']['close'] if self.train_data else self.price_data['close']
+                market_close = close_source.mean(axis=1)
+                market_df = pd.DataFrame({'close': market_close})
                 augmented_factors = memory_generator.generate(
                     task_description=f"Generate {n_seeds} alpha factors for A-share stock selection",
-                    price_df=pd.DataFrame(self.price_data['close']),
+                    price_df=market_df,
                 )
                 if augmented_factors:
                     # Convert dict results to CandidateFactor objects
@@ -359,12 +364,21 @@ class AAAI2027Pipeline:
         
         # Initialize backtester for evolution — USE TRAINING DATA ONLY
         # Critical: factors must NOT see test data during evolution
+        qlib_cfg = self.config.get('backtest', {}).get('qlib', {})
+        use_qlib = qlib_cfg.get('enable', False)
         backtester = FactorBacktester(
             prices=self.train_data['price_data'],
             fundamentals=self.train_data['fundamental_data'],
             forward_period=20,
+            use_qlib=use_qlib,
+            qlib_provider_uri=self.config.get('data', {}).get('qlib', {}).get(
+                'provider_uri', '~/.qlib/qlib_data/cn_data'
+            ),
+            qlib_topk=qlib_cfg.get('topk', 50),
         )
         
+        if use_qlib:
+            print("  [evolution] Using Qlib professional backtesting engine")
         print(f"  [evolution] Using TRAIN data only: {self._train_end_date}")
         evolution_result = self.evolving_generator.evolve(
             seed_factors=self.generated_factors,
@@ -445,8 +459,15 @@ class AAAI2027Pipeline:
         if self.memory_bank is not None and self.debate_results:
             try:
                 # Use TRAIN data for market state encoding (not test data)
-                recent = self.train_data['price_data']['close'].iloc[-self.recent_days:] if self.train_data else None
-                current_state = self.market_encoder.encode(recent) if recent is not None else None
+                if self.train_data:
+                    close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
+                    # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
+                    # Build market index proxy by cross-sectional mean
+                    market_close = close_df.mean(axis=1)
+                    market_df = pd.DataFrame({'close': market_close})
+                    current_state = self.market_encoder.encode(market_df)
+                else:
+                    current_state = None
             except Exception:
                 current_state = None
             saved = 0
@@ -494,9 +515,16 @@ class AAAI2027Pipeline:
         
         # Encode current market state using TRAIN data (not test data)
         # This prevents data leak from test period
-        current_state = self.market_encoder.encode(
-            pd.DataFrame(self.train_data['price_data']['close'].iloc[-self.recent_days:])  # Last N days of TRAIN data
-        )
+        close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
+        # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
+        # Build market index proxy by cross-sectional mean
+        market_close = close_df.mean(axis=1)
+        market_df = pd.DataFrame({'close': market_close})
+        try:
+            current_state = self.market_encoder.encode(market_df)
+        except Exception as e:
+            print(f"  [warn] Market state encoding failed: {e}")
+            current_state = None
         
         # Retrieve similar factors from memory
         # Use best evolved factors as query (higher quality than raw seeds)
@@ -995,6 +1023,7 @@ Examples:
   python main.py --full                                   Full pipeline with sample data
   python main.py --full --real                            Full pipeline with real data
   python main.py --full --real --source westock            Real data via westock (WorkBuddy)
+  python main.py --full --real --source qlib                Real data via Qlib (.bin format)
   python main.py --full --real --start 2023-01-01 --end 2024-12-31
   python main.py --full --real --force-refresh             Skip cache, re-download
         """,
@@ -1014,8 +1043,8 @@ Examples:
     )
     parser.add_argument(
         '--source', type=str, default='auto',
-        choices=['auto', 'westock', 'akshare', 'tushare'],
-        help='Real data source: auto (try westock→akshare→tushare), westock, akshare, tushare (default: auto)',
+        choices=['auto', 'westock', 'akshare', 'tushare', 'qlib'],
+        help='Real data source: auto (try westock→qlib→akshare→tushare), westock, qlib, akshare, tushare (default: auto)',
     )
     parser.add_argument(
         '--force-refresh', action='store_true', default=False,
@@ -1054,6 +1083,10 @@ Examples:
         '--config', type=str, default='config/config.yaml',
         help='Path to configuration file (default: config/config.yaml)',
     )
+    parser.add_argument(
+        '--qlib-backtest', action='store_true', default=False,
+        help='Use Qlib professional backtesting engine for factor evaluation (requires: pip install qlib)',
+    )
 
     args = parser.parse_args()
 
@@ -1068,6 +1101,8 @@ Examples:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
             pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
+        if args.qlib_backtest:
+            pipeline.config['backtest']['qlib']['enable'] = True
         
         metrics = pipeline.run_full_pipeline(
             start_date=args.start,
