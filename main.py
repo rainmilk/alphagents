@@ -34,8 +34,8 @@ from metrics.evaluator import FactorEvaluator, evaluate_portfolio_comprehensive
 # Import methods (with error handling for missing dependencies)
 try:
     from methods.debate import DebateEvaluator, FactorProposal
-    from methods.evolve import SelfEvolvingGenerator, FactorBacktester
-    from methods.memory import FactorMemoryBank, MarketStateEncoder, MemoryAugmentedGenerator
+    from methods.evolve import SelfEvolvingGenerator, FactorBacktester, CandidateFactor
+    from methods.memory import FactorMemoryBank, FactorEmbedder, MarketStateEncoder, MemoryAugmentedGenerator
     from methods.fusion import FactorFusion, PortfolioConstructor, FactorInfo, PortfolioConfig
     METHODS_AVAILABLE = True
 except ImportError as e:
@@ -50,12 +50,13 @@ class AAAI2027Pipeline:
     This pipeline integrates:
     1. Data loading and preprocessing
     2. Factor generation (LLM-based)
-    3. Factor evaluation (multi-agent debate)
-    4. Factor evolution (self-evolving generator)
-    5. Memory retrieval (state-aware)
-    6. Factor fusion (ICIR-weighted)
-    7. Portfolio construction
-    8. Backtesting and evaluation
+    3. Factor evolution (self-evolving — backtest coarse-filter)
+    4. Factor evaluation (multi-agent debate — quality gate)
+    5. Chair synthesis (cross-factor ranking + selection reasons)
+    6. Memory retrieval (state-aware)
+    7. Factor fusion (ICIR-weighted)
+    8. Portfolio construction
+    9. Backtesting and evaluation
     """
     
     def __init__(self, config_path: str = "config/config.yaml"):
@@ -83,6 +84,9 @@ class AAAI2027Pipeline:
         self.evolution_history = []
         self.portfolios = None
         self.performance_metrics = None
+
+        # Recent data window for market state encoding (from config, default 60)
+        self.recent_days = self.config.get("memory", {}).get("market_state", {}).get("recent_days", 60)
         
         print("=" * 60)
         print("  AAAI 2027 LLM Multi-Factor Stock Selection Pipeline")
@@ -250,7 +254,15 @@ class AAAI2027Pipeline:
         
         # Initialize memory bank
         memory_config = self.config['memory']
+        
+        # Initialize embedder
+        embedder = FactorEmbedder(
+            model_name=memory_config['encoder']['model'],
+            device=memory_config['encoder']['device'],
+        )
+        
         self.memory_bank = FactorMemoryBank(
+            embedder=embedder,
             index_path=memory_config['storage']['db_path'],
         )
         
@@ -270,7 +282,7 @@ class AAAI2027Pipeline:
         """
         Step 3: Generate factors using LLM.
 
-        The number of factors is read from config: llm.generator.n_candidates
+        The number of factors is read from config: evolution.n_seed_factors
         
         Args:
             use_memory: Whether to use memory-augmented generation
@@ -279,17 +291,18 @@ class AAAI2027Pipeline:
             print("\n[Step 3] Skipped: methods modules not available")
             return
         
-        n_factors = self.config['llm']['generator']['n_candidates']
-        print(f"\n[Step 3] Generating {n_factors} factors...")
+        n_seeds = self.config['evolution']['n_seeds']
+        print(f"\n[Step 3] Generating {n_seeds} seed factors...")
         
         # Initialize evolving generator
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
-            n_seeds=self.config['evolution']['n_seed_factors'],
+            n_seeds=n_seeds,
+            n_best_factors=self.config['evolution']['n_best_factors'],
         )
         
         # Generate seed factors
-        seed_factors = self.evolving_generator.generate_seed_factors(n_factors)
+        seed_factors = self.evolving_generator.generate_seed_factors()
         
         # If memory is available, augment generation
         if use_memory and self.memory_bank is not None and len(self.memory_bank) > 0:
@@ -303,13 +316,23 @@ class AAAI2027Pipeline:
             # few-shot examples retrieved from the memory bank
             try:
                 augmented_factors = memory_generator.generate(
-                    task_description=f"Generate {n_factors} alpha factors for A-share stock selection",
+                    task_description=f"Generate {n_seeds} alpha factors for A-share stock selection",
                     price_df=pd.DataFrame(self.price_data['close']),
                 )
                 if augmented_factors:
-                    # Merge augmented factors with seed factors
-                    self.generated_factors = seed_factors + augmented_factors
-                    print(f"  Memory-augmented generation: {len(augmented_factors)} additional factors")
+                    # Convert dict results to CandidateFactor objects
+                    # (MemoryAugmentedGenerator returns list[dict], but evolve() expects CandidateFactor)
+                    aug_factor_objs = [
+                        CandidateFactor(
+                            id=f"memory_aug_{i}",
+                            expression=f.get("expression", ""),
+                            description=f.get("description", f"Memory-augmented factor {i}"),
+                        )
+                        for i, f in enumerate(augmented_factors)
+                        if f.get("expression")
+                    ]
+                    self.generated_factors = seed_factors + aug_factor_objs
+                    print(f"  Memory-augmented generation: {len(aug_factor_objs)} additional factors")
             except Exception as e:
                 print(f"  Memory augmentation skipped: {e}")
                 self.generated_factors = seed_factors
@@ -318,99 +341,21 @@ class AAAI2027Pipeline:
         print(f"  Generated {len(seed_factors)} seed factors")
         print("  [✓] Factor generation complete")
         
-    def step4_evaluate_factors(self):
+    def step4_evolve_factors(self, n_rounds: int = 5):
         """
-        Step 4: Evaluate factors using multi-agent debate.
-        """
-        if not METHODS_AVAILABLE:
-            print("\n[Step 4] Skipped: methods modules not available")
-            return
-        
-        print("\n[Step 4] Evaluating factors (multi-agent debate)...")
-        
-        # Initialize debate evaluator (read API config from config.yaml)
-        eval_cfg = self.config['llm']['evaluator']
-        api_key = eval_cfg.get('api_key', '') or os.environ.get("DEEPSEEK_API_KEY", "")
-        base_url = eval_cfg.get('base_url', "https://api.deepseek.com")
-        
-        self.debate_evaluator = DebateEvaluator(
-            llm_model=eval_cfg['model'],
-            n_agents=eval_cfg['n_agents'],
-            n_rounds=eval_cfg.get('n_debate_rounds', 3),
-            api_key=api_key,
-            base_url=base_url,
-        )
-        
-        # Evaluate each factor (all factors, not just top 5)
-        self.debate_results = []  # (factor, DebateResult) pairs for step5/step6
-        for factor in self.generated_factors:
-            # Handle both CandidateFactor objects and dict representations
-            if isinstance(factor, dict):
-                expr = factor['expression']
-                desc = factor['description']
-            else:
-                expr = factor.expression
-                desc = factor.description
+        Step 4: Self-evolve seed factors through iterative improvement.
 
-            proposal = FactorProposal(expression=expr, description=desc)
-
-            result = self.debate_evaluator.evaluate(proposal)
-            self.debate_results.append((factor, result))
-
-            # Attach debate score to factor for use in step5/step6
-            if isinstance(factor, dict):
-                factor['debate_score'] = result.final_score
-            else:
-                factor.debate_score = result.final_score
-
-        print(f"  Evaluated {len(self.debate_results)} factors")
-        print("  [✓] Factor evaluation complete")
-
-        # Save evaluated factors to memory bank
-        if self.memory_bank is not None and self.debate_results:
-            try:
-                # Use TRAIN data for market state encoding (not test data)
-                recent = self.train_data['price_data']['close'].iloc[-60:] if self.train_data else None
-                current_state = self.market_encoder.encode(recent) if recent is not None else None
-            except Exception:
-                current_state = None
-            saved = 0
-            for factor, result in self.debate_results:
-                if isinstance(factor, dict):
-                    expr = factor.get('expression', '')
-                    desc = factor.get('description', '')
-                else:
-                    expr = getattr(factor, 'expression', '')
-                    desc = getattr(factor, 'description', '')
-                if not expr:
-                    continue
-                try:
-                    self.memory_bank.add(
-                        expression=expr,
-                        description=desc,
-                        market_state=current_state,
-                        ic=getattr(factor, 'ic', 0.0),
-                        sharpe=getattr(factor, 'sharpe', 0.0),
-                        source='llm',
-                    )
-                    saved += 1
-                except Exception as e:
-                    print(f"  [memory] add failed: {e}")
-            if saved:
-                print(f"  Saved {saved} factors to memory bank")
-        
-    def step5_evolve_factors(self, n_rounds: int = 5):
-        """
-        Step 5: Evolve factors through self-improvement.
+        Evolve before debate — the backtester coarsely filters factors,
+        then debate provides rigorous multi-expert evaluation on the best.
         
         Args:
             n_rounds: Number of evolution rounds
         """
         if not METHODS_AVAILABLE:
-            print("\n[Step 5] Skipped: methods modules not available")
+            print("\n[Step 4] Skipped: methods modules not available")
             return
         
-        print(f"\n[Step 5] Evolving factors ({n_rounds} rounds)...")
+        print(f"\n[Step 4] Evolving factors ({n_rounds} rounds)...")
         
         # Initialize backtester for evolution — USE TRAINING DATA ONLY
         # Critical: factors must NOT see test data during evolution
@@ -433,16 +378,79 @@ class AAAI2027Pipeline:
         print(f"  Evolution complete: {len(self.best_factors)} best factors")
         print(f"  Best IC: {evolution_result.best_ic:.4f}")
         print("  [✓] Factor evolution complete")
+        
+    def step5_evaluate_factors(self):
+        """
+        Step 5: Evaluate the evolved best factors via multi-agent debate.
 
-        # Save evolved best factors to memory bank
-        if self.memory_bank is not None and self.best_factors:
+        Debate runs AFTER evolution — it serves as the final quality gate,
+        applying 5-expert cross-validation to the top evolved factors.
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 5] Skipped: methods modules not available")
+            return
+        
+        print("\n[Step 5] Evaluating factors (multi-agent debate)...")
+        
+        # Initialize debate evaluator (read API config from config.yaml)
+        eval_cfg = self.config['llm']['evaluator']
+        api_key = eval_cfg.get('api_key', '') or os.environ.get("DEEPSEEK_API_KEY", "")
+        base_url = eval_cfg.get('base_url', "https://api.deepseek.com")
+
+        # Chair Agent config (separate model for arbitration & synthesis)
+        chair_cfg = self.config['llm'].get('chair', {})
+        chair_api_key = chair_cfg.get('api_key', '') or os.environ.get("CHAIR_API_KEY", "") or api_key
+
+        self.debate_evaluator = DebateEvaluator(
+            llm_model=eval_cfg['model'],
+            n_agents=eval_cfg['n_agents'],
+            n_rounds=eval_cfg.get('n_debate_rounds', 3),
+            api_key=api_key,
+            base_url=base_url,
+            # Chair Agent — typically a stronger model (GPT-4o) for arbitration & synthesis
+            chair_model=chair_cfg.get('model', ''),
+            chair_api_key=chair_api_key,
+            chair_base_url=chair_cfg.get('base_url', ''),
+            chair_temperature=chair_cfg.get('temperature', 0.2),
+            # Parallel: 5 agents evaluate the same factor concurrently (I/O-bound API calls)
+            parallel_eval=eval_cfg.get('parallel_eval', True),
+        )
+        
+        # Evaluate the evolved best_factors (not raw seed factors)
+        self.debate_results = []  # (factor, DebateResult) pairs for step6 fusion
+        for factor in self.best_factors:
+            # Handle both CandidateFactor objects and dict representations
+            if isinstance(factor, dict):
+                expr = factor['expression']
+                desc = factor['description']
+            else:
+                expr = factor.expression
+                desc = factor.description
+
+            proposal = FactorProposal(expression=expr, description=desc)
+
+            result = self.debate_evaluator.evaluate(proposal)
+            self.debate_results.append((factor, result))
+
+            # Attach debate score to factor for use in step6 fusion
+            if isinstance(factor, dict):
+                factor['debate_score'] = result.final_score
+            else:
+                factor.debate_score = result.final_score
+
+        print(f"  Evaluated {len(self.debate_results)} factors")
+        print("  [✓] Factor evaluation complete")
+
+        # Save debated best factors to memory bank
+        if self.memory_bank is not None and self.debate_results:
             try:
-                recent = self.price_data['close'].iloc[-60:] if self.price_data and 'close' in self.price_data else None
-                current_state = self.market_encoder.encode(pd.DataFrame(recent)) if recent is not None else None
+                # Use TRAIN data for market state encoding (not test data)
+                recent = self.train_data['price_data']['close'].iloc[-self.recent_days:] if self.train_data else None
+                current_state = self.market_encoder.encode(recent) if recent is not None else None
             except Exception:
                 current_state = None
             saved = 0
-            for factor in self.best_factors:
+            for factor, result in self.debate_results:
                 if isinstance(factor, dict):
                     expr = factor.get('expression', '')
                     desc = factor.get('description', '')
@@ -458,7 +466,7 @@ class AAAI2027Pipeline:
                         market_state=current_state,
                         ic=getattr(factor, 'ic', 0.0),
                         sharpe=getattr(factor, 'sharpe', 0.0),
-                        source='evolved',
+                        source='debate',
                     )
                     saved += 1
                 except Exception as e:
@@ -487,16 +495,17 @@ class AAAI2027Pipeline:
         # Encode current market state using TRAIN data (not test data)
         # This prevents data leak from test period
         current_state = self.market_encoder.encode(
-            pd.DataFrame(self.train_data['price_data']['close'].iloc[-60:])  # Last 60 days of TRAIN data
+            pd.DataFrame(self.train_data['price_data']['close'].iloc[-self.recent_days:])  # Last N days of TRAIN data
         )
         
         # Retrieve similar factors from memory
-        # Build a generic query from current factor descriptions
+        # Use best evolved factors as query (higher quality than raw seeds)
         query_desc = "multi-factor stock selection using technical indicators"
         query_expr = ""
-        if self.generated_factors:
-            # Use the first generated factor as query
-            f = self.generated_factors[0]
+        query_source = self.best_factors if (hasattr(self, 'best_factors') and self.best_factors) else self.generated_factors
+        if query_source:
+            # Use the first factor as query
+            f = query_source[0]
             if isinstance(f, dict):
                 query_desc = f.get('description', query_desc)
                 query_expr = f.get('expression', '')
@@ -525,6 +534,58 @@ class AAAI2027Pipeline:
         
         print("  [✓] Memory retrieval complete")
         
+    def step5c_chair_synthesis(self):
+        """
+        Step 5c: Chair Agent synthesizes ALL debate results into a comprehensive
+        cross-factor report with final rankings, selection reasons, and rejection reasons.
+
+        This is the capstone of the multi-agent debate module. The Chair Agent
+        (typically a stronger model like GPT-4o) reviews all debate results
+        holistically and produces:
+
+        - Ranked list of factors with 入选理由 (selection reasons)
+        - Rejected factors with 淘汰原因 (rejection reasons)
+        - Cross-cutting themes and overall confidence assessment
+
+        Output: experiments/{yyyymmdd}/chair_synthesis.json
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 5c] Skipped: methods modules not available")
+            return
+
+        if not hasattr(self, 'debate_results') or not self.debate_results:
+            print("\n[Step 5c] Skipped: no debate results available")
+            return
+
+        print("\n[Step 5c] Chair Agent synthesizing all debate results...")
+
+        # Build (FactorProposal, DebateResult) pairs
+        proposals_and_results = []
+        for factor, result in self.debate_results:
+            if isinstance(factor, dict):
+                expr = factor.get('expression', '')
+                desc = factor.get('description', '')
+            else:
+                expr = getattr(factor, 'expression', '')
+                desc = getattr(factor, 'description', '')
+
+            proposal = FactorProposal(expression=expr, description=desc)
+            proposals_and_results.append((proposal, result))
+
+        # Call Chair synthesis (saves chair_synthesis.json + appends to debate_factors_result.json internally)
+        synthesis = self.debate_evaluator.synthesize_all_factors(proposals_and_results)
+
+        # Print summary
+        print(f"  Chair synthesis complete:")
+        print(f"    Selected: {synthesis['selected_count']} factors")
+        print(f"    Rejected: {len(synthesis['rejected_factors'])} factors")
+        print(f"    Confidence: {synthesis['chair_confidence']}")
+        if synthesis.get('key_themes'):
+            print(f"    Key themes:")
+            for theme in synthesis['key_themes']:
+                print(f"      - {theme}")
+        print("  [✓] Chair synthesis complete")
+
     def step6_fuse_factors(self):
         """
         Step 6: Fuse factors using ICIR-weighted fusion.
@@ -546,7 +607,7 @@ class AAAI2027Pipeline:
         n_dates = self.price_data['close'].shape[0]
         date_index = self.price_data['close'].index
 
-        # Build debate_score lookup from step4 results
+        # Build debate_score lookup from step5 debate results
         debate_score_map = {}
         if hasattr(self, 'debate_results') and self.debate_results:
             for factor, result in self.debate_results:
@@ -575,6 +636,43 @@ class AAAI2027Pipeline:
         )
         
         print(f"  Fused {len(factor_infos)} factors")
+
+        # --- Save fusion results to experiments/{yyyymmdd}/fusion/final_factors.json ---
+        date_str = datetime.now().strftime("%Y%m%d")
+        fusion_dir = os.path.join("experiments", date_str, "fusion")
+        os.makedirs(fusion_dir, exist_ok=True)
+
+        # Build serializable composite scores: {date_str: {stock_code: score, ...}, ...}
+        scores_serializable = {}
+        for dt, row in self._composite_scores.iterrows():
+            date_key = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
+            stock_scores = {}
+            for stock, val in row.items():
+                if pd.notna(val):
+                    stock_scores[str(stock)] = float(val)
+            scores_serializable[date_key] = stock_scores
+
+        # Build factor info list
+        factor_details = []
+        for fi in factor_infos:
+            factor_details.append({
+                "name": fi.name,
+                "expression": fi.expression,
+                "weight": fusion_meta["weights"].get(fi.name, 0.0),
+                "debate_score": getattr(fi, "debate_score", None),
+            })
+
+        fusion_output = {
+            "meta": fusion_meta,
+            "factors": factor_details,
+            "composite_scores": scores_serializable,
+        }
+
+        fusion_path = os.path.join(fusion_dir, "final_factors.json")
+        with open(fusion_path, "w", encoding="utf-8") as f:
+            json.dump(fusion_output, f, ensure_ascii=False, indent=2)
+
+        print(f"  Fusion results saved to {fusion_path}")
         print("  [✓] Factor fusion complete")
         
     def step7_construct_portfolio(self):
@@ -647,15 +745,20 @@ class AAAI2027Pipeline:
         
         print("  [✓] Backtesting complete")
         
-    def step9_save_results(self, output_dir: str = "experiments/results"):
+    def step9_save_results(self, output_dir: str = None):
         """
         Step 9: Save results to disk.
-        
+
         Args:
-            output_dir: Directory to save results
+            output_dir: Directory to save results.
+                        If None, defaults to `experiments/{YYYYMMDD}/results/`.
         """
+        if output_dir is None:
+            date_str = datetime.now().strftime("%Y%m%d")
+            output_dir = os.path.join("experiments", date_str, "results")
+
         print(f"\n[Step 9] Saving results to {output_dir}...")
-        
+
         os.makedirs(output_dir, exist_ok=True)
         
         # Save performance metrics
@@ -687,17 +790,18 @@ class AAAI2027Pipeline:
         
     def run_full_pipeline(
         self,
-        start_date: str = "2022-01-01",
-        end_date: str = "2024-12-31",
+        start_date: str = "2021-01-01",
+        end_date: str = "2025-12-31",
         use_sample: bool = True,
         data_source: str = "auto",
         n_evolution_rounds: int = 5,
+        output_dir: str = None,
     ):
         """
         Run the full end-to-end pipeline.
 
-        All hyper-parameters (n_candidates, n_evolution_rounds, etc.) are read from config.yaml.
-        Use CLI --n-factors / --n-evolution-rounds to override config values at runtime.
+        All hyper-parameters (n_seed_factors, n_evolution_rounds, etc.) are read from config.yaml.
+        Use CLI --n-seeds / --n-evolution-rounds to override config values at runtime.
 
         Args:
             start_date: Start date (real data only)
@@ -705,6 +809,7 @@ class AAAI2027Pipeline:
             use_sample: True=sample data, False=real data
             data_source: Real data source ('westock', 'akshare', 'tushare', 'auto')
             n_evolution_rounds: Number of evolution rounds (overrides config)
+            output_dir: Output directory for step9. None = experiments/{YYYYMMDD}/results/
         """
         print("\n" + "=" * 60)
         data_label = "SAMPLE DATA (fast test)" if use_sample else "REAL DATA"
@@ -715,13 +820,14 @@ class AAAI2027Pipeline:
         self.step1_load_data(start_date, end_date, use_sample=use_sample, data_source=data_source)
         self.step2_initialize_memory()
         self.step3_generate_factors()
-        self.step4_evaluate_factors()
-        self.step5_evolve_factors(n_evolution_rounds)
+        self.step4_evolve_factors(n_evolution_rounds)
+        self.step5_evaluate_factors()
         self.step5b_retrieve_from_memory()
+        self.step5c_chair_synthesis()
         self.step6_fuse_factors()
         self.step7_construct_portfolio()
         self.step8_backtest()
-        self.step9_save_results()
+        self.step9_save_results(output_dir)
 
         # If portfolios are still None after full pipeline, generate fallback
         if self.portfolios is None:
@@ -929,12 +1035,20 @@ Examples:
         help='Stock universe for real data (default: hs300)',
     )
     parser.add_argument(
-        '--n-factors', type=int, default=None,
-        help='Override llm.generator.n_candidates from config (default: use config value)',
+        '--n-seeds', type=int, default=None,
+        help='Override llm.generator.n_seeds from config (default: use config value)',
     )
     parser.add_argument(
         '--n-evolution-rounds', type=int, default=5,
         help='Number of evolution rounds (default: 5)',
+    )
+    parser.add_argument(
+        '--n-best-factors', type=int, default=None,
+        help='Override evolution.n_best_factors (default: use config value)',
+    )
+    parser.add_argument(
+        '--output-dir', type=str, default=None,
+        help='Output directory (default: experiments/YYYYMMDD/results/)',
     )
     parser.add_argument(
         '--config', type=str, default='config/config.yaml',
@@ -948,10 +1062,12 @@ Examples:
         pipeline = AAAI2027Pipeline(config_path=args.config)
         
         # Apply CLI overrides to config
-        if args.n_factors is not None:
-            pipeline.config['llm']['generator']['n_candidates'] = args.n_factors
+        if args.n_seeds is not None:
+            pipeline.config['evolution']['n_seeds'] = args.n_seeds
         if args.n_evolution_rounds != 5:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
+        if args.n_best_factors is not None:
+            pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
         
         metrics = pipeline.run_full_pipeline(
             start_date=args.start,
@@ -959,6 +1075,7 @@ Examples:
             use_sample=not args.real,
             data_source=args.source,
             n_evolution_rounds=args.n_evolution_rounds,
+            output_dir=args.output_dir,
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")

@@ -11,7 +11,7 @@ Date: 2026-06-07
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, asdict
 import re
 import warnings
@@ -477,7 +477,6 @@ class FactorBacktester:
 
         # ---- Expression evaluator (lazy init) ----
         self._evaluator = None
-        self._eval_cache = {}        # expression → computed factor values
         self._metric_cache = {}      # expression → metrics dict
 
     @property
@@ -592,40 +591,50 @@ class FactorBacktester:
         }
 
     def clear_cache(self):
-        """Clear cached factor values and metrics."""
-        self._eval_cache.clear()
+        """Clear cached metrics."""
         self._metric_cache.clear()
 
     def evaluate_batch(
         self,
         factors: List['CandidateFactor'],
         max_workers: int = 4,
+        parallel: bool = True,
     ) -> List[Dict]:
         """
-        Evaluate multiple factors in parallel using ThreadPoolExecutor.
+        Evaluate multiple factors.
 
-        This is MUCH faster than sequential evaluation when there are
-        many factors to evaluate per round.
+        When parallel=True, uses ThreadPoolExecutor for speed.
+        When parallel=False, runs sequentially — much easier to debug
+        because tracebacks are clear and print() output is ordered.
 
         Args:
             factors: List of CandidateFactor objects to evaluate.
-            max_workers: Number of parallel workers (default: 4).
+            max_workers: Number of parallel workers (ignored when parallel=False).
+            parallel: If False, evaluate factors one by one in series.
 
         Returns:
             List of metric dicts, same order as `factors`.
         """
+        # --- Serial path (debug-friendly) ---
+        if not parallel:
+            results = []
+            for i, factor in enumerate(factors):
+                try:
+                    results.append(self.evaluate(factor))
+                except Exception as e:
+                    print(f"  [backtest] Eval failed for '{factor.expression}': {e}")
+                    results.append(self._empty_metrics())
+            return results
+
+        # --- Parallel path ---
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
-        # Thread-safe cache lock (optional, dict writes are atomic in CPython
-        # for single keys, but we guard for correctness)
         cache_lock = threading.Lock()
 
         def _evaluate_one(factor):
-            """Worker function: evaluate one factor."""
             expr = factor.expression
 
-            # --- Check cache (thread-safe read) ---
             with cache_lock:
                 if expr in self._metric_cache:
                     cached = self._metric_cache[expr].copy()
@@ -634,10 +643,8 @@ class FactorBacktester:
                     factor.win_rate = cached['win_rate']
                     return cached
 
-            # --- Evaluate ---
             try:
                 metrics = self.evaluate(factor)
-                # Cache the result (thread-safe write)
                 with cache_lock:
                     if expr not in self._metric_cache:
                         self._metric_cache[expr] = {
@@ -810,10 +817,6 @@ class FactorBacktester:
         drawdown = (cumulative - peak) / peak
         return float(drawdown.min())
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
-
     def compute_factor_values(self, expression: str) -> pd.DataFrame:
         """Compute raw factor values for a given expression."""
         return self.evaluator.evaluate(expression)
@@ -822,34 +825,6 @@ class FactorBacktester:
         """Compute Rank IC and ICIR for a factor expression."""
         fv = self.compute_factor_values(expression)
         return self._compute_rank_ic(fv, self._forward_returns)
-
-    def quantile_returns(
-        self, expression: str, n_quantiles: int = 5
-    ) -> Dict[int, pd.Series]:
-        """
-        Compute equal-weighted return series for each quantile.
-
-        Returns:
-            Dict mapping quantile index → return Series.
-        """
-        fv = self.compute_factor_values(expression)
-        result = {}
-
-        for t in range(len(fv)):
-            fv_t = fv.iloc[t]
-            fr_t = self._forward_returns.iloc[t]
-            mask = ~(fv_t.isna() | fr_t.isna())
-            if mask.sum() < n_quantiles * 2:
-                continue
-            try:
-                labels = pd.qcut(fv_t[mask], q=n_quantiles, labels=False, duplicates='drop')
-            except ValueError:
-                continue
-            for q in sorted(set(labels)):
-                ret = fr_t[mask][labels == q].mean()
-                result.setdefault(q, []).append(ret)
-
-        return {q: pd.Series(rets, name=f'Q{q}') for q, rets in result.items()}
 
 
 class SelfEvolvingGenerator:
@@ -868,6 +843,8 @@ class SelfEvolvingGenerator:
         self,
         llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
         n_seeds: int = 20,
+        n_best_factors: int = 10,
+        parallel: bool = True,
         api_key: str = "",
         base_url: str = "http://180.163.156.38:53000/v1",
     ):
@@ -876,12 +853,16 @@ class SelfEvolvingGenerator:
         
         Args:
             llm_model: LLM model to use
-            n_seeds: Number of seed factors
+            n_seeds: Number of seed factors to generate
+            n_best_factors: Number of top factors to select per round and final output
+            parallel: If False, evaluate factors serially (easier to debug)
             api_key: API key for LLM service. If empty, reads from config or env.
             base_url: API base URL
         """
         self.llm_model = llm_model
         self.n_seeds = n_seeds
+        self.n_best_factors = n_best_factors
+        self.parallel = parallel
         
         # Initialize OpenAI client for LLM calls
         self.client = None
@@ -986,6 +967,94 @@ class SelfEvolvingGenerator:
             raise
     
     @staticmethod
+    def _parse_llm_json(raw, expected_keys=("expression", "description")):
+        """
+        Robustly parse an LLM JSON response into a list of dicts.
+
+        Handles:
+        - Markdown code fences (```json ... ```)
+        - Leading/trailing explanatory text
+        - Response wrapped in an object: {"factors": [...]}
+        - Bare JSON array: [...]
+        """
+        # If already parsed (e.g. future _call_llm change), normalize
+        if isinstance(raw, list):
+            return [item if isinstance(item, dict) else {} for item in raw]
+        if isinstance(raw, dict):
+            return SelfEvolvingGenerator._unwrap_if_object(raw, expected_keys)
+
+        if not isinstance(raw, str):
+            raise ValueError(f"Unexpected raw type: {type(raw).__name__}")
+
+        text = raw.strip()
+
+        # Strip markdown code fences
+        if "```" in text:
+            parts = text.split("```", 2)
+            if len(parts) >= 3:
+                inner = parts[1].strip()
+                if inner.lower().startswith("json"):
+                    inner = inner[4:].strip()
+                text = inner
+
+        # Try to extract the first [...] or {...} JSON block
+        for start_char, end_char in [("[", "]"), ("{", "}")]:
+            idx = text.find(start_char)
+            if idx != -1:
+                depth = 0
+                in_str = False
+                escape_next = False
+                for j in range(idx, len(text)):
+                    ch = text[j]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\" and in_str:
+                        escape_next = True
+                        continue
+                    if ch == '"' and not escape_next:
+                        in_str = not in_str
+                    if in_str:
+                        continue
+                    if ch == start_char:
+                        depth += 1
+                    elif ch == end_char:
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[idx:j+1]
+                            try:
+                                parsed = json.loads(candidate)
+                                return SelfEvolvingGenerator._unwrap_if_object(parsed, expected_keys)
+                            except json.JSONDecodeError:
+                                break
+
+        # Last resort: try to parse the whole cleaned text
+        try:
+            parsed = json.loads(text)
+            return SelfEvolvingGenerator._unwrap_if_object(parsed, expected_keys)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Cannot parse LLM response as JSON. "
+                f"Cleaned text (first 300 chars): {text[:300]!r}. "
+                f"Error: {e}"
+            )
+
+    @staticmethod
+    def _unwrap_if_object(parsed, expected_keys):
+        """If parsed is a dict, try to extract a list from known keys."""
+        if isinstance(parsed, list):
+            return [item if isinstance(item, dict) else {} for item in parsed]
+        if isinstance(parsed, dict):
+            for key in ("factors", "factor", "results", "result", "data", "items"):
+                if key in parsed and isinstance(parsed[key], list):
+                    return [item if isinstance(item, dict) else {} for item in parsed[key]]
+            for v in parsed.values():
+                if isinstance(v, list) and v and all(isinstance(i, dict) for i in v):
+                    return [item if isinstance(item, dict) else {} for item in v]
+            return [parsed]  # Single-object response
+        raise ValueError(f"Parsed JSON is neither list nor dict: {type(parsed).__name__}")
+
+    @staticmethod
     def _fix_parentheses(expr: str) -> str:
         """
         Auto-fix unbalanced parentheses in factor expressions.
@@ -1012,22 +1081,53 @@ class SelfEvolvingGenerator:
                 return fixed
         return expr
 
-    def _save_factors_to_file(self, factors: List['CandidateFactor'], round_id: int, subdir: str = "self_evolve"):
+    def _save_factors_to_file(self, factors: List['CandidateFactor'], round_id: int, subdir: str = "self_evolve", filename: str = "generated_factors.json"):
         """
-        Save factors to experiments/results/{subdir}/round_{round_id}/generated_factors.json
+        Save factors to experiments/{yyyymmdd}/{subdir}/round_{round_id}/{filename}
         """
         import os
         import json
-        
-        save_dir = os.path.join("experiments", "results", subdir, f"round_{round_id}")
+        from datetime import datetime
+
+        date_str = datetime.now().strftime("%Y%m%d")
+        save_dir = os.path.join("experiments", date_str, subdir, f"round_{round_id}")
         os.makedirs(save_dir, exist_ok=True)
-        
+
         factors_dicts = [asdict(f) for f in factors]
-        save_path = os.path.join(save_dir, "generated_factors.json")
+        save_path = os.path.join(save_dir, filename)
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(factors_dicts, f, indent=2, ensure_ascii=False)
-        
+
         print(f"  [evolve] Saved {len(factors)} factors to {save_path}")
+
+    def _save_metrics_to_csv(self, factors: List['CandidateFactor'], metrics_list: List[Dict], round_id: int):
+        """
+        Save backtest metrics to experiments/{yyyymmdd}/self_evolve/round_{round_id}/backtest_factor_metrics.csv
+        """
+        import os
+        import csv
+        from datetime import datetime
+
+        date_str = datetime.now().strftime("%Y%m%d")
+        save_dir = os.path.join("experiments", date_str, "self_evolve", f"round_{round_id}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, "backtest_factor_metrics.csv")
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["factor_id", "expression", "ic", "ic_ir", "sharpe", "win_rate", "max_drawdown"])
+            for factor, metrics in zip(factors, metrics_list):
+                writer.writerow([
+                    factor.id,
+                    factor.expression,
+                    f"{metrics.get('ic', 0.0):.6f}",
+                    f"{metrics.get('ic_ir', 0.0):.6f}",
+                    f"{metrics.get('sharpe', 0.0):.6f}",
+                    f"{metrics.get('win_rate', 0.5):.6f}",
+                    f"{metrics.get('max_drawdown', 0.0):.6f}",
+                ])
+
+        print(f"  [evolve] Saved {len(factors)} factor metrics to {save_path}")
 
     def _generate_reflection(self, evaluated_factors: List['CandidateFactor'], top_factors: List['CandidateFactor'], round_id: int = 0) -> str:
         """
@@ -1044,8 +1144,6 @@ class SelfEvolvingGenerator:
         Returns:
             Reflection text (multi-line string)
         """
-        import re
-        
         if not evaluated_factors:
             return "No factors evaluated in this round."
         
@@ -1053,7 +1151,6 @@ class SelfEvolvingGenerator:
         successful = [f for f in evaluated_factors if f.ic is not None and f.ic > 0.02]
         moderate = [f for f in evaluated_factors if f.ic is not None and 0 <= f.ic <= 0.02]
         failed = [f for f in evaluated_factors if f.ic is not None and f.ic < 0]
-        negative_ic = [f for f in evaluated_factors if f.ic is not None and f.ic < -0.01]
         
         lines = []
         lines.append(f"=== Reflection for Round {round_id + 1} ===")
@@ -1147,16 +1244,7 @@ class SelfEvolvingGenerator:
             
             lines.append("")
         
-        # --- 4. Market state hints (if available) ---
-        # Check if factors have market state info
-        if hasattr(self, '_last_market_state') and self._last_market_state:
-            ms = self._last_market_state
-            lines.append("--- Market State Context ---")
-            lines.append(f"  Volatility: {ms.get('vol', 'N/A')}, Liquidity: {ms.get('liq', 'N/A')}")
-            lines.append(f"  Trend: {ms.get('trend', 'N/A')}, Correlation: {ms.get('corr', 'N/A')}")
-            lines.append("")
-        
-        # --- 5. Strategic suggestions for next round ---
+        # --- 4. Strategic suggestions for next round ---
         lines.append("--- Suggestions for Next Generation ---")
         if successful:
             best = max(successful, key=lambda x: x.ic or 0)
@@ -1179,16 +1267,16 @@ class SelfEvolvingGenerator:
         
         return "\n".join(lines)
 
-    def generate_seed_factors(self, n_factors: int = 20) -> List['CandidateFactor']:
+    def generate_seed_factors(self) -> List['CandidateFactor']:
         """
         Generate seed factors using LLM.
         
-        Args:
-            n_factors: Number of factors to generate
+        Uses self.n_seeds (set at construction time) as the target count.
             
         Returns:
             List of seed factors
         """
+        n_factors = self.n_seeds
         print(f"Generating {n_factors} seed factors...")
         
         # Try to use LLM to generate factors
@@ -1196,16 +1284,19 @@ class SelfEvolvingGenerator:
             try:
                 seed_factors = self._generate_factors_via_llm(n_factors)
                 if seed_factors and len(seed_factors) >= 1:
-                    print(f"Generated {len(seed_factors)} seed factors via LLM")
-                    self._save_factors_to_file(seed_factors, round_id=0)
-                    return seed_factors[:n_factors]
+                    result = seed_factors[:n_factors]
+                    print(f"Generated {len(result)} seed factors via LLM")
+                    self._save_factors_to_file(result, round_id=0)
+                    return result
             except Exception as e:
                 print(f"  [evolve] LLM factor generation failed: {e}")
                 print(f"  [evolve] Falling back to rule-based generation.")
         
         # Fallback: rule-based generation
         print(f"  [evolve] Using rule-based factor generation.")
-        return self._generate_factors_rule_based(n_factors)
+        fallback_factors = self._generate_factors_rule_based(n_factors)
+        self._save_factors_to_file(fallback_factors, round_id=0)
+        return fallback_factors
     
     def _generate_factors_via_llm(self, n_factors: int) -> List[CandidateFactor]:
         """
@@ -1254,11 +1345,13 @@ Return a JSON array of objects, each with "expression" and "description" keys.
 Ensure expressions are valid and can be evaluated by the factor engine."""
 
         # Build user_prompt with valid JSON example (avoid f-string escaping issues)
-        json_example = json.dumps([
-            {"expression": "rank(ts_corr(close, volume, 20))", "description": "Price-volume correlation momentum"},
-            {"expression": "-rank(pe)", "description": "Value factor based on P/E ratio"},
-            {"expression": "rank(ts_zscore(roe, 60))", "description": "Quality factor based on ROE z-score"}
-        ], ensure_ascii=False)
+        json_example = json.dumps({
+            "factors": [
+                {"expression": "rank(ts_corr(close, volume, 20))", "description": "Price-volume correlation momentum"},
+                {"expression": "-rank(pe)", "description": "Value factor based on P/E ratio"},
+                {"expression": "rank(ts_zscore(roe, 60))", "description": "Quality factor based on ROE z-score"}
+            ]
+        }, ensure_ascii=False)
 
         user_prompt = (
             f"Please generate {n_factors} diverse factor expressions for A-share stock selection.\n"
@@ -1268,33 +1361,18 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
             + "4. Each factor should have economic intuition\n"
             + "5. You MUST return exactly " + str(n_factors) + " factors\n"
-            + "6. Return strictly as a JSON array, no other text, no markdown fences\n"
+            + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
             + "\n"
-            + "Example (valid JSON array):\n"
+            + "Example (valid JSON object with \"factors\" key):\n"
             + json_example + "\n\n"
-            + f"Please generate {n_factors} factors now. Return only the JSON array."
+            + f"Please generate {n_factors} factors now. Return only the JSON object."
         )
 
         try:
             raw = self._call_llm(system_prompt, user_prompt, temperature=0.7, expect_json=True)
-            factors_json = json.loads(raw)
+            factors_json = self._parse_llm_json(raw)
 
-            # Handle case where LLM returns a dict instead of a list
-            if isinstance(factors_json, dict):
-                # Try to extract the list from common keys
-                for key in ["factors", "factor", "data", "results", "expressions"]:
-                    if key in factors_json and isinstance(factors_json[key], list):
-                        factors_json = factors_json[key]
-                        break
-                else:
-                    # If no recognized key, check if this dict is a single factor
-                    if "expression" in factors_json:
-                        factors_json = [factors_json]
-                    else:
-                        raise ValueError(
-                            f"Unexpected JSON structure from LLM. "
-                            f"Keys: {list(factors_json.keys())[:5]}"
-                        )
+
 
             seed_factors = []
             for i, f in enumerate(factors_json):
@@ -1311,9 +1389,9 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             
             return seed_factors
             
-        except json.JSONDecodeError as e:
-            print(f"  [evolve] Failed to parse LLM response as JSON: {e}")
-            print(f"  [evolve] Raw response: {raw[:200] if 'raw' in locals() else 'N/A'}")
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"  [evolve] Failed to parse LLM response: {e}")
+            print(f"  [evolve] Raw response: {raw[:300] if 'raw' in locals() else 'N/A'}")
             raise
         except Exception as e:
             raise
@@ -1404,9 +1482,10 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         for round_id in range(n_rounds):
             print(f"\nRound {round_id + 1}/{n_rounds}")
             
-            # Evaluate current factors (parallel batch evaluation)
-            print(f"  Evaluating {len(current_factors)} factors (parallel)...")
-            metrics_list = backtester.evaluate_batch(current_factors, max_workers=4)
+            # Evaluate current factors
+            mode = "parallel" if self.parallel else "serial"
+            print(f"  Evaluating {len(current_factors)} factors ({mode})...")
+            metrics_list = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
             
             evaluated_factors = []
             for i, factor in enumerate(current_factors):
@@ -1418,16 +1497,34 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 
                 if factor.ic > best_ic:
                     best_ic = factor.ic
+
+            # Save backtest metrics for this round
+            self._save_metrics_to_csv(current_factors, metrics_list, round_id)
             
             # Select top factors
-            top_factors = sorted(evaluated_factors, key=lambda x: x.ic, reverse=True)[:10]
+            top_factors = sorted(evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
             
             # Generate reflection based on backtest results
             reflection_notes = self._generate_reflection(evaluated_factors, top_factors, round_id)
             print(f"\n  [evolve] Reflection notes for round {round_id + 1}:\n{reflection_notes}\n")
             
-            # Generate improvements (with reflection notes)
-            improved_factors = self._generate_improvements(top_factors, round_id, reflection_notes)
+            # Generate improvements (try LLM first, fall back to rule-based)
+            improved_factors = None
+            if self.use_llm and self.client:
+                try:
+                    llm_factors = self._generate_improvements_via_llm(top_factors, round_id, reflection_notes)
+                    if llm_factors and len(llm_factors) >= len(top_factors) // 2:
+                        improved_factors = llm_factors
+                        print(f"  [evolve] Generated {len(improved_factors)} improved factors via LLM")
+                except Exception as e:
+                    print(f"  [evolve] LLM improvement generation failed: {e}")
+
+            if improved_factors is None:
+                print(f"  [evolve] Using rule-based factor improvement.")
+                improved_factors = self._generate_improvements_rule_based(top_factors)
+
+            # Save improved factors for this round
+            self._save_factors_to_file(improved_factors, round_id + 1, filename="improved_factors.json")
             
             # Record evolution round
             round_record = EvolutionRound(
@@ -1443,7 +1540,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             current_factors = improved_factors
             
             print(f"  Best IC: {best_ic:.4f}")
-            print(f"  Avg IC (top 10): {round_record.avg_ic:.4f}")
+            print(f"  Avg IC (top {self.n_best_factors}): {round_record.avg_ic:.4f}")
             
             # Check convergence
             if self._check_convergence(evolution_history):
@@ -1455,7 +1552,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         for round_record in evolution_history:
             all_factors.extend(round_record.improved_factors)
         
-        best_factors = sorted(all_factors, key=lambda x: x.ic, reverse=True)[:10]
+        best_factors = sorted(all_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
         
         return EvolutionResult(
             best_factors=best_factors,
@@ -1463,31 +1560,6 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             best_ic=best_ic,
             total_rounds=len(evolution_history),
         )
-    
-    def _generate_improvements(self, top_factors: List['CandidateFactor'], round_id: int = 0, reflection_notes: str = "") -> List['CandidateFactor']:
-        """
-        Generate improved factors based on top performers.
-        
-        Args:
-            top_factors: Top-performing factors
-            
-        Returns:
-            List of improved factors
-        """
-        # Try to use LLM to generate improvements
-        if self.use_llm and self.client:
-            try:
-                improved_factors = self._generate_improvements_via_llm(top_factors, round_id, reflection_notes)
-                if improved_factors and len(improved_factors) >= len(top_factors) // 2:
-                    print(f"  [evolve] Generated {len(improved_factors)} improved factors via LLM")
-                    return improved_factors
-            except Exception as e:
-                print(f"  [evolve] LLM improvement generation failed: {e}")
-                print(f"  [evolve] Falling back to rule-based improvement.")
-        
-        # Fallback: rule-based improvement
-        print(f"  [evolve] Using rule-based factor improvement.")
-        return self._generate_improvements_rule_based(top_factors)
     
     def _generate_improvements_via_llm(self, top_factors: List['CandidateFactor'], round_id: int = 0, reflection_notes: str = "") -> List['CandidateFactor']:
         """
@@ -1514,12 +1586,12 @@ Guidelines:
 - Improvements should be non-trivial (not just changing window size by 1)
 - Avoid overfitting: don't create overly complex expressions
 - Ensure expressions are valid and can be evaluated
-- Return a JSON array of objects with "expression" and "description" keys"""
+- Return a JSON object with key "factors" (a list of objects with "expression" and "description" keys)"""
 
         # Build prompt with top factors and reflection notes
         factors_str = "\n".join([
             f"  {f.id}: {f.expression} (IC={f.ic:.4f}, Sharpe={f.sharpe:.2f}) - {f.description}"
-            for f in top_factors[:10]  # Only show top 10 to avoid prompt overflow
+            for f in top_factors[:self.n_best_factors]  # Only show top N to avoid prompt overflow
         ])
         
         # Build reflection section
@@ -1553,19 +1625,22 @@ Requirements:
    - Applying nonlinear transformations
 4. Ensure expressions are valid and diverse
 5. Return strictly as a JSON array
+5. Return a JSON object with key "factors" (array of factor objects)
 
 Example format:
-[
-  {{"expression": "rank(ts_corr(close, volume, 10))", "description": "Improved momentum factor with shorter window"}},
-  {{"expression": "rank(ts_corr(close, volume, 20)) * -rank(pe)", "description": "Combined momentum-value factor"}}
-]
+{{
+  "factors": [
+    {{"expression": "rank(ts_corr(close, volume, 10))", "description": "Improved momentum factor with shorter window"}},
+    {{"expression": "rank(ts_corr(close, volume, 20)) * -rank(pe)", "description": "Combined momentum-value factor"}}
+  ]
+}}
 
-Please generate improved factors now. Return only the JSON array, no other text."""
+Please generate improved factors now. Return only the JSON object, no other text."""
 
         try:
             raw = self._call_llm(system_prompt, user_prompt, temperature=0.8, expect_json=True)
-            factors_json = json.loads(raw)
-            
+            factors_json = self._parse_llm_json(raw)
+
             improved_factors = []
             for i, f in enumerate(factors_json):
                 if not isinstance(f, dict) or "expression" not in f:
@@ -1583,9 +1658,6 @@ Please generate improved factors now. Return only the JSON array, no other text.
                 )
                 improved_factors.append(factor)
             
-            # Save LLM-generated factors for this round (1-based: round_1, round_2, ...)
-            self._save_factors_to_file(improved_factors, round_id + 1)
-            
             return improved_factors
             
         except json.JSONDecodeError as e:
@@ -1595,33 +1667,53 @@ Please generate improved factors now. Return only the JSON array, no other text.
         except Exception as e:
             raise
     
-    def _generate_improvements_rule_based(self, top_factors: List['CandidateFactor'], reflection_notes: str = "") -> List['CandidateFactor']:
-        """
-        Generate improved factors using rule-based method (fallback when LLM is unavailable).
-        
-        Args:
-            top_factors: Top-performing factors
-            
-        Returns:
-            List of improved factors
-        """
+    def _generate_improvements_rule_based(self, top_factors: List['CandidateFactor']) -> List['CandidateFactor']:
+        """Generate improved factors using four rule-based strategies (fallback when LLM unavailable)."""
+        import random
+        random.seed(42)
+
         improved_factors = []
-        
+
         for i, factor in enumerate(top_factors):
-            # Generate multiple improvement strategies
-            improvements = [
-                # Strategy 1: Adjust window size
-                self._adjust_window_size(factor.expression),
-                # Strategy 2: Add fundamental data
-                self._add_fundamental_signal(factor.expression),
-                # Strategy 3: Apply nonlinear transformation
-                self._apply_nonlinear_transform(factor.expression),
-                # Strategy 4: Combine with another top factor
-                self._combine_factors(factor.expression, top_factors[(i + 1) % len(top_factors)].expression) if len(top_factors) > 1 else factor.expression,
-            ]
-            
+            expr = factor.expression
+            other_expr = top_factors[(i + 1) % len(top_factors)].expression if len(top_factors) > 1 else expr
+
+            # Strategy 1: Adjust window size in time-series functions
+            win_parts = expr.split('(')
+            win_result = []
+            for k, part in enumerate(win_parts):
+                if k == 0:
+                    win_result.append(part)
+                    continue
+                sub_parts = part.split(',')
+                for m in range(1, len(sub_parts)):
+                    nm = re.match(r'\s*(\d+)', sub_parts[m])
+                    if nm:
+                        n = int(nm.group(1))
+                        if 5 <= n <= 60:
+                            sub_parts[m] = sub_parts[m].replace(str(n), str(max(5, n + random.randint(-10, 10))), 1)
+                win_result.append(','.join(sub_parts))
+            adjusted_expr = '('.join(win_result)
+
+            # Strategy 2: Add fundamental signal
+            fund = random.choice(['pe', 'pb', 'roe', 'market_cap'])
+            if random.random() < 0.5:
+                fund_expr = f"rank({expr}) * -rank({fund})"
+            else:
+                fund_expr = f"rank({expr}) + rank(-{fund})"
+
+            # Strategy 3: Apply nonlinear transformation
+            transform = random.choice(['log', 'sqrt', 'abs', 'sign'])
+            nonlinear_expr = f"{transform}({expr})"
+
+            # Strategy 4: Combine with another top factor
+            op = random.choice(['*', '+'])
+            combined_expr = f"rank({expr}) {op} rank({other_expr})"
+
+            improvements = [adjusted_expr, fund_expr, nonlinear_expr, combined_expr]
+
             for j, improved_expr in enumerate(improvements):
-                if improved_expr and improved_expr != factor.expression:
+                if improved_expr and improved_expr != expr:
                     improved = CandidateFactor(
                         id=f"improved_rule_{factor.id}_{i}_{j}",
                         expression=improved_expr,
@@ -1630,69 +1722,8 @@ Please generate improved factors now. Return only the JSON array, no other text.
                         generation=factor.generation + 1,
                     )
                     improved_factors.append(improved)
-        
+
         return improved_factors
-    
-    def _adjust_window_size(self, expression: str) -> str:
-        """Adjust window size in time-series functions."""
-        import re
-        import random
-        random.seed(42)  # For reproducibility
-        
-        # Find all numeric arguments in functions like ts_corr(..., w), ts_mean(..., w)
-        # Pattern matches numbers after a comma (window sizes)
-        def adjust_match(m):
-            num_str = m.group(0)
-            num = int(num_str)
-            # Only adjust numbers in the 5-60 range (likely window sizes)
-            if 5 <= num <= 60:
-                adjustment = random.randint(-10, 10)
-                return str(max(5, num + adjustment))
-            return num_str
-        
-        # Simple approach: find all numbers and adjust those that look like window sizes
-        # This is a simplification - in practice, we should parse the expression properly
-        words = expression.split('(')
-        result = []
-        for i, word in enumerate(words):
-            if i > 0:  # Not the first word
-                # Find numbers after commas
-                parts = word.split(',')
-                for j in range(1, len(parts)):  # Skip first part (function name or first arg)
-                    # Extract leading number
-                    num_match = re.match(r'\s*(\d+)', parts[j])
-                    if num_match:
-                        num = int(num_match.group(1))
-                        if 5 <= num <= 60:
-                            adjustment = random.randint(-10, 10)
-                            new_num = max(5, num + adjustment)
-                            parts[j] = parts[j].replace(str(num), str(new_num), 1)
-                result.append(','.join(parts))
-            else:
-                result.append(word)
-        
-        return '('.join(result)
-    
-    def _add_fundamental_signal(self, expression: str) -> str:
-        """Add fundamental signal to factor expression."""
-        import random
-        fundamental = random.choice(['pe', 'pb', 'roe', 'market_cap'])
-        if random.random() < 0.5:
-            return f"rank({expression}) * -rank({fundamental})"
-        else:
-            return f"rank({expression}) + rank(-{fundamental})"
-    
-    def _apply_nonlinear_transform(self, expression: str) -> str:
-        """Apply nonlinear transformation to factor expression."""
-        import random
-        transform = random.choice(['log', 'sqrt', 'abs', 'sign'])
-        return f"{transform}({expression})"
-    
-    def _combine_factors(self, expr1: str, expr2: str) -> str:
-        """Combine two factor expressions."""
-        import random
-        op = random.choice(['*', '+'])
-        return f"rank({expr1}) {op} rank({expr2})"
     
     def _check_convergence(self, history: List[EvolutionRound]) -> bool:
         """
@@ -1715,59 +1746,40 @@ Please generate improved factors now. Return only the JSON array, no other text.
 
 
 if __name__ == '__main__':
-    # Demo
-    print("=== Self-Evolving Factor Generator Demo ===\n")
-    
-    # Generate sample data
+    """Quick smoke test for expression evaluator and backtester."""
+    print("=== Factor Evaluator Smoke Test ===\n")
+
     np.random.seed(42)
-    n_dates = 252
-    n_stocks = 50
-    
+    n_dates, n_stocks = 252, 50
     dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
-    stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
-    
-    # Price data (random walk with drift)
+    codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
+
     close_prices = pd.DataFrame(
         10 + np.cumsum(np.random.randn(n_dates, n_stocks) * 0.02 + 0.0005, axis=0),
-        index=dates, columns=stock_codes,
+        index=dates, columns=codes,
     )
     volume_data = pd.DataFrame(
         np.abs(np.random.randn(n_dates, n_stocks) * 1e6 + 5e6),
-        index=dates, columns=stock_codes,
+        index=dates, columns=codes,
     )
-    
-    # Initialize backtester with full data
-    backtester = FactorBacktester(
-        prices=close_prices,
-        volume=volume_data,
-        forward_period=20,
-    )
-    
-    # Test expression evaluation
-    print("Testing expression evaluator...")
-    expr1 = "rank(ts_corr(close, volume, 20))"
-    fv1 = backtester.compute_factor_values(expr1)
-    print(f"  {expr1}: shape={fv1.shape}, nan={fv1.isna().sum().sum()}")
-    
-    expr2 = "rank(ts_delta(close, 5))"
-    fv2 = backtester.compute_factor_values(expr2)
-    print(f"  {expr2}: shape={fv2.shape}, nan={fv2.isna().sum().sum()}")
-    
-    expr3 = "ts_zscore(close, 20) * -1"
-    fv3 = backtester.compute_factor_values(expr3)
-    print(f"  {expr3}: shape={fv3.shape}, nan={fv3.isna().sum().sum()}")
-    
-    # Test full evaluation
-    print("\nTesting factor evaluation...")
-    from dataclasses import dataclass
-    TestFactor = type('TestFactor', (), {
-        '__init__': lambda self, e: setattr(self, 'expression', e),
-    })
-    
-    for expr in [expr1, expr2, expr3]:
-        f = TestFactor(expr)
+
+    backtester = FactorBacktester(prices=close_prices, volume=volume_data, forward_period=20)
+
+    test_expressions = [
+        "rank(ts_corr(close, volume, 20))",
+        "rank(ts_delta(close, 5))",
+        "ts_zscore(close, 20) * -1",
+    ]
+
+    for expr in test_expressions:
+        fv = backtester.compute_factor_values(expr)
+        print(f"  {expr}: shape={fv.shape}, nan={fv.isna().sum().sum()}")
+
+    print("\nFactor evaluation metrics:")
+    for expr in test_expressions:
+        f = CandidateFactor(id="test", expression=expr, description=f"Test: {expr}")
         m = backtester.evaluate(f)
         print(f"  {expr}: IC={m['ic']:.4f}, Sharpe={m['sharpe']:.2f}, "
               f"WinRate={m['win_rate']:.2%}, MaxDD={m['max_drawdown']:.2%}")
-    
-    print("\n=== Demo Complete ===")
+
+    print("\n=== Smoke Test Complete ===")

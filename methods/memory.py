@@ -485,6 +485,10 @@ class FactorMemoryBank:
         self._faiss_index = None
         self._embeddings_cache: dict[str, np.ndarray] = {}  # factor_id -> embedding
 
+        # Auto-load existing data if available
+        if self.index_path and self.index_path.exists():
+            self.load()
+
     def __len__(self) -> int:
         """Return number of stored factors."""
         return len(self.factors)

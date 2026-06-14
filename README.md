@@ -32,7 +32,11 @@ AAAI2027_LLM_MultiFactor/
 ├── experiments/           # Experiment results
 │   ├── results/          # Fixed output directory (portfolios, baselines, etc.)
 │   └── {yyyymmdd}/       # Date-stamped run outputs
-│       └── debate/       # Debate expert opinions (JSON)
+│       ├── self_evolve/  # LLM-generated factors per round
+│       │   ├── round_0/  # Seed factors (generated_factors.json + backtest csv)
+│       │   └── round_N/  # Evolved factors (improved_factors.json + backtest csv)
+│       ├── debate/       # Debate expert opinions (debate_factors_result.json)
+│       └── fusion/       # Final fused factors (final_factors.json)
 ├── paper/                 # Paper-related files
 │   └── figures/          # Generated figures
 ├── main.py                # Main pipeline (argparse CLI)
@@ -108,7 +112,7 @@ python main.py --full
 
 ```bash
 # Auto-detect best available source
-python main.py --full --real
+python main.py --full --real --n-seeds=1 --n-best-factors=2
 
 # Specify data source
 python main.py --full --real --source westock
@@ -126,8 +130,9 @@ python main.py --full --real --force-refresh
 1. **Load data** — sample or real A-share data with preprocessing; saves train/test splits as CSVs to `data/train/` and `data/test/`
 2. **Initialize memory** — FAISS-backed factor memory bank
 3. **Generate factors** — LLM-driven seed factor generation
-4. **Evaluate factors** — Multi-agent debate (5 experts)
-5. **Evolve factors** — Self-improving iterative evolution
+4. **Evolve factors** — Self-improving iterative evolution (backtester coarse filter)
+5. **Evaluate factors** — Multi-agent debate with 5 experts (final quality gate)
+5c. **Chair synthesis** — Chair Agent cross-factor ranking with selection/rejection reasons (chair_synthesis.json)
 6. **Retrieve from memory** — State-aware top-k factor retrieval
 7. **Fuse factors** — ICIR-weighted fusion with correlation penalty
 8. **Construct portfolio** — Top-N portfolio with risk constraints
@@ -149,9 +154,11 @@ Options:
   --end DATE               End date for real data (default: 2024-12-31)
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
-  --n-factors N            Number of factors (default: from config.yaml n_candidates)
-  --n-evolution-rounds N   Number of evolution rounds (default: 5)
+  --n-seeds N             Override llm.generator.n_seeds from config
+  --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
+  --n-best-factors N       Override evolution.n_best_factors from config (controls n_best_factors in SelfEvolvingGenerator)
   --config PATH            Path to config file (default: config/config.yaml)
+  --output-dir PATH        Output directory (default: experiments/YYYYMMDD/results/)
 ```
 
 ### Run Experiments
@@ -192,11 +199,12 @@ Each agent evaluates factors independently (Phase 1), then engages in structured
 ### 2. Self-Evolving Factor Generator (`methods/evolve.py`)
 
 Generates factors through iterative evolution:
-- Generate seed factors (LLM)
+- Generate seed factors (LLM or rule-based fallback) — count controlled by `evolution.n_seed_factors`
 - Backtest and evaluate via `FactorBacktester`
+- Select top-k factors per round — controlled by `evolution.n_best_factors` (maps to `SelfEvolvingGenerator.n_best_factors`)
 - Reflect on failures
 - Generate improvements
-- Repeat until convergence
+- Repeat until convergence (max rounds: `evolution.max_rounds`)
 - Returns `EvolutionResult` (dataclass with `EvolutionRound` history)
 
 ### 3. State-Aware Factor Memory Bank (`methods/memory.py`)
@@ -221,21 +229,33 @@ Fuses multiple factors into a composite score:
 Edit `config/config.yaml` to customize:
 - Data source and universe
 - LLM models and parameters
-- Evolution hyperparameters
+- Evolution hyperparameters (`n_seed_factors`, `top_k`, `max_rounds`, etc.)
 - Memory bank settings
 - Fusion strategy
 - Backtest parameters
+- Experiment settings (cross-validation, baselines, metrics)
+
+Key evolution config keys:
+- `evolution.n_seed_factors`: Number of seed factors to generate
+- `evolution.n_best_factors`: Number of top factors to select per round (passed as `n_best_factors` to `SelfEvolvingGenerator`)
+- `evolution.max_rounds`: Maximum evolution rounds before convergence
 
 ## Results
 
-All results are saved to `experiments/results/` (fixed) and `experiments/{yyyymmdd}/` (date-stamped per-run):
+All results are saved under `experiments/`:
+
+**`experiments/results/`** — fixed outputs:
 - `performance_metrics.csv`: Main results
 - `portfolios.csv`: Portfolio weights
 - `evolution_history.json`: Evolution round history (serialized from dataclass)
 - `ablation_studies.json`: Ablation study results
 - `baseline_comparisons.json`: Baseline comparison results
-- `self_evolve/round_*/generated_factors.json`: Factor evolution snapshots
-- `debate/debate_factors_result.json`: All expert opinions (scores, reasoning, concerns, strengths) across independent evaluation and debate rounds
+
+**`experiments/{yyyymmdd}/`** — date-stamped per-run outputs:
+- `self_evolve/round_0/generated_factors.json`: Seed factors (LLM Phase 1)
+- `self_evolve/round_1/generated_factors.json` … `round_N/`: Evolved factors per round
+- `debate/debate_factors_result.json`: All expert opinions (scores, reasoning, concerns, strengths) across independent evaluation and debate rounds, plus Chair Agent cross-factor synthesis record
+- `fusion/final_factors.json`: Final fused factors after ICIR-weighted fusion
 
 Train/test data persists as CSVs under `data/train/` and `data/test/` with `data/split_info.json` metadata.
 

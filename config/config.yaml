@@ -59,7 +59,6 @@ llm:
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.7
     max_tokens: 2000
-    n_candidates: 20  # number of candidate factors per round
     
   # Factor evaluation (debate)
   evaluator:
@@ -69,17 +68,21 @@ llm:
     temperature: 0.3
     n_agents: 5
     n_debate_rounds: 3
-    
-  # Embedding model
-  embedding:
-    model: "paraphrase-multilingual-MiniLM-L12-v2"
-    fallback: "tfidf"
-    device: "cpu"  # cpu, cuda
+    parallel_eval: true   # true = 5 agents evaluate concurrently (ThreadPoolExecutor); false = serial for debugging
 
+  # Chair Agent (仲裁 / 跨因子综合报告)
+  # 设计理念：5位专家用低成本模型（DeepSeek），主席用强推理模型（GPT-4o）
+  # 主席负责：分歧仲裁 + 所有因子的综合排名 + 入选/淘汰理由
+  chair:
+    model: "bailian/deepseek-v4-flash"              # 理想: gpt-4o；当前使用与专家相同模型
+    base_url: "http://35.220.164.252:3888/v1"
+    api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
+    temperature: 0.2  # 主席需要更确定性的输出
+    
 # ==================== Evolution Configuration ====================
 evolution:
-  n_seed_factors: 20
-  top_k: 10
+  n_seeds: 10  # number of candidate factors per round
+  n_best_factors: 10
   n_improve: 10
   n_mutate: 5
   max_rounds: 15
@@ -96,6 +99,7 @@ evolution:
 memory:
   # Market state encoding
   market_state:
+    recent_days: 60    # recent data window for encoding current market state
     vix_low: 15.0
     vix_high: 25.0
     ma_short: 20
@@ -115,8 +119,13 @@ memory:
     
   # Storage
   storage:
-    db_path: "data/memory_bank.json"
-    faiss_path: "data/memory_bank.faiss"
+    db_path: "data/memory_bank"
+    faiss_path: "data/memory_bank"
+  
+  # Embedder
+  encoder:
+    model: "all-MiniLM-L12-v2"
+    device: "cuda"
 
 # ==================== Fusion Configuration ====================
 fusion:
