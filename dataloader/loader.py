@@ -385,8 +385,8 @@ def load_real_data(
     This function tries sources in order:
       1. Local pickle cache (fastest)
       2. westock (WorkBuddy built-in A-share data)
-      3. AkShare (open-source Python library)
-      4. Tushare (requires token)
+      3. Tushare (requires token)
+      4. AkShare (open-source Python library)
       5. Qlib (high-performance .bin format, local — lowest priority, heavy dependency)
       6. Synthetic fallback (generated data)
 
@@ -446,18 +446,7 @@ def load_real_data(
         except Exception as e:
             print(f"  [westock] Failed: {e}")
 
-    # 3. Try AkShare
-    if source in ("akshare", "auto"):
-        try:
-            result = _load_from_akshare(universe, start_date, end_date)
-            if result is not None:
-                print(f"  [akshare] Data loaded successfully")
-                _save_cache(cache_file, *result)
-                return result
-        except Exception as e:
-            print(f"  [akshare] Failed: {e}")
-
-    # 4. Try Tushare
+    # 3. Try Tushare
     if source in ("tushare", "auto"):
         try:
             result = _load_from_tushare(universe, start_date, end_date)
@@ -467,6 +456,17 @@ def load_real_data(
                 return result
         except Exception as e:
             print(f"  [tushare] Failed: {e}")
+
+    # 4. Try AkShare
+    if source in ("akshare", "auto"):
+        try:
+            result = _load_from_akshare(universe, start_date, end_date)
+            if result is not None:
+                print(f"  [akshare] Data loaded successfully")
+                _save_cache(cache_file, *result)
+                return result
+        except Exception as e:
+            print(f"  [akshare] Failed: {e}")
 
     # 5. Try Qlib (high-performance .bin format, local — lowest priority, heavy dependency)
     if source in ("qlib", "auto"):
@@ -769,36 +769,59 @@ def _load_from_tushare(
         for field in ['pe', 'pb', 'roe', 'market_cap']:
             fundamental_data[field] = pd.DataFrame(np.nan, index=dates, columns=stock_codes)
 
-        # daily_basic: fetch by date (more efficient than by stock)
-        daily_basic_all = []  # collect for raw save
+        # daily_basic: iterate ONE STOCK AT A TIME with full date range.
+        # Tushare daily_basic does NOT support comma-separated ts_code
+        # with start_date/end_date range queries (returns empty).
+        # Single stock + date range is the only reliable pattern.
+        daily_basic_all = []
         try:
-            date_samples = [d.strftime('%Y%m%d') for d in dates[::max(1, n_days // 20)]][:20]
-            for d in date_samples:
+            ts_codes_fund = [_ts_code(c) for c in stock_codes]
+            n_stocks = len(ts_codes_fund)
+            sd_fund = start_date.replace('-', '')
+            ed_fund = end_date.replace('-', '')
+
+            for si, tsc in enumerate(ts_codes_fund):
+                plain = stock_codes[si]  # original plain code (e.g. '000001')
                 try:
-                    df_b = pro.daily_basic(ts_code=','.join(stock_codes),
-                                            trade_date=d,
-                                            fields='ts_code,pe_ttm,pb,roe,total_mv')
-                    if df_b is None or df_b.empty:
-                        continue
-                    daily_basic_all.append(df_b)
-                    dt = pd.Timestamp(d[:4] + '-' + d[4:6] + '-' + d[6:])
-                    for _, row in df_b.iterrows():
-                        code = row['ts_code']
-                        if code not in stock_codes:
+                    df_b = pro.daily_basic(
+                        ts_code=tsc,
+                        start_date=sd_fund,
+                        end_date=ed_fund,
+                        fields='ts_code,trade_date,pe_ttm,pb,total_mv'
+                    )
+                except Exception:
+                    df_b = None
+
+                if df_b is None or df_b.empty:
+                    time.sleep(0.05)
+                    continue
+
+                daily_basic_all.append(df_b)
+                for _, row in df_b.iterrows():
+                    try:
+                        dt_val = row['trade_date']
+                        if isinstance(dt_val, str):
+                            dt = pd.Timestamp(dt_val[:4] + '-' + dt_val[4:6] + '-' + dt_val[6:])
+                        else:
+                            dt = pd.Timestamp(dt_val)
+                        if dt not in fundamental_data['pe'].index:
                             continue
                         if 'pe_ttm' in row and pd.notna(row['pe_ttm']):
-                            fundamental_data['pe'].loc[dt, code] = float(row['pe_ttm'])
+                            fundamental_data['pe'].loc[dt, plain] = float(row['pe_ttm'])
                         if 'pb' in row and pd.notna(row['pb']):
-                            fundamental_data['pb'].loc[dt, code] = float(row['pb'])
-                        if 'roe' in row and pd.notna(row['roe']):
-                            fundamental_data['roe'].loc[dt, code] = float(row['roe']) / 100.0
+                            fundamental_data['pb'].loc[dt, plain] = float(row['pb'])
                         if 'total_mv' in row and pd.notna(row['total_mv']):
-                            fundamental_data['market_cap'].loc[dt, code] = float(row['total_mv']) / 10000.0
-                except Exception:
-                    continue
-                time.sleep(0.1)
-        except Exception:
-            pass
+                            fundamental_data['market_cap'].loc[dt, plain] = float(row['total_mv']) / 10000.0
+                    except Exception:
+                        continue
+
+                if (si + 1) % 50 == 0 or si == n_stocks - 1:
+                    n_filled = fundamental_data['pe'].notna().any(axis=1).sum()
+                    print(f"  [tushare] Fundamentals: stock {si+1}/{n_stocks}, filled dates: {n_filled}/{n_days}")
+                time.sleep(0.05)
+
+        except Exception as e:
+            print(f"  [tushare] Fundamentals fetch error: {e}")
 
         # Save combined daily_basic raw data
         if daily_basic_all:
@@ -808,6 +831,54 @@ def _load_from_tushare(
             except Exception:
                 pass
 
+        # ---- 6b. ROE from fina_indicator (quarterly) ----
+        # daily_basic doesn't have ROE; use fina_indicator which provides
+        # quarterly financial ratios. Forward-fill to daily dates.
+        roe_loaded = 0
+        try:
+            print("  [tushare] Fetching ROE (fina_indicator)...")
+            for si, tsc in enumerate(ts_codes_fund):
+                plain = stock_codes[si]
+                try:
+                    df_roe = pro.fina_indicator(
+                        ts_code=tsc,
+                        start_date=sd_fund,
+                        end_date=ed_fund,
+                        fields='ts_code,end_date,roe'
+                    )
+                except Exception:
+                    df_roe = None
+
+                if df_roe is None or df_roe.empty:
+                    time.sleep(0.05)
+                    continue
+
+                for _, row in df_roe.iterrows():
+                    try:
+                        dt_val = row['end_date']
+                        if isinstance(dt_val, str):
+                            dt = pd.Timestamp(dt_val[:4] + '-' + dt_val[4:6] + '-' + dt_val[6:])
+                        else:
+                            dt = pd.Timestamp(dt_val)
+                        if 'roe' in row and pd.notna(row['roe']):
+                            roe_val = float(row['roe']) / 100.0  # Tushare roe is in %
+                            # Assign to the nearest date in our index that's >= report_date
+                            match_dates = fundamental_data['roe'].index[
+                                fundamental_data['roe'].index >= dt
+                            ]
+                            if len(match_dates) > 0:
+                                fundamental_data['roe'].loc[match_dates[0]:, plain] = roe_val
+                            roe_loaded += 1
+                    except Exception:
+                        continue
+
+                if (si + 1) % 100 == 0 or si == n_stocks - 1:
+                    n_roe = fundamental_data['roe'].notna().any(axis=0).sum()
+                    print(f"  [tushare] ROE: stock {si+1}/{n_stocks}, covered: {n_roe}/{n_stocks}, data points: {roe_loaded}")
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"  [tushare] ROE fetch error: {e}")
+
         # Fill missing fundamentals (forward/back fill; leave remaining as NaN)
         for field in fundamental_data:
             fundamental_data[field] = fundamental_data[field].ffill().bfill()
@@ -816,7 +887,8 @@ def _load_from_tushare(
         print("  [tushare] Fetching industry classification...")
         industry_dict = {}
         try:
-            df_ind = pro.stock_basic(ts_code=','.join(stock_codes),
+            ts_codes = [_ts_code(c) for c in stock_codes]
+            df_ind = pro.stock_basic(ts_code=','.join(ts_codes),
                                       fields='ts_code,industry')
             # Save raw industry classification
             try:
@@ -1417,80 +1489,75 @@ def _load_from_akshare(
         fundamental_loaded = False
 
         # 1) Try Tushare daily_basic — real daily PE/PB/market_cap history
+        # Tushare daily_basic does NOT support comma-separated ts_code with
+        # start_date/end_date range queries (returns empty). Iterate one stock
+        # at a time — the only reliable pattern.
+        ts_codes_fund = []
+        n_stocks_fund = 0
+        sd_fund = ''
+        ed_fund = ''
         try:
             import tushare as ts
             token = _get_tushare_token()
             if token:
                 ts.set_token(token)
                 pro = ts.pro_api()
-                # Build ts_code list (max 50 per batch to avoid URL too long)
-                ts_codes = [_ts_code(c) for c in stock_codes]
+                ts_codes_fund = [_ts_code(c) for c in stock_codes]
+                n_stocks_fund = len(ts_codes_fund)
+                sd_fund = start_date.replace('-', '')
+                ed_fund = end_date.replace('-', '')
                 pe_loaded = pb_loaded = mc_loaded = 0
-                for i in range(0, len(ts_codes), 50):
-                    batch = ts_codes[i:i+50]
-                    ts_code_str = ','.join(batch)
+                for si, tsc in enumerate(ts_codes_fund):
+                    plain = tsc.split('.')[0]
+                    # Build Qlib-style code (SH000001 / SZ000001) for stock_codes lookup
+                    if tsc.endswith('.SH'):
+                        qc = 'SH' + plain
+                    elif tsc.endswith('.SZ'):
+                        qc = 'SZ' + plain
+                    else:
+                        qc = plain
+                    if qc not in stock_codes:
+                        continue
                     try:
                         df_fund = pro.daily_basic(
-                            ts_code=ts_code_str,
-                            start_date=start_date.replace('-', ''),
-                            end_date=end_date.replace('-', ''),
+                            ts_code=tsc,
+                            start_date=sd_fund,
+                            end_date=ed_fund,
                             fields='ts_code,trade_date,pe_ttm,pb,total_mv'
                         )
                     except Exception:
-                        # Try one-by-one for this batch
                         df_fund = None
-                        for tc in batch:
-                            try:
-                                df_one = pro.daily_basic(
-                                    ts_code=tc,
-                                    start_date=start_date.replace('-', ''),
-                                    end_date=end_date.replace('-', ''),
-                                    fields='ts_code,trade_date,pe_ttm,pb,total_mv'
-                                )
-                                if df_fund is None:
-                                    df_fund = df_one
-                                else:
-                                    df_fund = pd.concat([df_fund, df_one], ignore_index=True)
-                            except Exception:
-                                pass
 
                     if df_fund is None or df_fund.empty:
+                        time.sleep(0.05)
                         continue
 
-                    df_fund['trade_date'] = pd.to_datetime(df_fund['trade_date'], format='%Y%m%d')
-                    df_fund = df_fund.sort_values('trade_date')
-
                     for _, row in df_fund.iterrows():
-                        tc = str(row['ts_code']).strip()
-                        plain = tc.split('.')[0]
-                        qc = None
-                        if tc.endswith('.SH'):
-                            qc = 'SH' + plain
-                        elif tc.endswith('.SZ'):
-                            qc = 'SZ' + plain
-                        if qc is None or qc not in stock_codes:
-                            continue
-                        dt = row['trade_date']
-                        if dt in fundamental_data['pe'].index:
-                            try:
-                                if pd.notna(row.get('pe_ttm')):
-                                    fundamental_data['pe'].loc[dt, qc] = float(row['pe_ttm'])
-                                    pe_loaded += 1
-                            except Exception:
-                                pass
-                            try:
-                                if pd.notna(row.get('pb')):
-                                    fundamental_data['pb'].loc[dt, qc] = float(row['pb'])
-                                    pb_loaded += 1
-                            except Exception:
-                                pass
-                            try:
-                                if pd.notna(row.get('total_mv')):
-                                    # total_mv unit: 万元 → 亿元
-                                    fundamental_data['market_cap'].loc[dt, qc] = float(row['total_mv']) / 10000.0
-                                    mc_loaded += 1
-                            except Exception:
-                                pass
+                        try:
+                            dt_val = row['trade_date']
+                            if isinstance(dt_val, str):
+                                dt = pd.Timestamp(dt_val[:4] + '-' + dt_val[4:6] + '-' + dt_val[6:])
+                            else:
+                                dt = pd.Timestamp(dt_val)
+                            if dt not in fundamental_data['pe'].index:
+                                continue
+                            if pd.notna(row.get('pe_ttm')):
+                                fundamental_data['pe'].loc[dt, qc] = float(row['pe_ttm'])
+                                pe_loaded += 1
+                            if pd.notna(row.get('pb')):
+                                fundamental_data['pb'].loc[dt, qc] = float(row['pb'])
+                                pb_loaded += 1
+                            if pd.notna(row.get('total_mv')):
+                                fundamental_data['market_cap'].loc[dt, qc] = float(row['total_mv']) / 10000.0
+                                mc_loaded += 1
+                        except Exception:
+                            pass
+
+                    if (si + 1) % 50 == 0 or si == n_stocks_fund - 1:
+                        n_covered = fundamental_data['pe'].notna().any(axis=0).sum()
+                        print(f"  [akshare] Tushare daily_basic: stock {si+1}/{n_stocks_fund}, "
+                              f"covered: {n_covered}/{n_stocks}")
+                    time.sleep(0.05)
 
                 n_covered = fundamental_data['pe'].notna().any(axis=0).sum()
                 if n_covered > 0:
@@ -1500,6 +1567,63 @@ def _load_from_akshare(
                           f"rows_pe={pe_loaded}, rows_pb={pb_loaded}, rows_mc={mc_loaded}")
         except Exception as e:
             print(f"  [akshare] Tushare daily_basic failed: {e}")
+
+        # 1b) Try Tushare fina_indicator for ROE (quarterly, forward-fill to daily)
+        try:
+            token = _get_tushare_token()
+            if token:
+                ts.set_token(token)
+                pro = ts.pro_api()
+                roe_loaded = 0
+                print("  [akshare] Fetching ROE (fina_indicator)...")
+                for si, tsc in enumerate(ts_codes_fund):
+                    plain = tsc.split('.')[0]
+                    if tsc.endswith('.SH'):
+                        qc = 'SH' + plain
+                    elif tsc.endswith('.SZ'):
+                        qc = 'SZ' + plain
+                    else:
+                        qc = plain
+                    if qc not in stock_codes:
+                        continue
+                    try:
+                        df_roe = pro.fina_indicator(
+                            ts_code=tsc,
+                            start_date=sd_fund,
+                            end_date=ed_fund,
+                            fields='ts_code,end_date,roe'
+                        )
+                    except Exception:
+                        df_roe = None
+
+                    if df_roe is None or df_roe.empty:
+                        time.sleep(0.05)
+                        continue
+
+                    for _, row in df_roe.iterrows():
+                        try:
+                            dt_val = row['end_date']
+                            if isinstance(dt_val, str):
+                                dt = pd.Timestamp(dt_val[:4] + '-' + dt_val[4:6] + '-' + dt_val[6:])
+                            else:
+                                dt = pd.Timestamp(dt_val)
+                            if 'roe' in row and pd.notna(row['roe']):
+                                roe_val = float(row['roe']) / 100.0
+                                match_dates = fundamental_data['roe'].index[
+                                    fundamental_data['roe'].index >= dt
+                                ]
+                                if len(match_dates) > 0:
+                                    fundamental_data['roe'].loc[match_dates[0]:, qc] = roe_val
+                                roe_loaded += 1
+                        except Exception:
+                            pass
+
+                    if (si + 1) % 100 == 0 or si == n_stocks_fund - 1:
+                        n_roe = fundamental_data['roe'].notna().any(axis=0).sum()
+                        print(f"  [akshare] ROE: stock {si+1}/{n_stocks_fund}, covered: {n_roe}/{n_stocks}, data points: {roe_loaded}")
+                    time.sleep(0.05)
+        except Exception as e:
+            print(f"  [akshare] ROE fetch error: {e}")
 
         # 2) Fallback: AkShare spot snapshot (latest data only, broadcast to all dates)
         if not fundamental_loaded:

@@ -5,7 +5,7 @@
 data:
   # Data source
   source: "tushare"  # or "akshare", "westock", "qlib", "auto"
-  tushare_token: "bc3ab6199bac87d1f17ec1ad5aca6d9c1f28382c12325b943622f275"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
+  tushare_token: "d83808e8ee98957fe38996678210faacda9f68d8c22574f38f572704"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
   
   # Qlib config (used when source="qlib" or "auto")
   qlib:
