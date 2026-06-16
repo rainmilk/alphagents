@@ -14,7 +14,7 @@ AAAI2027_LLM_MultiFactor/
 │   └── config.yaml        # Main configuration
 ├── data/                  # Data loading and output
 │   ├── loader.py          # Data loader (sample / real A-share data)
-│   ├── raw/               # Raw data (AkShare kline CSVs)
+│   ├── raw/               # Raw data (westock/AkShare/Tushare/Qlib kline CSVs)
 │   ├── train/             # Train split CSVs (price/fundamental/industry)
 │   ├── test/              # Test split CSVs (price/fundamental/industry)
 │   └── memory_bank.json/  # Factor memory bank snapshots
@@ -80,13 +80,14 @@ The pipeline supports two data modes controlled by a single switch:
 | Mode | Flag | Data | Use Case |
 |---|---|---|---|
 | **Sample** (default) | `--sample` or no flag | Synthetic random walk data (100 stocks × 500 days) | Fast testing, CI, no external API needed |
-| **Real** | `--real` | A-share data via westock → AkShare → Tushare → synthetic fallback | Production, paper experiments |
+| **Real** | `--real` | A-share data via westock → AkShare → Tushare → Qlib → synthetic fallback | Production, paper experiments |
 
 **Real data source chain** (automatic fallback):
 1. **westock** — WorkBuddy built-in A-share data (preferred, no extra setup)
 2. **AkShare** — Open-source Python library (`pip install akshare`)
 3. **Tushare** — Requires token (`pip install tushare`, set `TUSHARE_TOKEN`)
-4. **Synthetic** — Final fallback (same shape, random data)
+4. **Qlib** — High-performance `.bin` format (`pip install qlib`, auto-downloads cn_data)
+5. **Synthetic** — Final fallback (same shape, random data)
 
 Real data is cached to `data/cache_*.pkl` after first load. Use `--force-refresh` to skip cache.
 
@@ -115,7 +116,7 @@ python main.py --full
 python main.py --full --real --n-seeds=1 --n-best-factors=2
 
 # Specify data source
-python main.py --full --real --source westock
+python main.py --full --real --source qlib
 python main.py --full --real --source akshare
 
 # Custom date range + universe
@@ -147,7 +148,7 @@ Options:
   --full                   Run full end-to-end pipeline (default: quick demo)
   --real                   Use real A-share data (default: sample data)
   --sample                 Use sample/synthetic data (default)
-  --source {auto,westock,akshare,tushare}
+  --source {auto,westock,akshare,tushare,qlib}
                            Real data source (default: auto)
   --force-refresh          Skip cache, re-download real data
   --start DATE             Start date for real data (default: 2022-01-01)
@@ -157,6 +158,7 @@ Options:
   --n-seeds N             Override llm.generator.n_seeds from config
   --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
   --n-best-factors N       Override evolution.n_best_factors from config (controls n_best_factors in SelfEvolvingGenerator)
+  --forward-period N       Forward return horizon in trading days (None → config or 20)
   --config PATH            Path to config file (default: config/config.yaml)
   --output-dir PATH        Output directory (default: experiments/YYYYMMDD/results/)
 ```
@@ -236,6 +238,7 @@ Edit `config/config.yaml` to customize:
 - Experiment settings (cross-validation, baselines, metrics)
 
 Key evolution config keys:
+- `evolution.forward_period`: Forward return horizon in trading days (default: 20)
 - `evolution.n_seed_factors`: Number of seed factors to generate
 - `evolution.n_best_factors`: Number of top factors to select per round (passed as `n_best_factors` to `SelfEvolvingGenerator`)
 - `evolution.max_rounds`: Maximum evolution rounds before convergence
@@ -292,6 +295,7 @@ The pipeline falls back to synthetic data automatically. To use real data:
 1. **westock**: Available inside WorkBuddy sessions — no setup needed
 2. **AkShare**: `pip install akshare`
 3. **Tushare**: Register at tushare.pro, set `TUSHARE_TOKEN` env var
+4. **Qlib**: `pip install qlib` — auto-downloads cn_data bundle (~1 GB on first use)
 
 ### Issue: "UnicodeDecodeError: 'gbk' codec can't decode"
 
