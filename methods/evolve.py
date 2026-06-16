@@ -36,6 +36,10 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+# Local imports
+from backtest.metrics import annualized_sharpe, max_drawdown
+from backtest.metrics import rank_ic
+
 
 @dataclass
 class CandidateFactor:
@@ -381,8 +385,8 @@ class _FactorExprEvaluator:
 
     @staticmethod
     def _fn_rank(x: pd.DataFrame) -> pd.DataFrame:
-        """Cross-sectional percentile rank (0~1)."""
-        return x.rank(axis=1, pct=True, na_option='bottom')
+        """Cross-sectional percentile rank (0~1). NaN remains NaN."""
+        return x.rank(axis=1, pct=True, na_option='keep')
 
     @staticmethod
     def _fn_ts_rank(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -638,7 +642,7 @@ class FactorBacktester:
             fr_aligned = fwd.loc[common_dates, common_codes]
 
             # Step 3: Rank IC
-            ic, ic_ir = self._compute_rank_ic(fv_aligned, fr_aligned)
+            ic, ic_ir = rank_ic(fv_aligned, fr_aligned)
 
             # Step 4: Quantile portfolio metrics
             sharpe, win_rate, max_dd, long_short_ret = self._compute_quantile_metrics(
@@ -882,57 +886,6 @@ class FactorBacktester:
         return results
 
     # ------------------------------------------------------------------
-    # Rank IC
-    # ------------------------------------------------------------------
-
-    def _compute_rank_ic(
-        self, factor_values: pd.DataFrame, forward_returns: pd.DataFrame
-    ) -> Tuple[float, float]:
-        """
-        Compute Rank IC (cross-sectional Spearman correlation) and ICIR.
-
-        Vectorized: computes ranks for all time periods at once,
-        then uses a fast column-wise correlation to approximate per-period IC.
-        For strict per-period Spearman, falls back to a vectorized
-        row-level correlation using numpy.
-
-        Returns:
-            (mean_ic, ic_ir) where ic_ir = mean_ic / std_ic
-        """
-        # --- Fast path: vectorized rank IC ---
-        # Rank across columns (cross-sectional rank for each time t)
-        fv_ranks = factor_values.rank(axis=1, numeric_only=True, pct=False)
-        fr_ranks = forward_returns.rank(axis=1, numeric_only=True, pct=False)
-
-        # Compute Pearson correlation of ranks along each row (time t)
-        # corr = sum((fv_r - fv_r_mean) * (fr_r - fr_r_mean)) / (std_fv * std_fr)
-        # Vectorized over all time periods:
-        fv_mean = fv_ranks.mean(axis=1)
-        fr_mean = fr_ranks.mean(axis=1)
-        fv_centered = fv_ranks.subtract(fv_mean, axis=0)
-        fr_centered = fr_ranks.subtract(fr_mean, axis=0)
-
-        numerator = (fv_centered * fr_centered).sum(axis=1)
-        denom = (
-            np.sqrt((fv_centered ** 2).sum(axis=1))
-            * np.sqrt((fr_centered ** 2).sum(axis=1))
-        )
-        ic_series = numerator / denom
-
-        # Handle edge cases
-        ic_series = ic_series.replace([np.inf, -np.inf], np.nan).dropna()
-
-        if ic_series.empty:
-            return 0.0, 0.0
-
-        ic_arr = ic_series.values
-        mean_ic = float(np.mean(ic_arr))
-        std_ic = float(np.std(ic_arr, ddof=1))
-        ic_ir = mean_ic / std_ic if std_ic > 0 else 0.0
-
-        return mean_ic, ic_ir
-
-    # ------------------------------------------------------------------
     # Quantile portfolio metrics
     # ------------------------------------------------------------------
 
@@ -986,45 +939,15 @@ class FactorBacktester:
             return 0.0, 0.5, 0.0, pd.Series(dtype=float)
 
         ls_series = pd.Series(long_short_rets, name='long_short')
-        sharpe = self._annualized_sharpe(ls_series)
+        sharpe = annualized_sharpe(ls_series)
         win_rate = float((ls_series > 0).mean())
-        max_dd = self._max_drawdown(ls_series)
+        max_dd = max_drawdown(ls_series)
 
         return sharpe, win_rate, max_dd, ls_series
 
     # ------------------------------------------------------------------
-    # Portfolio statistics
+    # Factor computation helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _annualized_sharpe(returns: pd.Series, rf: float = 0.02) -> float:
-        """
-        Compute annualised Sharpe ratio.
-
-        Assumes daily returns; annualises with sqrt(252).
-        """
-        if len(returns) < 2:
-            return 0.0
-        excess = returns - rf / 252.0
-        mean_ret = float(excess.mean())
-        std_ret = float(excess.std(ddof=1))
-        if std_ret == 0:
-            return 0.0
-        return (mean_ret / std_ret) * np.sqrt(252)
-
-    @staticmethod
-    def _max_drawdown(returns: pd.Series) -> float:
-        """
-        Compute maximum drawdown from a return series.
-
-        Returns a negative number (e.g., -0.15 = 15% drawdown).
-        """
-        if len(returns) < 2:
-            return 0.0
-        cumulative = (1 + returns).cumprod()
-        peak = cumulative.cummax()
-        drawdown = (cumulative - peak) / peak
-        return float(drawdown.min())
 
     def compute_factor_values(self, expression: str) -> pd.DataFrame:
         """Compute raw factor values for a given expression."""
@@ -1034,11 +957,6 @@ class FactorBacktester:
             raise ValueError(
                 f"Failed to compute factor values for '{expression}': {e}"
             ) from e
-
-    def rank_ic(self, expression: str) -> Tuple[float, float]:
-        """Compute Rank IC and ICIR for a factor expression."""
-        fv = self.compute_factor_values(expression)
-        return self._compute_rank_ic(fv, self._forward_returns)
 
 
 class SelfEvolvingGenerator:

@@ -100,6 +100,8 @@ class AAAI2027Pipeline:
         use_sample: bool = True,
         data_source: str = "auto",
         force_refresh: bool = False,
+        split_train_end: str = None,
+        split_test_start: str = None,
     ):
         """
         Step 1: Load and preprocess data.
@@ -115,6 +117,8 @@ class AAAI2027Pipeline:
             use_sample: True=sample data, False=real data
             data_source: 'westock', 'akshare', 'tushare', or 'auto'
             force_refresh: Skip cache and re-download real data
+            split_train_end: Explicit train end date (overrides config)
+            split_test_start: Explicit test start date (overrides config)
         """
         print("\n[Step 1] Loading data...")
 
@@ -152,9 +156,9 @@ class AAAI2027Pipeline:
         self.data_loader.fundamental_data = self.fundamental_data
         self.data_loader.industry_data = self.industry_data
         
-        # Read split config from config.yaml, or use defaults
-        train_end_date = self.config.get('data', {}).get('train_end_date', None)
-        test_start_date = self.config.get('data', {}).get('test_start_date', None)
+        # Read split config from explicit params, config.yaml, or defaults
+        train_end_date = split_train_end or self.config.get('data', {}).get('train_end_date', None)
+        test_start_date = split_test_start or self.config.get('data', {}).get('test_start_date', None)
         
         if train_end_date is None:
             # Default: use 80/20 split (80% train, 20% test)
@@ -164,6 +168,12 @@ class AAAI2027Pipeline:
             train_end_date = dates[split_idx - 1].strftime('%Y-%m-%d')
             test_start_date = dates[split_idx].strftime('%Y-%m-%d')
             print(f"  [split] Using default 80/20 split: train_end={train_end_date}, test_start={test_start_date}")
+        elif test_start_date is None:
+            # train_end specified but test_start not — set test_start to day after
+            test_start_date = train_end_date
+            print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
+        else:
+            print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
         
         self.train_data, self.test_data = self.data_loader.split_data(
             train_end_date=train_end_date,
@@ -346,7 +356,7 @@ class AAAI2027Pipeline:
         print(f"  Generated {len(seed_factors)} seed factors")
         print("  [✓] Factor generation complete")
         
-    def step4_evolve_factors(self, n_rounds: int = 5):
+    def step4_evolve_factors(self, n_rounds: int = 5, forward_period: int = None):
         """
         Step 4: Self-evolve seed factors through iterative improvement.
 
@@ -355,12 +365,17 @@ class AAAI2027Pipeline:
         
         Args:
             n_rounds: Number of evolution rounds
+            forward_period: Forward return horizon in trading days (None → config or 20)
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 4] Skipped: methods modules not available")
             return
         
-        print(f"\n[Step 4] Evolving factors ({n_rounds} rounds)...")
+        # Resolve forward_period: explicit arg > config.yaml > default 20
+        if forward_period is None:
+            forward_period = self.config.get('evolution', {}).get('forward_period', 20)
+        
+        print(f"\n[Step 4] Evolving factors ({n_rounds} rounds, forward={forward_period}d)...")
         
         # Initialize backtester for evolution — USE TRAINING DATA ONLY
         # Critical: factors must NOT see test data during evolution
@@ -369,7 +384,7 @@ class AAAI2027Pipeline:
         backtester = FactorBacktester(
             prices=self.train_data['price_data'],
             fundamentals=self.train_data['fundamental_data'],
-            forward_period=20,
+            forward_period=forward_period,
             use_qlib=use_qlib,
             qlib_provider_uri=self.config.get('data', {}).get('qlib', {}).get(
                 'provider_uri', '~/.qlib/qlib_data/cn_data'
@@ -824,6 +839,9 @@ class AAAI2027Pipeline:
         data_source: str = "auto",
         n_evolution_rounds: int = 5,
         output_dir: str = None,
+        split_train_end: str = None,
+        split_test_start: str = None,
+        forward_period: int = None,
     ):
         """
         Run the full end-to-end pipeline.
@@ -838,6 +856,9 @@ class AAAI2027Pipeline:
             data_source: Real data source ('westock', 'akshare', 'tushare', 'auto')
             n_evolution_rounds: Number of evolution rounds (overrides config)
             output_dir: Output directory for step9. None = experiments/{YYYYMMDD}/results/
+            split_train_end: Explicit train end date for train/test split
+            split_test_start: Explicit test start date for train/test split
+            forward_period: Forward return horizon in trading days (None → config or 20)
         """
         print("\n" + "=" * 60)
         data_label = "SAMPLE DATA (fast test)" if use_sample else "REAL DATA"
@@ -845,10 +866,16 @@ class AAAI2027Pipeline:
         print("=" * 60)
 
         # Run all steps
-        self.step1_load_data(start_date, end_date, use_sample=use_sample, data_source=data_source)
+        self.step1_load_data(
+            start_date, end_date,
+            use_sample=use_sample,
+            data_source=data_source,
+            split_train_end=split_train_end,
+            split_test_start=split_test_start,
+        )
         self.step2_initialize_memory()
         self.step3_generate_factors()
-        self.step4_evolve_factors(n_evolution_rounds)
+        self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
         self.step5_evaluate_factors()
         self.step5b_retrieve_from_memory()
         self.step5c_chair_synthesis()
@@ -1072,6 +1099,10 @@ Examples:
         help='Number of evolution rounds (default: 5)',
     )
     parser.add_argument(
+        '--forward-period', type=int, default=None,
+        help='Forward return horizon in trading days (None → config or 20)',
+    )
+    parser.add_argument(
         '--n-best-factors', type=int, default=None,
         help='Override evolution.n_best_factors (default: use config value)',
     )
@@ -1111,6 +1142,7 @@ Examples:
             data_source=args.source,
             n_evolution_rounds=args.n_evolution_rounds,
             output_dir=args.output_dir,
+            forward_period=args.forward_period,
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")

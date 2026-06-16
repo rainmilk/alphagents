@@ -243,6 +243,156 @@ class ExperimentRunner:
         
         return robustness_results
     
+    def run_cross_period_validation(
+        self,
+        start_end_dates: Dict[str, List[Tuple[str, str]]],
+        data_source: str = "auto",
+        n_evolution_rounds: int = 3,
+    ):
+        """
+        Run cross-period validation across multiple train/test date pairs.
+
+        Args:
+            start_end_dates: Dict with 'train_dates' and 'test_dates' keys,
+                each containing a list of (start, end) tuples in 'YYYYMMDD' format.
+                Example:
+                    {
+                        'train_dates': [('20200101','20211231'), ('20220101','20231231')],
+                        'test_dates': [('20210101','20211231'), ('20230101','20231231')],
+                    }
+            data_source: Data source ('westock', 'akshare', 'tushare', 'auto')
+            n_evolution_rounds: Evolution rounds per period (default: 3 for speed)
+
+        Returns:
+            Dict mapping period labels to aggregated results
+        """
+        print("\n" + "=" * 60)
+        print("  Cross-Period Validation")
+        print("=" * 60)
+
+        train_dates = start_end_dates.get('train_dates', [])
+        test_dates = start_end_dates.get('test_dates', [])
+
+        if len(train_dates) != len(test_dates):
+            raise ValueError(
+                f"train_dates ({len(train_dates)}) and test_dates ({len(test_dates)}) "
+                f"must have the same length"
+            )
+
+        n_periods = len(train_dates)
+        print(f"  Periods: {n_periods}")
+
+        period_results = {}
+        all_metrics = []
+
+        for i in range(n_periods):
+            train_start, train_end = train_dates[i]
+            test_start, test_end = test_dates[i]
+
+            # Normalise to YYYY-MM-DD for internal use
+            train_start_fmt = self._normalise_date(train_start)
+            train_end_fmt = self._normalise_date(train_end)
+            test_start_fmt = self._normalise_date(test_start)
+            test_end_fmt = self._normalise_date(test_end)
+
+            period_label = f"period_{i+1}"
+            print(f"\n{'─' * 50}")
+            print(f"  [{period_label}] Train: {train_start_fmt} → {train_end_fmt}")
+            print(f"  [{period_label}] Test:  {test_start_fmt} → {test_end_fmt}")
+            print(f"{'─' * 50}")
+
+            try:
+                # Data range covers both train and test
+                data_start = min(train_start_fmt, test_start_fmt)
+                data_end = max(train_end_fmt, test_end_fmt)
+
+                pipeline = AAAI2027Pipeline()
+                metrics = pipeline.run_full_pipeline(
+                    start_date=data_start,
+                    end_date=data_end,
+                    use_sample=False,
+                    data_source=data_source,
+                    n_evolution_rounds=n_evolution_rounds,
+                    output_dir=(
+                        f"{self.output_dir}/cross_period/{period_label}"
+                    ),
+                    split_train_end=train_end_fmt,
+                    split_test_start=test_start_fmt,
+                )
+
+                # Build structured result
+                period_result = {
+                    'train_start': train_start_fmt,
+                    'train_end': train_end_fmt,
+                    'test_start': test_start_fmt,
+                    'test_end': test_end_fmt,
+                    'metrics': metrics,
+                }
+                period_results[period_label] = period_result
+                all_metrics.append({
+                    'period': period_label,
+                    'train_start': train_start_fmt,
+                    'train_end': train_end_fmt,
+                    'test_start': test_start_fmt,
+                    'test_end': test_end_fmt,
+                    **{k: v for k, v in (metrics or {}).items()
+                       if isinstance(v, (int, float))},
+                })
+
+                print(f"  [{period_label}] Done — "
+                      f"Sharpe={metrics.get('sharpe_ratio', 'N/A')}, "
+                      f"MaxDD={metrics.get('max_drawdown', 'N/A')}")
+            except Exception as e:
+                print(f"  [{period_label}] FAILED: {e}")
+                period_results[period_label] = {
+                    'train_start': train_start_fmt,
+                    'train_end': train_end_fmt,
+                    'test_start': test_start_fmt,
+                    'test_end': test_end_fmt,
+                    'error': str(e),
+                }
+
+        # ── Aggregate summary ──
+        if all_metrics:
+            summary_df = pd.DataFrame(all_metrics)
+            summary_df = summary_df.set_index('period')
+            print(f"\n{'=' * 70}")
+            print("  Cross-Period Validation Summary")
+            print(f"{'=' * 70}")
+
+            # Print key metrics per period
+            metric_cols = [c for c in summary_df.columns
+                           if c not in ('train_start', 'train_end',
+                                         'test_start', 'test_end')]
+            if metric_cols:
+                print(summary_df[metric_cols].round(4).to_string())
+                print(f"\n  ── Aggregated (mean ± std) ──")
+                for col in metric_cols:
+                    vals = summary_df[col].dropna()
+                    if len(vals) > 0:
+                        print(f"  {col:25s}: {vals.mean():.4f} ± {vals.std():.4f}")
+
+            # Save
+            summary_path = f"{self.output_dir}/cross_period_summary.json"
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            summary_df.reset_index().to_json(summary_path, orient='records',
+                                              indent=2, default_handler=str)
+            print(f"\n  Summary saved to {summary_path}")
+
+        self.results['cross_period_validation'] = period_results
+
+        print("\n" + "=" * 60)
+        print("  Cross-Period Validation Complete")
+        print("=" * 60)
+
+        return period_results
+
+    @staticmethod
+    def _normalise_date(date_str: str) -> str:
+        """Convert YYYYMMDD or YYYY-MM-DD to YYYY-MM-DD."""
+        clean = date_str.replace('-', '')
+        return f"{clean[:4]}-{clean[4:6]}-{clean[6:8]}"
+    
     def _run_pipeline_with_ablation(self, **kwargs) -> Dict:
         """
         Run pipeline with specific components removed.
@@ -452,15 +602,20 @@ class ExperimentRunner:
         pass
 
 
-def run_all_experiments():
+def run_all_experiments(
+        start_end_dates: Dict[str, List[Tuple[str, str]]],
+        data_source: str = "auto",
+        n_evolution_rounds: int = 3):
     """
     Run all experiments for the AAAI 2027 paper.
     """
     runner = ExperimentRunner()
     
     # Run main experiment
-    runner.run_main_experiment(n_runs=3)  # Use 3 runs for quick testing
-    
+    # runner.run_main_experiment(n_runs=3)  # Use 3 runs for quick testing
+
+    runner.run_cross_period_validation(start_end_dates, data_source, n_evolution_rounds)
+
     # Run ablation studies
     runner.run_ablation_studies()
     
@@ -481,5 +636,10 @@ def run_all_experiments():
 
 
 if __name__ == '__main__':
+    start_end_dates = {
+        'train_dates': [('20210101', '20221231'), ('20220101', '20231231'), ('20230101', '20241231')],
+        'test_dates': [('20230101', '20231231'), ('20240101', '20241231'), ('20250101', '20W251231')],
+    }
+
     # Run all experiments
-    results = run_all_experiments()
+    results = run_all_experiments(start_end_dates)
