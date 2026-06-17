@@ -86,6 +86,7 @@ llm:
     
 # ==================== Evolution Configuration ====================
 evolution:
+  forward_period: 20  # forward return horizon in trading days (factor evaluation)
   n_seeds: 10  # number of candidate factors per round
   n_best_factors: 10
   n_improve: 10
