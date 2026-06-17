@@ -499,13 +499,13 @@ class FactorMemoryBank:
     ):
         self.factors: list[StoredFactor] = []
         self.embedder = embedder or FactorEmbedder()
-        self.index_path = Path(index_path) if index_path else None
+        self.index_path = index_path
         self.use_faiss = use_faiss
         self._faiss_index = None
         self._embeddings_cache: dict[str, np.ndarray] = {}  # factor_id -> embedding
 
         # Auto-load existing data if available
-        if self.index_path and self.index_path.exists():
+        if self.index_path:
             self.load()
 
     def __len__(self) -> int:
@@ -651,7 +651,7 @@ class FactorMemoryBank:
 
     def save(self, path: Optional[str] = None):
         """持久化到磁盘（JSON + FAISS index）"""
-        p = Path(path) if path else (self.index_path or Path("./memory_bank"))
+        p = Path(path) if path else (Path(self.index_path) or Path("./memory_bank"))
         p.mkdir(parents=True, exist_ok=True)
 
         # 保存因子记录
@@ -673,7 +673,7 @@ class FactorMemoryBank:
 
     def load(self, path: Optional[str] = None):
         """从磁盘加载"""
-        p = Path(path) if path else (self.index_path or Path("./memory_bank"))
+        p = Path(path) if path else (Path(self.index_path) or Path("./memory_bank"))
         if not p.exists():
             print(f"[MemoryBank] No saved data at {p}")
             return

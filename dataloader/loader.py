@@ -21,17 +21,11 @@ from pathlib import Path
 import yaml
 from datetime import datetime, timedelta
 import warnings
+
+from config import config_path
+import config as global_config
+
 warnings.filterwarnings('ignore')
-
-
-# ---------------------------------------------------------------------------
-# Cache helpers
-# ---------------------------------------------------------------------------
-
-def _cache_path(universe: str, start_date: str, end_date: str) -> str:
-    """Build a consistent cache file path."""
-    os.makedirs('data', exist_ok=True)
-    return f"data/cache_{universe}_{start_date}_{end_date}.pkl"
 
 
 def _save_cache(cache_file: str, price_data, fundamental_data, industry_data):
@@ -55,28 +49,12 @@ def _load_cache(cache_file: str):
 # ---------------------------------------------------------------------------
 # Raw data persistence helpers
 # ---------------------------------------------------------------------------
-
-RAW_DATA_DIR = "data/raw"
-
-def _ensure_raw_dir(subdir: str) -> str:
-    """Create raw data subdirectory and return its path."""
-    path = os.path.join(RAW_DATA_DIR, subdir)
-    os.makedirs(path, exist_ok=True)
-    return path
-
 def _save_raw_csv(df: pd.DataFrame, relpath: str, index: bool = True):
     """Save a DataFrame as CSV to data/raw/... with utf-8-sig encoding."""
-    full_path = os.path.join(RAW_DATA_DIR, relpath)
+    raw_data_dir = config_path('data', 'raw')
+    full_path = os.path.join(raw_data_dir, relpath)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     df.to_csv(full_path, index=index, encoding='utf-8-sig')
-    n_rows, n_cols = df.shape
-    print(f"  [raw] Saved {full_path}  ({n_rows} rows x {n_cols} cols)")
-
-def _save_raw_parquet(df: pd.DataFrame, relpath: str):
-    """Save a DataFrame as Parquet to data/raw/... (fast & compact)."""
-    full_path = os.path.join(RAW_DATA_DIR, relpath)
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    df.to_parquet(full_path)
     n_rows, n_cols = df.shape
     print(f"  [raw] Saved {full_path}  ({n_rows} rows x {n_cols} cols)")
 
@@ -405,6 +383,11 @@ def load_real_data(
         - fundamental_data: Dict of DataFrames with keys [pe, pb, roe, market_cap]
         - industry_series: Series, index=stock_code, value=industry_name
     """
+
+    global_config.universe = universe
+    global_config.start_date = start_date
+    global_config.end_date = end_date
+
     # Load config if not provided (try default path)
     if config is None:
         _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -419,7 +402,7 @@ def load_real_data(
     # Generate column mapping JSON for documentation (idempotent)
     _generate_column_mapping_json()
 
-    cache_file = _cache_path(universe, start_date, end_date)
+    cache_file = config_path('data','cache.pkl')
 
     # 1. Try cache first
     if not force_refresh:

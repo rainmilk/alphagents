@@ -24,6 +24,10 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import yaml
 import warnings
+
+import config
+from config import config_path
+
 warnings.filterwarnings('ignore')
 
 # Import all modules
@@ -120,6 +124,7 @@ class AAAI2027Pipeline:
             split_train_end: Explicit train end date (overrides config)
             split_test_start: Explicit test start date (overrides config)
         """
+
         print("\n[Step 1] Loading data...")
 
         if use_sample:
@@ -222,7 +227,7 @@ class AAAI2027Pipeline:
             pd.Series(series).to_csv(csv_path, index=True, encoding='utf-8-sig')
         
         for split, data in [("train", self.train_data), ("test", self.test_data)]:
-            root = os.path.join("data", split)
+            root = config_path("data", split)
             os.makedirs(root, exist_ok=True)
             
             n_price = _save_category(data.get('price_data'), root, "price")
@@ -247,7 +252,7 @@ class AAAI2027Pipeline:
             "saved_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         
-        info_path = os.path.join("data", "split_info.json")
+        info_path = config_path("data", "split_info.json")
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(split_info, f, indent=2, ensure_ascii=False)
         
@@ -682,7 +687,8 @@ class AAAI2027Pipeline:
 
         # --- Save fusion results to experiments/{yyyymmdd}/fusion/final_factors.json ---
         date_str = datetime.now().strftime("%Y%m%d")
-        fusion_dir = os.path.join("experiments", date_str, "fusion")
+        fusion_dir = os.path.join(date_str, "fusion")
+        fusion_dir = config_path("experiments", fusion_dir)
         os.makedirs(fusion_dir, exist_ok=True)
 
         # Build serializable composite scores: {date_str: {stock_code: score, ...}, ...}
@@ -798,7 +804,8 @@ class AAAI2027Pipeline:
         """
         if output_dir is None:
             date_str = datetime.now().strftime("%Y%m%d")
-            output_dir = os.path.join("experiments", date_str, "results")
+            output_dir = os.path.join(date_str, "results")
+            output_dir = config_path('experiments', output_dir)
 
         print(f"\n[Step 9] Saving results to {output_dir}...")
 

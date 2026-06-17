@@ -19,6 +19,8 @@ import os
 import json
 import logging
 
+from config import config_path
+
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
@@ -1222,7 +1224,8 @@ class SelfEvolvingGenerator:
         from datetime import datetime
 
         date_str = datetime.now().strftime("%Y%m%d")
-        save_dir = os.path.join("experiments", date_str, subdir, f"round_{round_id}")
+        save_dir = os.path.join(date_str, subdir, f"round_{round_id}")
+        save_dir = config_path("experiments", save_dir)
         os.makedirs(save_dir, exist_ok=True)
 
         factors_dicts = [asdict(f) for f in factors]
@@ -1241,7 +1244,8 @@ class SelfEvolvingGenerator:
         from datetime import datetime
 
         date_str = datetime.now().strftime("%Y%m%d")
-        save_dir = os.path.join("experiments", date_str, "self_evolve", f"round_{round_id}")
+        save_dir = os.path.join(date_str, "self_evolve", f"round_{round_id}")
+        save_dir = config_path('experiments', save_dir)
         os.makedirs(save_dir, exist_ok=True)
 
         save_path = os.path.join(save_dir, "backtest_factor_metrics.csv")

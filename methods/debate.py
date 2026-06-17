@@ -19,6 +19,8 @@ import os
 import json
 from datetime import datetime
 
+from config import config_path
+
 warnings.filterwarnings('ignore')
 
 try:
@@ -349,7 +351,9 @@ class DebateEvaluator:
 
         if output_dir is None:
             date_str = datetime.now().strftime("%Y%m%d")
-            output_dir = os.path.join("experiments", date_str, "debate")
+            output_dir = os.path.join(date_str, "debate")
+            output_dir = config_path("experiments", output_dir)
+
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, "debate_factors_result.json")
 
@@ -946,7 +950,8 @@ class DebateEvaluator:
         from datetime import datetime
 
         date_str = datetime.now().strftime("%Y%m%d")
-        output_dir = os.path.join("experiments", date_str)
+        output_dir = os.path.join(date_str, "debate")
+        output_dir = config_path("experiments", output_dir)
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, "chair_synthesis.json")
 
@@ -966,7 +971,8 @@ class DebateEvaluator:
         from datetime import datetime
 
         date_str = datetime.now().strftime("%Y%m%d")
-        debate_dir = os.path.join("experiments", date_str, "debate")
+        debate_dir = os.path.join(date_str, "debate")
+        debate_dir = config_path("experiments", debate_dir)
         os.makedirs(debate_dir, exist_ok=True)
         debate_path = os.path.join(debate_dir, "debate_factors_result.json")
 
