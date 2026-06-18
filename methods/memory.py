@@ -403,6 +403,7 @@ class StoredFactor:
 
     # 绩效指标（回测结果）
     ic: float = 0.0                    # Information Coefficient
+    icir: float = 0.0                  # ICIR = IC / std(IC)
     sharpe: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
@@ -435,6 +436,7 @@ class StoredFactor:
             "description": self.description,
             "market_state": self.market_state.to_dict(),
             "ic": self.ic,
+            "icir": self.icir,
             "sharpe": self.sharpe,
             "win_rate": self.win_rate,
             "max_drawdown": self.max_drawdown,
@@ -454,6 +456,7 @@ class StoredFactor:
             description=d["description"],
             market_state=MarketState.from_dict(d["market_state"]),
             ic=d.get("ic", 0.0),
+            icir=d.get("icir", 0.0),
             sharpe=d.get("sharpe", 0.0),
             win_rate=d.get("win_rate", 0.0),
             max_drawdown=d.get("max_drawdown", 0.0),
@@ -520,8 +523,10 @@ class FactorMemoryBank:
         description: str,
         market_state: MarketState,
         ic: float = 0.0,
+        icir: float = 0.0,
         sharpe: float = 0.0,
         win_rate: float = 0.0,
+        max_drawdown: float = 0.0,
         source: str = "llm",
         parent_ids: Optional[list[str]] = None,
     ) -> str:
@@ -536,7 +541,7 @@ class FactorMemoryBank:
         existing = self._find_by_id(factor_id)
         if existing:
             # 更新现有因子的绩效（取历史平均）
-            self._update_existing_factor(existing, ic, sharpe, win_rate)
+            self._update_existing_factor(existing, ic, icir, sharpe, win_rate, max_drawdown)
             return factor_id
 
         # 新建
@@ -547,8 +552,10 @@ class FactorMemoryBank:
             description=description,
             market_state=market_state,
             ic=ic,
+            icir=icir,
             sharpe=sharpe,
             win_rate=win_rate,
+            max_drawdown=max_drawdown,
             created_at=now,
             source=source,
             parent_ids=parent_ids or [],
@@ -702,13 +709,15 @@ class FactorMemoryBank:
                 return f
         return None
 
-    def _update_existing_factor(self, f: StoredFactor, ic: float, sharpe: float, win_rate: float):
+    def _update_existing_factor(self, f: StoredFactor, ic: float, icir: float, sharpe: float, win_rate: float, max_drawdown: float):
         """当因子已存在时，用指数移动平均更新其绩效"""
         alpha = 0.3
         f.ic = (1 - alpha) * f.ic + alpha * ic
+        f.icir = (1 - alpha) * f.icir + alpha * icir
         f.sharpe = (1 - alpha) * f.sharpe + alpha * sharpe
         f.win_rate = (1 - alpha) * f.win_rate + alpha * win_rate
-        print(f"[MemoryBank] Updated existing factor {f.factor_id}: new IC={f.ic:.4f}")
+        f.max_drawdown = (1 - alpha) * f.max_drawdown + alpha * max_drawdown
+        print(f"[MemoryBank] Updated existing factor {f.factor_id}: new IC={f.ic:.4f}, new ICIR={f.icir:.4f}")
 
     def _get_embedding(self, f: StoredFactor) -> np.ndarray:
         """获取因子的嵌入向量（优先用缓存）"""

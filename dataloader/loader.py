@@ -17,9 +17,7 @@ import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from pathlib import Path
 import yaml
-from datetime import datetime, timedelta
 import warnings
 
 from config import config_path
@@ -84,6 +82,7 @@ def _generate_column_mapping_json(output_path: str = "data/column_mapping.json")
             "fundamental": {
                 "pe":         {"type": "float64", "unit": "倍",    "desc": "P/E ratio (TTM)"},
                 "pb":         {"type": "float64", "unit": "倍",    "desc": "P/B ratio"},
+                "ps":         {"type": "float64", "unit": "倍",    "desc": "P/S ratio (TTM)"},
                 "roe":        {"type": "float64", "unit": "ratio", "desc": "Return on Equity"},
                 "market_cap": {"type": "float64", "unit": "亿元",  "desc": "Total market cap"},
             },
@@ -126,6 +125,7 @@ def _generate_column_mapping_json(output_path: str = "data/column_mapping.json")
                             "昨收":         {"canonical": "prev_close",           "type": "float64"},
                             "市盈率-动态":   {"canonical": "pe",                   "type": "float64",  "note": "TTM P/E"},
                             "市净率":       {"canonical": "pb",                   "type": "float64"},
+                            "市销率":       {"canonical": "ps",                   "type": "float64",  "note": "TTM P/S"},
                             "总市值":       {"canonical": "market_cap_raw",       "type": "float64",  "note": "unit: CNY; divided by 1e8 → canonical(亿元)"},
                             "流通市值":     {"canonical": "circulating_market_cap","type": "float64", "note": "unit: CNY"},
                             "成交量":       {"canonical": "volume",               "type": "int64"},
@@ -170,12 +170,13 @@ def _generate_column_mapping_json(output_path: str = "data/column_mapping.json")
                     },
                     "daily_basic": {
                         "description": "Daily fundamental indicators.",
-                        "url_hint": "pro.daily_basic(ts_code=..., trade_date=..., fields='ts_code,pe_ttm,pb,roe,total_mv')",
+                        "url_hint": "pro.daily_basic(ts_code=..., trade_date=..., fields='ts_code,pe_ttm,pb,ps_ttm,roe,total_mv')",
                         "columns": {
                             "ts_code":    {"canonical": "code",       "type": "str"},
                             "trade_date": {"canonical": "date",       "type": "datetime"},
                             "pe_ttm":     {"canonical": "pe",         "type": "float64", "note": "TTM P/E"},
                             "pb":         {"canonical": "pb",         "type": "float64"},
+                            "ps_ttm":     {"canonical": "ps",         "type": "float64", "note": "TTM P/S"},
                             "roe":        {"canonical": "roe",        "type": "float64", "note": "raw is %; loader divides by 100"},
                             "total_mv":   {"canonical": "market_cap", "type": "float64", "note": "unit: 万元; loader divides by 10000 → 亿元"},
                         },
@@ -380,7 +381,7 @@ def load_real_data(
     Returns:
         Tuple of (price_data, fundamental_data, industry_series)
         - price_data: Dict of DataFrames with keys [open, high, low, close, volume, amount]
-        - fundamental_data: Dict of DataFrames with keys [pe, pb, roe, market_cap]
+        - fundamental_data: Dict of DataFrames with keys [pe, pb, ps, roe, market_cap]
         - industry_series: Series, index=stock_code, value=industry_name
     """
 
@@ -554,9 +555,13 @@ def _load_from_westock(
                 except Exception:
                     continue
         
-        # Fill missing
+        # Fill missing price data: ffill only (no bfill — avoids look-ahead bias)
+        # volume: fill NaN with 0 (no trading on suspension days)
         for field in price_data:
-            price_data[field] = price_data[field].ffill().bfill()
+            if field == 'volume':
+                price_data[field] = price_data[field].fillna(0)
+            else:
+                price_data[field] = price_data[field].ffill()
 
         # Validate: if close data is still all NaN, return None to fall through
         if price_data['close'].isna().all().all():
@@ -566,12 +571,12 @@ def _load_from_westock(
         # Fundamental data — try westock fundamentals API
         fundamental_data = {}
         # Initialize with NaN; real values will be filled in below
-        for factor in ['pe', 'pb', 'roe', 'market_cap']:
+        for factor in ['pe', 'pb', 'ps', 'roe', 'market_cap']:
             fundamental_data[factor] = pd.DataFrame(
                 np.nan, index=dates, columns=stock_codes
             )
         try:
-            for factor in ['pe', 'pb', 'roe', 'market_cap']:
+            for factor in ['pe', 'pb', 'ps', 'roe', 'market_cap']:
                 fund_df = westock.get_fundamentals(stock_codes, factor, start_date, end_date)
                 if fund_df is not None and not fund_df.empty:
                     fund_df.index = pd.to_datetime(fund_df.index)
@@ -582,11 +587,11 @@ def _load_from_westock(
                     except Exception:
                         pass
         except Exception:
-            pass  # Keep NaN-initialized DataFrames; ffill/bfill applied below
+            pass  # Keep NaN-initialized DataFrames; ffill applied below
 
-        # Forward/back fill missing fundamentals (use most recent available value)
+        # Forward fill missing fundamentals (use most recent available value; no bfill to avoid look-ahead bias)
         for factor in fundamental_data:
-            fundamental_data[factor] = fundamental_data[factor].ffill().bfill()
+            fundamental_data[factor] = fundamental_data[factor].ffill()
         
         # Industry classification
         try:
@@ -737,9 +742,13 @@ def _load_from_tushare(
                 print(f"  [tushare] Kline progress: {i + 1}/{n_stocks} (errors: {fail_count})")
             time.sleep(0.2)  # rate limit
 
-        # ---- 5. Forward/back fill missing price data ----
+        # Fill missing price data: ffill only (no bfill — avoids look-ahead bias)
+        # volume: fill NaN with 0 (no trading on suspension days)
         for field in price_data:
-            price_data[field] = price_data[field].ffill().bfill()
+            if field == 'volume':
+                price_data[field] = price_data[field].fillna(0)
+            else:
+                price_data[field] = price_data[field].ffill()
 
         # Validate: if close data is still all NaN, return None to fall through
         if price_data['close'].isna().all().all():
@@ -749,7 +758,7 @@ def _load_from_tushare(
         # ---- 6. Fundamental data ----
         print("  [tushare] Fetching fundamentals...")
         fundamental_data = {}
-        for field in ['pe', 'pb', 'roe', 'market_cap']:
+        for field in ['pe', 'pb', 'ps', 'roe', 'market_cap']:
             fundamental_data[field] = pd.DataFrame(np.nan, index=dates, columns=stock_codes)
 
         # daily_basic: iterate ONE STOCK AT A TIME with full date range.
@@ -770,7 +779,7 @@ def _load_from_tushare(
                         ts_code=tsc,
                         start_date=sd_fund,
                         end_date=ed_fund,
-                        fields='ts_code,trade_date,pe_ttm,pb,total_mv'
+                        fields='ts_code,trade_date,pe_ttm,pb,ps_ttm,total_mv'
                     )
                 except Exception:
                     df_b = None
@@ -793,6 +802,8 @@ def _load_from_tushare(
                             fundamental_data['pe'].loc[dt, plain] = float(row['pe_ttm'])
                         if 'pb' in row and pd.notna(row['pb']):
                             fundamental_data['pb'].loc[dt, plain] = float(row['pb'])
+                        if 'ps_ttm' in row and pd.notna(row['ps_ttm']):
+                            fundamental_data['ps'].loc[dt, plain] = float(row['ps_ttm'])
                         if 'total_mv' in row and pd.notna(row['total_mv']):
                             fundamental_data['market_cap'].loc[dt, plain] = float(row['total_mv']) / 10000.0
                     except Exception:
@@ -817,15 +828,21 @@ def _load_from_tushare(
         # ---- 6b. ROE from fina_indicator (quarterly) ----
         # daily_basic doesn't have ROE; use fina_indicator which provides
         # quarterly financial ratios. Forward-fill to daily dates.
+        #
+        # NOTE: We look back 2 years before start_date when fetching ROE.
+        # This ensures that even if a stock's first report within [start_date, end_date]
+        # is published late, we still capture the prior report and can ffill into
+        # the early part of our date range (no need for bfill / look-ahead bias).
         roe_loaded = 0
         try:
             print("  [tushare] Fetching ROE (fina_indicator)...")
+            roe_start_dt = (pd.Timestamp(start_date) - pd.DateOffset(years=2)).strftime('%Y%m%d')
             for si, tsc in enumerate(ts_codes_fund):
                 plain = stock_codes[si]
                 try:
                     df_roe = pro.fina_indicator(
                         ts_code=tsc,
-                        start_date=sd_fund,
+                        start_date=roe_start_dt,
                         end_date=ed_fund,
                         fields='ts_code,end_date,roe'
                     )
@@ -835,6 +852,10 @@ def _load_from_tushare(
                 if df_roe is None or df_roe.empty:
                     time.sleep(0.05)
                     continue
+
+                # Sort by end_date ascending so earlier reports are filled first;
+                # otherwise a later (older) report can overwrite a newer one.
+                df_roe = df_roe.sort_values('end_date')
 
                 for _, row in df_roe.iterrows():
                     try:
@@ -862,9 +883,9 @@ def _load_from_tushare(
         except Exception as e:
             print(f"  [tushare] ROE fetch error: {e}")
 
-        # Fill missing fundamentals (forward/back fill; leave remaining as NaN)
+        # Fill missing fundamentals (forward fill only; no bfill to avoid look-ahead bias)
         for field in fundamental_data:
-            fundamental_data[field] = fundamental_data[field].ffill().bfill()
+            fundamental_data[field] = fundamental_data[field].ffill()
 
         # ---- 7. Industry classification ----
         print("  [tushare] Fetching industry classification...")
@@ -903,6 +924,11 @@ def _load_from_tushare(
         industry_series = pd.Series(industry_dict)
 
         print(f"  [tushare] Data loaded: {n_stocks} stocks x {n_days} days")
+
+        # Save fundamental data to CSV
+        for factor in fundamental_data:
+            _save_raw_csv(fundamental_data[factor], f'tushare/fundamentals/{factor}.csv', index=True)
+
         return price_data, fundamental_data, industry_series
 
     except Exception as e:
@@ -1223,9 +1249,13 @@ def _load_from_qlib(
 
     print(f"  [qlib] Fetched price data for {n_fetched}/{n_stocks} stocks")
 
-    # Fill missing
+    # Fill missing price data: ffill only (no bfill — avoids look-ahead bias)
+    # volume: fill NaN with 0 (no trading on suspension days)
     for field in price_data:
-        price_data[field] = price_data[field].ffill().bfill()
+        if field == 'volume':
+            price_data[field] = price_data[field].fillna(0)
+        else:
+            price_data[field] = price_data[field].ffill()
 
     # Validate
     if price_data['close'].isna().all().all():
@@ -1235,7 +1265,7 @@ def _load_from_qlib(
     # ---- 7. Fundamental data ----
     print("  [qlib] Building fundamental data...")
     fundamental_data = {}
-    for field in ['pe', 'pb', 'roe', 'market_cap']:
+    for field in ['pe', 'pb', 'ps', 'roe', 'market_cap']:
         fundamental_data[field] = pd.DataFrame(
             np.nan, index=dates, columns=qlib_codes
         )
@@ -1254,9 +1284,9 @@ def _load_from_qlib(
     except Exception as e:
         print(f"  [qlib] Fundamental factor extraction failed: {e}")
 
-    # Forward/back fill
+    # Forward fill only (no bfill to avoid look-ahead bias)
     for field in fundamental_data:
-        fundamental_data[field] = fundamental_data[field].ffill().bfill()
+        fundamental_data[field] = fundamental_data[field].ffill()
 
     # ---- 8. Industry classification ----
     # AkShare industry APIs are currently broken (network/SSL issues with external sources).
@@ -1449,8 +1479,13 @@ def _load_from_akshare(
                 print(f"  [akshare] Kline progress: {i + 1}/{n_stocks} (errors: {fail_count})")
 
         # ---- 5. Fill missing ----
+        # Price data: ffill only (no bfill — avoids look-ahead bias)
+        # volume: fill NaN with 0 (no trading on suspension days)
         for field in price_data:
-            price_data[field] = price_data[field].ffill().bfill()
+            if field == 'volume':
+                price_data[field] = price_data[field].fillna(0)
+            else:
+                price_data[field] = price_data[field].ffill()
 
         # Validate: if close data is still all NaN, return None to fall through
         if price_data['close'].isna().all().all():
@@ -1464,14 +1499,14 @@ def _load_from_akshare(
         # (real historical data), then fall back to AkShare spot.
         print("  [akshare] Building fundamental data...")
         fundamental_data = {}
-        for field in ['pe', 'pb', 'roe', 'market_cap']:
+        for field in ['pe', 'pb', 'ps', 'roe', 'market_cap']:
             fundamental_data[field] = pd.DataFrame(
                 np.nan, index=dates, columns=stock_codes
             )
 
         fundamental_loaded = False
 
-        # 1) Try Tushare daily_basic — real daily PE/PB/market_cap history
+        # 1) Try Tushare daily_basic — real daily PE/PB/PS/market_cap history
         # Tushare daily_basic does NOT support comma-separated ts_code with
         # start_date/end_date range queries (returns empty). Iterate one stock
         # at a time — the only reliable pattern.
@@ -1489,7 +1524,7 @@ def _load_from_akshare(
                 n_stocks_fund = len(ts_codes_fund)
                 sd_fund = start_date.replace('-', '')
                 ed_fund = end_date.replace('-', '')
-                pe_loaded = pb_loaded = mc_loaded = 0
+                pe_loaded = pb_loaded = ps_loaded = mc_loaded = 0
                 for si, tsc in enumerate(ts_codes_fund):
                     plain = tsc.split('.')[0]
                     # Build Qlib-style code (SH000001 / SZ000001) for stock_codes lookup
@@ -1506,7 +1541,7 @@ def _load_from_akshare(
                             ts_code=tsc,
                             start_date=sd_fund,
                             end_date=ed_fund,
-                            fields='ts_code,trade_date,pe_ttm,pb,total_mv'
+                            fields='ts_code,trade_date,pe_ttm,pb,ps_ttm,total_mv'
                         )
                     except Exception:
                         df_fund = None
@@ -1530,6 +1565,9 @@ def _load_from_akshare(
                             if pd.notna(row.get('pb')):
                                 fundamental_data['pb'].loc[dt, qc] = float(row['pb'])
                                 pb_loaded += 1
+                            if pd.notna(row.get('ps_ttm')):
+                                fundamental_data['ps'].loc[dt, qc] = float(row['ps_ttm'])
+                                ps_loaded += 1
                             if pd.notna(row.get('total_mv')):
                                 fundamental_data['market_cap'].loc[dt, qc] = float(row['total_mv']) / 10000.0
                                 mc_loaded += 1
@@ -1547,7 +1585,7 @@ def _load_from_akshare(
                     fundamental_loaded = True
                     print(f"  [akshare] Tushare daily_basic coverage: "
                           f"pe={n_covered}/{n_stocks}, "
-                          f"rows_pe={pe_loaded}, rows_pb={pb_loaded}, rows_mc={mc_loaded}")
+                          f"rows_pe={pe_loaded}, rows_pb={pb_loaded}, rows_ps={ps_loaded}, rows_mc={mc_loaded}")
         except Exception as e:
             print(f"  [akshare] Tushare daily_basic failed: {e}")
 
@@ -1559,6 +1597,7 @@ def _load_from_akshare(
                 pro = ts.pro_api()
                 roe_loaded = 0
                 print("  [akshare] Fetching ROE (fina_indicator)...")
+                roe_start_dt = (pd.Timestamp(start_date) - pd.DateOffset(years=2)).strftime('%Y%m%d')
                 for si, tsc in enumerate(ts_codes_fund):
                     plain = tsc.split('.')[0]
                     if tsc.endswith('.SH'):
@@ -1572,7 +1611,7 @@ def _load_from_akshare(
                     try:
                         df_roe = pro.fina_indicator(
                             ts_code=tsc,
-                            start_date=sd_fund,
+                            start_date=roe_start_dt,
                             end_date=ed_fund,
                             fields='ts_code,end_date,roe'
                         )
@@ -1582,6 +1621,9 @@ def _load_from_akshare(
                     if df_roe is None or df_roe.empty:
                         time.sleep(0.05)
                         continue
+
+                    # Sort by end_date ascending so earlier reports are filled first
+                    df_roe = df_roe.sort_values('end_date')
 
                     for _, row in df_roe.iterrows():
                         try:
@@ -1632,6 +1674,7 @@ def _load_from_akshare(
                     code_col = '代码' if '代码' in df_spot.columns else df_spot.columns[0]
                     pe_col   = '市盈率-动态' if '市盈率-动态' in df_spot.columns else None
                     pb_col   = '市净率'      if '市净率'      in df_spot.columns else None
+                    ps_col   = '市销率'      if '市销率'      in df_spot.columns else None
                     mc_col   = '总市值'      if '总市值'      in df_spot.columns else None
 
                     if code_col in df_spot.columns:
@@ -1647,6 +1690,11 @@ def _load_from_akshare(
                             if pb_col and pd.notna(row.get(pb_col)):
                                 try:
                                     fundamental_data['pb'].loc[:, code] = float(row[pb_col])
+                                except Exception:
+                                    pass
+                            if ps_col and pd.notna(row.get(ps_col)):
+                                try:
+                                    fundamental_data['ps'].loc[:, code] = float(row[ps_col])
                                 except Exception:
                                     pass
                             if mc_col and pd.notna(row.get(mc_col)):
@@ -1666,9 +1714,9 @@ def _load_from_akshare(
             print("  [akshare] Fundamental data unavailable from all sources — "
                   "proceeding with NaN (pipeline will handle)")
 
-        # Forward/back fill missing fundamentals
+        # Forward fill only (no bfill to avoid look-ahead bias)
         for field in fundamental_data:
-            fundamental_data[field] = fundamental_data[field].ffill().bfill()
+            fundamental_data[field] = fundamental_data[field].ffill()
 
         # ---- 7. Industry classification ----
         print("  [akshare] Fetching industry classification...")
@@ -1710,6 +1758,11 @@ def _load_from_akshare(
         industry_series = pd.Series(industry_dict)
 
         print(f"  [akshare] Data loaded: {n_stocks} stocks x {n_days} days")
+
+        # Save fundamental data to CSV
+        for factor in fundamental_data:
+            _save_raw_csv(fundamental_data[factor], f'akshare/fundamentals/{factor}.csv', index=True)
+
         return price_data, fundamental_data, industry_series
 
     except Exception as e:
@@ -1758,6 +1811,11 @@ def _generate_synthetic_data(
         # PB: log-normal, median ~2, always positive
         'pb': pd.DataFrame(
             np.exp(np.random.randn(n_days, n_stocks) * 0.5 + np.log(2)),
+            index=dates, columns=stock_codes
+        ),
+        # PS(TTM): log-normal, median ~2, always positive (similar to PB)
+        'ps': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.7 + np.log(2)),
             index=dates, columns=stock_codes
         ),
         # ROE: clipped normal, median ~10%, range -50%~80%
@@ -1845,6 +1903,23 @@ class DataLoader:
             config=self.config,
         )
 
+        # Filter both price_data and fundamental_data to actual trading days only.
+        # dates was built with freq='B' (weekdays), which still includes Chinese public
+        # holidays (Spring Festival, National Day, etc.).  Those rows are all-NaN in
+        # price_data['close'].  We derive the real trading-day index from the rows that
+        # have at least one non-NaN close value and reindex everything to it.
+        if price_data and 'close' in price_data:
+            actual_trading_days = price_data['close'].dropna(how='all').index
+            n_removed = len(price_data['close'].index) - len(actual_trading_days)
+            if n_removed > 0:
+                print(f"  [loader] Removed {n_removed} non-trading days (holidays) from index")
+            price_data = {k: v.reindex(actual_trading_days) for k, v in price_data.items()}
+            if fundamental_data:
+                fundamental_data = {
+                    k: v.reindex(actual_trading_days) for k, v in fundamental_data.items()
+                }
+            print(f"  [loader] Final trading-day index: {len(actual_trading_days)} days")
+
         # Preprocess
         price_data = self._preprocess_price_data(price_data)
         fundamental_data = self._preprocess_fundamental_data(fundamental_data)
@@ -1872,7 +1947,8 @@ class DataLoader:
             if self.preprocessing_config['fill_method'] == 'forward':
                 df = df.ffill()
             elif self.preprocessing_config['fill_method'] == 'backward':
-                df = df.bfill()
+                # DEPRECATED: backward fill introduces look-ahead bias; treat as forward fill
+                df = df.ffill()
             elif self.preprocessing_config['fill_method'] == 'interpolate':
                 df = df.interpolate(method='linear')
             
@@ -1899,8 +1975,13 @@ class DataLoader:
         processed = {}
         
         for col, df in fundamental_data.items():
-            # Fill missing values with forward fill (use latest available)
-            df = df.ffill().bfill()
+            # By this point the index has already been aligned to actual trading days
+            # (holidays removed) in load_data() via dropna(how='all') on price_data['close'].
+            # So we only need to forward-fill within each column.
+            # We deliberately do NOT bfill: bfill would use future report values to fill
+            # the period before the first report, introducing look-ahead bias.
+            # Pre-first-report NaN values are left as NaN and handled downstream.
+            df = df.ffill()
             processed[col] = df
         
         return processed
@@ -2115,6 +2196,10 @@ def load_sample_data(n_stocks: int = 100, n_days: int = 1000) -> Tuple[pd.DataFr
         ),
         'pb': pd.DataFrame(
             np.exp(np.random.randn(n_days, n_stocks) * 0.5 + np.log(2)),
+            index=dates, columns=stock_codes
+        ),
+        'ps': pd.DataFrame(
+            np.exp(np.random.randn(n_days, n_stocks) * 0.7 + np.log(2)),
             index=dates, columns=stock_codes
         ),
         'roe': pd.DataFrame(

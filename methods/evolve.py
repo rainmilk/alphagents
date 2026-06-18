@@ -52,26 +52,25 @@ class CandidateFactor:
     parent_id: Optional[str] = None
     generation: int = 0
     ic: float = 0.0
+    icir: float = 0.0
     sharpe: float = 0.0
     win_rate: float = 0.0
     
     
 @dataclass
 class EvolutionRound:
-    """Record of an evolution round."""
+    """Record of an evolution round — stores evaluated factors for this round."""
     round_id: int
-    seed_factors: List[CandidateFactor]
-    improved_factors: List[CandidateFactor]
+    factors: List[CandidateFactor]   # evaluated factors in this round
     best_ic: float
     avg_ic: float
-    
-    
+
+
 @dataclass
 class EvolutionResult:
     """Result of evolution process."""
     best_factors: List[CandidateFactor]
     evolution_history: List[EvolutionRound]
-    best_ic: float
     total_rounds: int
     
     
@@ -394,13 +393,16 @@ class _FactorExprEvaluator:
     def _fn_ts_rank(x: pd.DataFrame, window) -> pd.DataFrame:
         """Rolling time-series rank within each stock."""
         w = _FactorExprEvaluator._safe_int(window)
-        return x.rolling(window=w, min_periods=max(3, w // 2)).rank(pct=True) / w
+        min_p = min(max(2, w // 2), w)  # never exceed w
+        return x.rolling(window=w, min_periods=min_p).rank(pct=True) / w
 
     @staticmethod
     def _fn_ts_corr(x: pd.DataFrame, y: pd.DataFrame, window) -> pd.DataFrame:
         """Rolling Pearson correlation between x and y (per stock)."""
         w = _FactorExprEvaluator._safe_int(window)
-        return x.rolling(window=w, min_periods=max(10, w)).corr(y)
+        # min_periods must be <= window; require at least 3 points but never exceed w
+        min_p = min(max(3, w // 2), w)
+        return x.rolling(window=w, min_periods=min_p).corr(y)
 
     @staticmethod
     def _fn_ts_mean(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -410,7 +412,9 @@ class _FactorExprEvaluator:
     @staticmethod
     def _fn_ts_std(x: pd.DataFrame, window) -> pd.DataFrame:
         w = _FactorExprEvaluator._safe_int(window)
-        return x.rolling(window=w, min_periods=max(5, w * 2 // 3)).std(ddof=0)
+        # min_periods must be <= window; never exceed w
+        min_p = min(max(2, w * 2 // 3), w)
+        return x.rolling(window=w, min_periods=min_p).std(ddof=0)
 
     @staticmethod
     def _fn_ts_min(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -558,6 +562,11 @@ class FactorBacktester:
         self._data_map = dict(self.price_data)
         self._data_map.update(self.fundamental_data)
 
+        # ---- Derived fields ----
+        if 'close' in self._data_map and 'pe' in self._data_map:
+            pe_safe = self._data_map['pe'].replace(0, np.nan)
+            self._data_map['eps'] = self._data_map['close'] / pe_safe
+
         # ---- Compute forward returns ----
         self._forward_returns = self._compute_forward_returns()
 
@@ -623,6 +632,7 @@ class FactorBacktester:
             cached = self._metric_cache[expr].copy()
             # Update the factor object
             factor.ic = cached['ic']
+            factor.icir = cached.get('icir', 0.0)
             factor.sharpe = cached['sharpe']
             factor.win_rate = cached['win_rate']
             return cached
@@ -653,7 +663,7 @@ class FactorBacktester:
 
             metrics = {
                 'ic': float(ic) if not np.isnan(ic) else 0.0,
-                'ic_ir': float(ic_ir) if not np.isnan(ic_ir) else 0.0,
+                'icir': float(ic_ir) if not np.isnan(ic_ir) else 0.0,
                 'sharpe': float(sharpe) if not np.isnan(sharpe) else 0.0,
                 'win_rate': float(win_rate) if not np.isnan(win_rate) else 0.5,
                 'max_drawdown': float(max_dd) if not np.isnan(max_dd) else 0.0,
@@ -663,6 +673,7 @@ class FactorBacktester:
 
             # Update the factor object
             factor.ic = metrics['ic']
+            factor.icir = metrics['icir']
             factor.sharpe = metrics['sharpe']
             factor.win_rate = metrics['win_rate']
 
@@ -681,7 +692,7 @@ class FactorBacktester:
     def _empty_metrics(self) -> Dict:
         """Return a safe empty-result dict."""
         return {
-            'ic': 0.0, 'ic_ir': 0.0, 'sharpe': 0.0,
+            'ic': 0.0, 'icir': 0.0, 'sharpe': 0.0,
             'win_rate': 0.5, 'max_drawdown': 0.0,
             'long_short_ret': pd.Series(dtype=float),
             'factor_values': pd.DataFrame(),
@@ -750,6 +761,7 @@ class FactorBacktester:
 
         # Update factor object with Qlib metrics
         factor.ic = qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0))
+        factor.icir = qlib_metrics.get('icir', qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0)))
         # Map long_short_sharpe to sharpe for compatibility
         factor.sharpe = qlib_metrics.get('long_short_sharpe', 0.0)
         factor.win_rate = qlib_metrics.get('win_rate', 0.5)
@@ -757,7 +769,7 @@ class FactorBacktester:
         # Normalize output to match standard evaluate() return format
         return {
             'ic': qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0)),
-            'ic_ir': qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0)),
+            'icir': qlib_metrics.get('icir', qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0))),
             'sharpe': qlib_metrics.get('long_short_sharpe', 0.0),
             'win_rate': qlib_metrics.get('win_rate', 0.5),
             'max_drawdown': qlib_metrics.get('max_drawdown', 0.0),
@@ -854,6 +866,7 @@ class FactorBacktester:
                 if expr in self._metric_cache:
                     cached = self._metric_cache[expr].copy()
                     factor.ic = cached['ic']
+                    factor.icir = cached.get('icir', 0.0)
                     factor.sharpe = cached['sharpe']
                     factor.win_rate = cached['win_rate']
                     return cached
@@ -1235,36 +1248,6 @@ class SelfEvolvingGenerator:
 
         print(f"  [evolve] Saved {len(factors)} factors to {save_path}")
 
-    def _save_metrics_to_csv(self, factors: List['CandidateFactor'], metrics_list: List[Dict], round_id: int):
-        """
-        Save backtest metrics to experiments/{yyyymmdd}/self_evolve/round_{round_id}/backtest_factor_metrics.csv
-        """
-        import os
-        import csv
-        from datetime import datetime
-
-        date_str = datetime.now().strftime("%Y%m%d")
-        save_dir = os.path.join(date_str, "self_evolve", f"round_{round_id}")
-        save_dir = config_path('experiments', save_dir)
-        os.makedirs(save_dir, exist_ok=True)
-
-        save_path = os.path.join(save_dir, "backtest_factor_metrics.csv")
-        with open(save_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["factor_id", "expression", "ic", "ic_ir", "sharpe", "win_rate", "max_drawdown"])
-            for factor, metrics in zip(factors, metrics_list):
-                writer.writerow([
-                    factor.id,
-                    factor.expression,
-                    f"{metrics.get('ic', 0.0):.6f}",
-                    f"{metrics.get('ic_ir', 0.0):.6f}",
-                    f"{metrics.get('sharpe', 0.0):.6f}",
-                    f"{metrics.get('win_rate', 0.5):.6f}",
-                    f"{metrics.get('max_drawdown', 0.0):.6f}",
-                ])
-
-        print(f"  [evolve] Saved {len(factors)} factor metrics to {save_path}")
-
     def _generate_reflection(self, evaluated_factors: List['CandidateFactor'], top_factors: List['CandidateFactor'], round_id: int = 0) -> str:
         """
         Generate reflection text based on backtest results.
@@ -1449,7 +1432,7 @@ Your task is to generate diverse, economically meaningful factor expressions for
 
 Supported data sources:
 - open, high, low, close, volume, amount (price and volume data)
-- pe, pb, roe, market_cap (fundamental data)
+- pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
 
 Supported functions (WorldQuant style):
 - rank(X): cross-sectional percentile rank [0, 1]
@@ -1614,6 +1597,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         current_factors = seed_factors
         
         best_ic = 0.0
+        all_evaluated_factors: List[CandidateFactor] = []  # accumulates IC-evaluated factors from every round
         
         for round_id in range(n_rounds):
             print(f"\nRound {round_id + 1}/{n_rounds}")
@@ -1627,6 +1611,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             for i, factor in enumerate(current_factors):
                 metrics = metrics_list[i]
                 factor.ic = metrics.get('ic', 0.0)
+                factor.icir = metrics.get('icir', 0.0)
                 factor.sharpe = metrics.get('sharpe', 0.0)
                 factor.win_rate = metrics.get('win_rate', 0.5)
                 evaluated_factors.append(factor)
@@ -1634,8 +1619,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 if factor.ic > best_ic:
                     best_ic = factor.ic
 
-            # Save backtest metrics for this round
-            self._save_metrics_to_csv(current_factors, metrics_list, round_id)
+            self._save_factors_to_file(current_factors, round_id, filename="improved_factors.json")
             
             # Select top factors
             top_factors = sorted(evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
@@ -1659,15 +1643,12 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 print(f"  [evolve] Using rule-based factor improvement.")
                 improved_factors = self._generate_improvements_rule_based(top_factors)
 
-            # Save improved factors for this round
-            self._save_factors_to_file(improved_factors, round_id + 1, filename="improved_factors.json")
-            
-            # Record evolution round
+            # Record evolution round (store evaluated factors only)
+            round_best_ic = max(f.ic for f in evaluated_factors) if evaluated_factors else 0.0
             round_record = EvolutionRound(
                 round_id=round_id,
-                seed_factors=current_factors,
-                improved_factors=improved_factors,
-                best_ic=best_ic,
+                factors=evaluated_factors,
+                best_ic=round_best_ic,
                 avg_ic=np.mean([f.ic for f in top_factors]),
             )
             evolution_history.append(round_record)
@@ -1675,6 +1656,10 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             # Update current factors
             current_factors = improved_factors
             
+            # Keep a running list of all evaluated factors (with real IC values)
+            # evaluated_factors holds the assessed batch for this round
+            all_evaluated_factors.extend(evaluated_factors)
+
             print(f"  Best IC: {best_ic:.4f}")
             print(f"  Avg IC (top {self.n_best_factors}): {round_record.avg_ic:.4f}")
             
@@ -1683,17 +1668,27 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 print("\nConvergence reached!")
                 break
         
-        # Select best factors
-        all_factors = []
-        for round_record in evolution_history:
-            all_factors.extend(round_record.improved_factors)
-        
-        best_factors = sorted(all_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
+        # Evaluate the final round's improved_factors — they were generated but never assessed
+        if current_factors:
+            print(f"\n[evolve] Evaluating final improved factors ({len(current_factors)})...")
+            final_metrics = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
+            for factor, metrics in zip(current_factors, final_metrics):
+                factor.ic = metrics.get('ic', 0.0)
+                factor.icir = metrics.get('icir', 0.0)
+                factor.sharpe = metrics.get('sharpe', 0.0)
+                factor.win_rate = metrics.get('win_rate', 0.5)
+                if factor.ic > best_ic:
+                    best_ic = factor.ic
+            # Save improved factors with real IC/Sharpe/win_rate after backtest evaluation
+            self._save_factors_to_file(current_factors, len(evolution_history), filename="improved_factors.json")
+            all_evaluated_factors.extend(current_factors)
+
+        # Select best factors from all evaluated factors across all rounds
+        best_factors = sorted(all_evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
         
         return EvolutionResult(
             best_factors=best_factors,
             evolution_history=evolution_history,
-            best_ic=best_ic,
             total_rounds=len(evolution_history),
         )
     

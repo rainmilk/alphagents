@@ -410,7 +410,8 @@ class AAAI2027Pipeline:
         self.best_factors = evolution_result.best_factors
         
         print(f"  Evolution complete: {len(self.best_factors)} best factors")
-        print(f"  Best IC: {evolution_result.best_ic:.4f}")
+        best_ic = self.best_factors[0].ic if self.best_factors else 0.0
+        print(f"  Best IC: {best_ic:.4f}")
         print("  [✓] Factor evolution complete")
         
     def step5_evaluate_factors(self):
@@ -506,7 +507,10 @@ class AAAI2027Pipeline:
                         description=desc,
                         market_state=current_state,
                         ic=getattr(factor, 'ic', 0.0),
+                        icir=getattr(factor, 'icir', 0.0),
                         sharpe=getattr(factor, 'sharpe', 0.0),
+                        win_rate=getattr(factor, 'win_rate', 0.0),
+                        max_drawdown=getattr(factor, 'max_drawdown', 0.0),
                         source='debate',
                     )
                     saved += 1
@@ -570,13 +574,30 @@ class AAAI2027Pipeline:
         
         if retrieved_factors:
             print(f"  Retrieved {len(retrieved_factors)} factors from memory")
-            
+
             # Merge retrieved factors into the factor pool
             # Retrieved factors augment the best evolved factors
+            # Deduplicate by expression to avoid duplicates (step5b may be re-run)
+            existing_exprs = set()
+            if hasattr(self, 'best_factors') and self.best_factors:
+                for f in self.best_factors:
+                    if isinstance(f, dict):
+                        expr = f.get('expression', '')
+                    else:
+                        expr = getattr(f, 'expression', '')
+                    if expr:
+                        existing_exprs.add(expr)
+
+            added = 0
             if hasattr(self, 'best_factors') and self.best_factors:
                 for rf in retrieved_factors:
-                    self.best_factors.append(rf)
-                print(f"  Factor pool size after merge: {len(self.best_factors)}")
+                    if rf.expression not in existing_exprs:
+                        self.best_factors.append(rf)
+                        existing_exprs.add(rf.expression)
+                        added += 1
+
+            print(f"  Added {added} new factors from memory (skipped {len(retrieved_factors) - added} duplicates)")
+            print(f"  Factor pool size after merge: {len(self.best_factors)}")
         else:
             print("  No relevant factors found in memory")
         
@@ -650,11 +671,25 @@ class AAAI2027Pipeline:
             corr_penalty=self.config['fusion']['weighting']['corr_penalty'],
         )
         
-        # Prepare factor values
-        factor_dict = self._calculate_factor_values()   # dict[str, DataFrame], each is (n_dates, n_stocks)
-        n_dates = self.price_data['close'].shape[0]
-        date_index = self.price_data['close'].index
+        # Prepare factor values (use TRAIN data to determine fusion weights — in-sample)
+        # Fusion weights are model parameters; they must be determined on training data,
+        # then applied to test data in step8 for out-of-sample evaluation.
+        if hasattr(self, 'train_data') and self.train_data:
+            _train_price = self.train_data.get('price_data', {})
+            factor_dict = self._calculate_factor_values(price_data=_train_price)
+        else:
+            factor_dict = self._calculate_factor_values()
 
+        # Build factor metadata lookup from best_factors (has ic, icir, sharpe from backtest)
+        factor_meta_lookup = {}
+        if hasattr(self, 'best_factors') and self.best_factors:
+            for f in self.best_factors:
+                expr = f.expression if hasattr(f, 'expression') else str(f)
+                ic_val = getattr(f, 'ic', 0.0)
+                icir_val = getattr(f, 'icir', 0.0)
+                sharpe_val = getattr(f, 'sharpe', 0.0)
+                factor_meta_lookup[expr] = (ic_val, icir_val, sharpe_val)
+        
         # Build debate_score lookup from step5 debate results
         debate_score_map = {}
         if hasattr(self, 'debate_results') and self.debate_results:
@@ -665,7 +700,7 @@ class AAAI2027Pipeline:
                     expr = getattr(factor, 'expression', '')
                 if expr:
                     debate_score_map[expr] = result.final_score
-
+        
         # Build factor_values_dict and factor_infos
         factor_values_dict = {}
         factor_infos = []
@@ -675,14 +710,36 @@ class AAAI2027Pipeline:
                 values_df = values_df.copy()
                 values_df.index = pd.to_datetime(values_df.index)
             factor_values_dict[name] = values_df
+            
+            # Look up ic/icir/sharpe from backtest results
+            meta = factor_meta_lookup.get(name)
+            if meta:
+                ic_val, icir_val, sharpe_val = meta
+                # Compute ic_std from icir (icir = ic / ic_std)
+                if abs(icir_val) > 1e-8:
+                    ic_std_val = ic_val / icir_val
+                else:
+                    ic_std_val = 1.0  # default: equivalent to ic_weighted
+            else:
+                ic_val = ic_std_val = sharpe_val = 0.0
+            
             dscore = debate_score_map.get(name, 0.0)
-            factor_infos.append(FactorInfo(name=name, expression=name, debate_score=dscore))
+            factor_infos.append(FactorInfo(
+                name=name, expression=name,
+                ic=ic_val, icir=icir_val, ic_std=ic_std_val,
+                sharpe=sharpe_val, debate_score=dscore,
+            ))
 
         # Fuse factors
         self._composite_scores, fusion_meta = fusion.fuse(
             factor_infos, factor_values_dict
         )
         
+        # Save fusion weights and object for step7 (out-of-sample application)
+        self.fusion_weights = fusion_meta["weights"]
+        self.fusion_obj = fusion
+        self.factor_infos = factor_infos  # Reuse in step7
+
         print(f"  Fused {len(factor_infos)} factors")
 
         # --- Save fusion results to experiments/{yyyymmdd}/fusion/final_factors.json ---
@@ -691,9 +748,16 @@ class AAAI2027Pipeline:
         fusion_dir = config_path("experiments", fusion_dir)
         os.makedirs(fusion_dir, exist_ok=True)
 
-        # Build serializable composite scores: {date_str: {stock_code: score, ...}, ...}
+        # Build serializable composite scores (train-period, where fusion weights were determined)
+        # Filter to train dates if available
+        if hasattr(self, 'train_data') and self.train_data:
+            train_dates = self.train_data['price_data']['close'].index
+            _score_df = self._composite_scores.loc[train_dates.intersection(self._composite_scores.index)]
+        else:
+            _score_df = self._composite_scores
+
         scores_serializable = {}
-        for dt, row in self._composite_scores.iterrows():
+        for dt, row in _score_df.iterrows():
             date_key = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
             stock_scores = {}
             for stock, val in row.items():
@@ -743,14 +807,42 @@ class AAAI2027Pipeline:
             max_industry_exposure=portfolio_cfg.get('max_industry_exposure', 0.30),
         ))
         
-        # Build portfolios (use .copy() to prevent accidental in-place modification)
-        close_copy = self.price_data['close'].copy()
+        # --- Use TRAIN-determined weights to build TEST-period portfolios ---
+        # Correct out-of-sample evaluation:
+        # 1. Weights determined on train data (step6)
+        # 2. Apply to test data factor values → test-period composite scores
+        # 3. Build portfolios for test period
+        # 4. Backtest on test data (step8)
+
+        if not hasattr(self, 'fusion_obj') or self.fusion_obj is None:
+            print("  [error] fusion_obj not available. Run step6 first.")
+            return
+
+        # 1. Calculate factor values on TEST data
+        if not hasattr(self, 'test_data') or not self.test_data:
+            print("  [error] test_data not available, cannot construct out-of-sample portfolios")
+            return
+        _test_price = self.test_data.get('price_data', {})
+        test_factor_dict = self._calculate_factor_values(price_data=_test_price)
+
+        # 2. Apply train-determined weights to test data factor values
+        if not hasattr(self, 'factor_infos'):
+            print("  [error] factor_infos not available (step6 not run?). Run step6 first.")
+            return
+        test_composite_scores, _ = self.fusion_obj.fuse(
+            self.factor_infos, test_factor_dict,
+            precomputed_weights=self.fusion_weights
+        )
+        self._composite_scores = test_composite_scores  # Update to test-period scores
+
+        # 3. Build portfolios for test period
+        close_copy = self.test_data['price_data']['close'].copy()
         raw_portfolios = constructor.build(
             composite_scores=self._composite_scores,
             prices=close_copy,
             industry=self.industry_data,
         )
-        
+
         # Convert list[Portfolio] to DataFrame (n_dates x n_stocks) for backtester
         weight_dict = {}
         for pf in raw_portfolios:
@@ -758,8 +850,8 @@ class AAAI2027Pipeline:
         self.portfolios = pd.DataFrame(weight_dict).T
         self.portfolios.index = pd.to_datetime(self.portfolios.index)
         self.portfolios = self.portfolios.fillna(0.0)
-        
-        print(f"  Constructed {len(self.portfolios)} portfolios")
+
+        print(f"  Constructed {len(self.portfolios)} portfolios (test period)")
         print("  [✓] Portfolio construction complete")
         
     def step8_backtest(self):
@@ -919,15 +1011,25 @@ class AAAI2027Pipeline:
         
         return self.performance_metrics
     
-    def _calculate_factor_values(self) -> pd.DataFrame:
+    def _calculate_factor_values(self, price_data: Optional[Dict] = None) -> pd.DataFrame:
         """
         Calculate factor values for all stocks from REAL price/volume data.
 
+        Parameters
+        ----------
+        price_data : dict, optional
+            If provided, use this instead of self.price_data.
+            Callers should pass train_data['price_data'] for step6 (fusion weight
+            determination, in-sample), or test_data['price_data'] for true
+            out-of-sample evaluation (though step8 handles that separately).
+            If None, falls back to self.price_data (backward compatible).
+
         Returns:
-            DataFrame of factor values (n_dates x n_stocks), indexed by date.
+            dict[str, DataFrame]: each DataFrame is (n_dates, n_stocks), indexed by date.
         """
-        close = self.price_data.get('close')
-        volume = self.price_data.get('volume')
+        _price_data = price_data if price_data is not None else self.price_data
+        close = _price_data.get('close')
+        volume = _price_data.get('volume')
         if close is None or not isinstance(close, pd.DataFrame):
             dates = pd.date_range('2024-01-01', periods=100, freq='B')
             stocks = [f'STOCK_{i:04d}' for i in range(100)]
@@ -959,13 +1061,24 @@ class AAAI2027Pipeline:
             factor_exprs = []
             for f in factors:
                 expr = f['expression'] if isinstance(f, dict) else f.expression
-                # Simplified: map common expressions to computations
-                if 'momentum' in expr.lower() or 'return' in expr.lower():
+                expr_lower = expr.lower()
+                # 注意匹配顺序：先匹配长词，再匹配短词，避免子串误判
+                if 'momentum' in expr_lower or 'return' in expr_lower:
                     factor_exprs.append((expr, returns.rolling(20).sum()))
-                elif 'vol' in expr.lower():
+                elif 'volume' in expr_lower or '量' in expr:
+                    if volume is not None:
+                        factor_exprs.append((expr, (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)))
+                    else:
+                        # volume 数据不可用，退回 random
+                        rng = np.random.RandomState(abs(hash(expr)) % (2**32))
+                        vals = pd.DataFrame(
+                            rng.randn(len(close), close.shape[1]),
+                            index=close.index, columns=close.columns,
+                        )
+                        factor_exprs.append((expr, vals))
+                elif 'vol' in expr_lower:
+                    # 必须在 'volume' 之后匹配，避免 'vol' 被 'volume' 子串误判
                     factor_exprs.append((expr, -returns.rolling(20).std()))
-                elif 'volume' in expr.lower() or '量' in expr:
-                    factor_exprs.append((expr, (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)))
                 else:
                     # Default: random with seed from expr for reproducibility
                     rng = np.random.RandomState(abs(hash(expr)) % (2**32))

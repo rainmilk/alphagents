@@ -137,18 +137,28 @@ class FactorNormalizer:
 
 @dataclass
 class FactorInfo:
-    """单个因子的元信息（用于加权计算）"""
+    """单个因子的元信息（用于加权计算）
+
+    Attributes
+    ----------
+    ic : float
+        信息系数（Information Coefficient），直接来自回测结果。
+    icir : float
+        ICIR = IC / std(IC)，直接来自回测结果。
+        `FactorFusion` 的 `icir_weighted` 策略直接使用此值。
+    ic_std : float
+        保留字段，仅用于向后兼容（旧代码可能直接设置 ic_std）。
+    sharpe : float
+        因子多空组合的 Sharpe Ratio，来自回测。
+    """
     name: str
     expression: str
     ic: float = 0.0
-    ic_std: float = 0.0
+    icir: float = 0.0       # ICIR = IC / std(IC)，直接传入，不再动态计算
+    ic_std: float = 0.0     # 保留，向后兼容
     sharpe: float = 0.0
     debate_score: float = 0.0  # 0-10, from multi-agent debate
     values: Optional[pd.DataFrame] = None  # index=date, columns=stock_code
-
-    @property
-    def icir(self) -> float:
-        return self.ic / (self.ic_std + 1e-8) if self.ic_std > 0 else 0.0
 
     @property
     def ic_decayed(self) -> float:
@@ -190,6 +200,7 @@ class FactorFusion:
         factors: list[FactorInfo],
         factor_values: dict[str, pd.DataFrame],
         industry: Optional[pd.Series] = None,
+        precomputed_weights: Optional[dict[str, float]] = None,
     ) -> tuple[pd.DataFrame, dict]:
         """
         Parameters
@@ -197,6 +208,9 @@ class FactorFusion:
         factors : list[FactorInfo], 因子元信息
         factor_values : dict, {name: pd.DataFrame(index=date, columns=stock_code)}
         industry : pd.Series, optional
+        weights : dict, optional, 预计算权重（来自训练期）
+            若提供，则跳过 _compute_weights() 和相关性惩罚，
+            直接使用权重（避免测试期数据泄露）。
 
         Returns
         -------
@@ -207,11 +221,16 @@ class FactorFusion:
         if n == 0:
             raise ValueError("No factors provided")
 
-        # 1. 计算原始权重
-        raw_weights = self._compute_weights(factors)
+        # 1. 计算原始权重（若未提供预计算权重）
+        _precomputed = (precomputed_weights is not None)
+        if _precomputed:
+            # 使用训练期确定的权重，跳过相关性惩罚（避免数据泄露）
+            raw_weights = precomputed_weights
+        else:
+            raw_weights = self._compute_weights(factors)
 
-        # 2. 相关性惩罚
-        if self.corr_penalty and n > 1:
+        # 2. 相关性惩罚（仅当权重新鲜计算时应用；预计算权重已含惩罚）
+        if not _precomputed and self.corr_penalty and n > 1:
             weights = self._apply_corr_penalty(raw_weights, factor_values)
         else:
             weights = raw_weights
@@ -845,9 +864,9 @@ if __name__ == "__main__":
     f_lowvol = _make_factor(0.025, 0.4)
 
     factors = [
-        FactorInfo("momentum", "rank(close/delay(close,60))", ic=0.04, ic_std=0.08),
-        FactorInfo("value", "rank(1/pb)", ic=0.03, ic_std=0.10),
-        FactorInfo("lowvol", "-ts_std(returns,20)", ic=0.025, ic_std=0.08),
+        FactorInfo("momentum", "rank(close/delay(close,60))", ic=0.04, icir=0.04/0.08, ic_std=0.08),
+        FactorInfo("value", "rank(1/pb)", ic=0.03, icir=0.03/0.10, ic_std=0.10),
+        FactorInfo("lowvol", "-ts_std(returns,20)", ic=0.025, icir=0.025/0.08, ic_std=0.08),
     ]
 
     factor_values = {

@@ -569,7 +569,7 @@ class QlibBacktester:
 
                 return {
                     'ic': mean_ic,
-                    'ic_ir': ic_ir,
+                    'icir': ic_ir,
                     'rank_ic': mean_rank_ic,
                     'rank_icir': rank_icir,
                     'long_short_sharpe': ls_sharpe,
@@ -714,7 +714,7 @@ class QlibBacktester:
     def _empty_factor_metrics() -> Dict[str, float]:
         """Return a safe empty-result dict for factor evaluation."""
         return {
-            'ic': 0.0, 'ic_ir': 0.0,
+            'ic': 0.0, 'icir': 0.0,
             'rank_ic': 0.0, 'rank_icir': 0.0,
             'long_short_sharpe': 0.0, 'long_short_return': 0.0,
             'win_rate': 0.5, 'max_drawdown': 0.0,
