@@ -84,23 +84,20 @@ llm:
     # 设计理念：专家用低成本模型做大量评估，主席做最终的跨因子综合排名
     # 理想场景下 chair 应使用更强的推理模型（如 GPT-4o），当前出于成本考虑使用相同模型
     
-# ==================== Evolution Configuration ====================
+# ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
-  # --- Active keys ---
   forward_period: 20   # [ACTIVE] forward return horizon in trading days
   n_seeds: 10          # [ACTIVE] number of candidate factors per round
   n_best_factors: 10   # [ACTIVE] top-N factors to retain per round
   max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
-
-  # --- Unused keys (defined as roadmap, no runtime effect) ---
-  n_improve: 10        # [UNUSED] improve count — hardcoded in FactorEvolver
-  n_mutate: 5          # [UNUSED] mutation count — hardcoded in FactorEvolver
-  convergence_delta: 0.003  # [UNUSED] hardcoded as literal in evolve.py
-  convergence_window: 2     # [UNUSED] not read by any code
-  patience: 3               # [UNUSED] not read by any code
-  min_ic: 0.02              # [UNUSED] quality threshold not wired (see memory.retrieval.min_ic instead)
-  min_sharpe: 0.5           # [UNUSED] not read by any code
-  max_drawdown: -0.20       # [UNUSED] not read by any code
+  n_improve: 10        # [ACTIVE] target number of improved factors per round (LLM generation)
+  n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
+  convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
+  convergence_window: 2     # [ACTIVE] number of recent rounds to check for convergence
+  patience: 3               # [ACTIVE] max consecutive non-improving rounds before early stop
+  min_ic: 0.02              # [ACTIVE] quality filter: drop factors with IC below this
+  min_sharpe: 0.5           # [ACTIVE] quality filter: drop factors with Sharpe below this
+  max_drawdown: -0.20       # [ACTIVE] quality filter: drop factors with drawdown worse than this
 
 # ==================== Memory Bank Configuration ====================
 memory:

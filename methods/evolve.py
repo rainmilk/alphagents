@@ -878,6 +878,14 @@ class SelfEvolvingGenerator:
         llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
         n_seeds: int = 20,
         n_best_factors: int = 10,
+        n_improve: int = 10,
+        n_mutate: int = 5,
+        convergence_delta: float = 0.003,
+        convergence_window: int = 2,
+        patience: int = 3,
+        min_ic: float = 0.02,
+        min_sharpe: float = 0.5,
+        max_drawdown: float = -0.20,
         parallel: bool = True,
         api_key: str = "",
         base_url: str = "http://180.163.156.38:53000/v1",
@@ -889,6 +897,14 @@ class SelfEvolvingGenerator:
             llm_model: LLM model to use
             n_seeds: Number of seed factors to generate
             n_best_factors: Number of top factors to select per round and final output
+            n_improve: Target number of improved factors to generate per round
+            n_mutate: Number of mutation variations per top factor (rule-based fallback)
+            convergence_delta: Min IC improvement to continue evolution
+            convergence_window: Number of recent rounds to check for convergence
+            patience: Max consecutive non-improving rounds before early stop
+            min_ic: Minimum IC threshold for quality filtering
+            min_sharpe: Minimum Sharpe ratio threshold for quality filtering
+            max_drawdown: Maximum drawdown threshold (negative, e.g. -0.20)
             parallel: If False, evaluate factors serially (easier to debug)
             api_key: API key for LLM service. If empty, reads from config or env.
             base_url: API base URL
@@ -896,6 +912,14 @@ class SelfEvolvingGenerator:
         self.llm_model = llm_model
         self.n_seeds = n_seeds
         self.n_best_factors = n_best_factors
+        self.n_improve = n_improve
+        self.n_mutate = n_mutate
+        self.convergence_delta = convergence_delta
+        self.convergence_window = convergence_window
+        self.patience = patience
+        self.min_ic = min_ic
+        self.min_sharpe = min_sharpe
+        self.max_drawdown = max_drawdown
         self.parallel = parallel
         
         # Initialize OpenAI client for LLM calls
@@ -1578,6 +1602,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         
         best_ic = 0.0
         all_evaluated_factors: List[CandidateFactor] = []  # accumulates IC-evaluated factors from every round
+        no_improvement_count = 0  # for patience-based early stop
         
         for round_id in range(n_rounds):
             print(f"\nRound {round_id + 1}/{n_rounds}")
@@ -1644,9 +1669,20 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             print(f"  Best IC: {best_ic:.4f}")
             print(f"  Avg IC (top {self.n_best_factors}): {round_record.avg_ic:.4f}")
             
+            # Track patience: consecutive rounds without IC improvement
+            if round_best_ic > best_ic:
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            
             # Check convergence
             if self._check_convergence(evolution_history):
                 print("\nConvergence reached!")
+                break
+            
+            # Check patience: early stop if no improvement for N consecutive rounds
+            if no_improvement_count >= self.patience:
+                print(f"\nEarly stop: no IC improvement for {self.patience} consecutive rounds (patience={self.patience})")
                 break
         
         # Evaluate the final round's improved_factors — they were generated but never assessed
@@ -1668,8 +1704,30 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         # Select best factors from all evaluated factors across all rounds
         best_factors = sorted(all_evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
         
+        # Quality filter: remove factors that don't meet minimum thresholds
+        quality_filtered = []
+        for f in best_factors:
+            if f.ic < self.min_ic:
+                continue
+            if f.sharpe < self.min_sharpe:
+                continue
+            if f.max_drawdown < self.max_drawdown:
+                continue
+            quality_filtered.append(f)
+        
+        n_before = len(best_factors)
+        n_after = len(quality_filtered)
+        if n_after < n_before:
+            print(f"\n  [quality] Filtered {n_before - n_after} factors below threshold "
+                  f"(min_ic={self.min_ic}, min_sharpe={self.min_sharpe}, max_drawdown={self.max_drawdown})")
+        
+        # If quality filter removed everything, keep the original list (better than empty)
+        if not quality_filtered:
+            print(f"  [quality] Warning: all factors failed quality filter — keeping unfiltered best factors")
+            quality_filtered = best_factors
+        
         return EvolutionResult(
-            best_factors=best_factors,
+            best_factors=quality_filtered,
             evolution_history=evolution_history,
             total_rounds=len(evolution_history),
         )
@@ -1729,7 +1787,7 @@ Top factors:
 {factors_str}
 {reflection_section}
 Requirements:
-1. Generate {len(top_factors)} improved factors
+1. Generate {self.n_improve} improved factors
 2. Each improvement should be based on one or more of the top factors
 3. Improvements can include:
    - Parameter tuning (change window sizes)
@@ -1781,7 +1839,10 @@ Please generate improved factors now. Return only the JSON object, no other text
             raise
     
     def _generate_improvements_rule_based(self, top_factors: List['CandidateFactor']) -> List['CandidateFactor']:
-        """Generate improved factors using four rule-based strategies (fallback when LLM unavailable)."""
+        """Generate improved factors using rule-based strategies (fallback when LLM unavailable).
+        
+        Generates up to `n_mutate` variations per top factor using diverse strategies.
+        """
         import random
         random.seed(42)
 
@@ -1790,6 +1851,9 @@ Please generate improved factors now. Return only the JSON object, no other text
         for i, factor in enumerate(top_factors):
             expr = factor.expression
             other_expr = top_factors[(i + 1) % len(top_factors)].expression if len(top_factors) > 1 else expr
+
+            # All available mutation strategies
+            all_strategies = []
 
             # Strategy 1: Adjust window size in time-series functions
             win_parts = expr.split('(')
@@ -1807,6 +1871,7 @@ Please generate improved factors now. Return only the JSON object, no other text
                             sub_parts[m] = sub_parts[m].replace(str(n), str(max(5, n + random.randint(-10, 10))), 1)
                 win_result.append(','.join(sub_parts))
             adjusted_expr = '('.join(win_result)
+            all_strategies.append(adjusted_expr)
 
             # Strategy 2: Add fundamental signal
             fund = random.choice(['pe', 'pb', 'roe', 'market_cap'])
@@ -1814,16 +1879,29 @@ Please generate improved factors now. Return only the JSON object, no other text
                 fund_expr = f"rank({expr}) * -rank({fund})"
             else:
                 fund_expr = f"rank({expr}) + rank(-{fund})"
+            all_strategies.append(fund_expr)
 
             # Strategy 3: Apply nonlinear transformation
             transform = random.choice(['log', 'sqrt', 'abs', 'sign'])
             nonlinear_expr = f"{transform}({expr})"
+            all_strategies.append(nonlinear_expr)
 
             # Strategy 4: Combine with another top factor
             op = random.choice(['*', '+'])
             combined_expr = f"rank({expr}) {op} rank({other_expr})"
+            all_strategies.append(combined_expr)
 
-            improvements = [adjusted_expr, fund_expr, nonlinear_expr, combined_expr]
+            # Strategy 5: Time-series z-score normalization
+            ts_expr = f"ts_zscore({expr}, 20)"
+            all_strategies.append(ts_expr)
+
+            # Strategy 6: Rank of rank
+            rank_expr = f"rank(rank({expr}))"
+            all_strategies.append(rank_expr)
+
+            # Select up to n_mutate strategies (capped by available strategies)
+            n_strategies = min(self.n_mutate, len(all_strategies))
+            improvements = random.sample(all_strategies, n_strategies) if len(all_strategies) > n_strategies else all_strategies
 
             for j, improved_expr in enumerate(improvements):
                 if improved_expr and improved_expr != expr:
@@ -1842,20 +1920,23 @@ Please generate improved factors now. Return only the JSON object, no other text
         """
         Check if evolution has converged.
         
+        Convergence is reached when IC improvement over the last `convergence_window`
+        rounds is below `convergence_delta`.
+        
         Args:
             history: Evolution history
             
         Returns:
             True if converged
         """
-        if len(history) < 2:
+        if len(history) < self.convergence_window + 1:
             return False
         
-        # Check if IC improvement is below threshold
-        recent_ics = [h.best_ic for h in history[-2:]]
-        improvement = recent_ics[-1] - recent_ics[-2]
+        # Check if IC improvement is below threshold over the convergence window
+        recent_ics = [h.best_ic for h in history[-(self.convergence_window + 1):]]
+        improvement = recent_ics[-1] - recent_ics[0]
         
-        return improvement < 0.003  # convergence_delta
+        return improvement < self.convergence_delta
 
 
 if __name__ == '__main__':

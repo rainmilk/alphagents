@@ -310,10 +310,19 @@ class AAAI2027Pipeline:
         print(f"\n[Step 3] Generating {n_seeds} seed factors...")
         
         # Initialize evolving generator
+        evo_cfg = self.config['evolution']
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
             n_seeds=n_seeds,
-            n_best_factors=self.config['evolution']['n_best_factors'],
+            n_best_factors=evo_cfg['n_best_factors'],
+            n_improve=evo_cfg.get('n_improve', 10),
+            n_mutate=evo_cfg.get('n_mutate', 5),
+            convergence_delta=evo_cfg.get('convergence_delta', 0.003),
+            convergence_window=evo_cfg.get('convergence_window', 2),
+            patience=evo_cfg.get('patience', 3),
+            min_ic=evo_cfg.get('min_ic', 0.02),
+            min_sharpe=evo_cfg.get('min_sharpe', 0.5),
+            max_drawdown=evo_cfg.get('max_drawdown', -0.20),
         )
         
         # Generate seed factors
@@ -861,13 +870,6 @@ class AAAI2027Pipeline:
             max_weight=portfolio_cfg['max_weight'],
             max_industry_exposure=portfolio_cfg.get('max_industry_exposure', 0.30),
         ))
-        
-        # --- Compute test-period composite scores using trained weights ---
-        # step6 called fuse() on train_data, saving weights to self.fusion_obj
-        # Now apply those weights to test_data factor values directly (no predict())
-        if not hasattr(self, 'fusion_obj') or self.fusion_obj is None:
-            print("  [error] fusion_obj not available. Run step6 first.")
-            return
 
         # 1. Compute factor values on test data
         print("  Computing test-period factor values...")
@@ -883,7 +885,7 @@ class AAAI2027Pipeline:
             fusion_result = self.fusion_result
         meta = fusion_result['meta']
         saved_weights = meta['weights']
-        saved_signs  = meta.get('signs', {})
+        saved_signs = meta.get('signs', {})
 
         # normalizer 是无状态的（横截面标准化），参数从 config 读取
         norm_cfg = self.config['fusion'].get('normalization', {})
@@ -1111,33 +1113,126 @@ class AAAI2027Pipeline:
         self.step7_construct_portfolio(test_data=test_data)
         self.step8_backtest(test_data=test_data)
         self.step9_save_results(output_dir)
-
-        # If portfolios are still None after full pipeline, generate fallback
-        if self.portfolios is None:
-            print("\n[Fallback] No portfolios constructed, generating random ones...")
-            n_stocks = min(50, self.price_data['close'].shape[1])
-            # Use actual trading days from test_data (or price_data fallback)
-            if hasattr(self, 'test_data') and self.test_data:
-                _trading_days = self.test_data['price_data']['close'].index
-            else:
-                _trading_days = self.price_data['close'].index
-            n_dates = min(100, len(_trading_days))
-            dates = _trading_days[:n_dates]
-            stock_codes = self.price_data['close'].columns[:n_stocks]
-
-            self.portfolios = pd.DataFrame(
-                np.random.dirichlet(np.ones(n_stocks), size=n_dates),
-                index=dates,
-                columns=stock_codes,
-            )
-            self.step8_backtest(test_data=test_data)
         
         print("\n" + "=" * 60)
         print("  Pipeline Complete!")
         print("=" * 60)
         
         return self.performance_metrics
-    
+
+    def run_test_pipeline(
+        self,
+        factor_path: str,
+        test_data: dict,
+        holding_period: int = None,
+    ):
+        """
+        Load saved factors from JSON and run test-period portfolio construction + backtest.
+
+        This skips step1–step6 (data loading, evolution, debate, fusion) and directly
+        loads the trained factor weights/signs from a final_factors.json file, then
+        runs step7 (portfolio construction) and step8 (backtest) on the provided
+        test_data.
+
+        Args:
+            factor_path: Path to final_factors.json (saved by step6_fuse_factors).
+            test_data: Dict with keys {'price_data', 'fundamental_data', 'industry_data'}
+                       for the test period. Required — no fallback to self.test_data.
+            holding_period: Backtest holding period override (1=daily, 5=weekly, 20=monthly).
+                            None → use config or existing engine setting.
+
+        Returns:
+            Performance metrics dict from step8.
+        """
+        import json
+        from types import SimpleNamespace
+
+        print("\n" + "=" * 60)
+        print("  Running Test Pipeline — loading saved factors")
+        print("=" * 60)
+
+        # ── 1. Load fusion result from JSON ──
+        print(f"\n[Load] Reading factors from {factor_path}...")
+        with open(factor_path, "r", encoding="utf-8") as f:
+            fusion_result = json.load(f)
+
+        saved_factors = fusion_result.get("factors", [])
+        meta = fusion_result.get("meta", {})
+        saved_weights = meta.get("weights", {})
+        saved_signs = meta.get("signs", {})
+
+        if not saved_factors:
+            print("  [error] No factors found in the JSON file.")
+            return None
+
+        print(f"  Loaded {len(saved_factors)} factors, {len(saved_weights)} weights, {len(saved_signs)} signs")
+
+        # ── 2. Reconstruct self.best_factors (for _calculate_factor_values) ──
+        # _calculate_factor_values reads .expression from each factor.
+        # We use SimpleNamespace to create lightweight objects with .expression.
+        self.best_factors = [
+            SimpleNamespace(
+                name=f["name"],
+                expression=f["expression"],
+                ic=0.0,
+                icir=0.0,
+                sharpe=0.0,
+                debate_score=f.get("debate_score", 0.0) or 0.0,
+            )
+            for f in saved_factors
+        ]
+
+        # ── 3. Reconstruct self.factor_infos (for step7 iteration) ──
+        # step7 iterates self.factor_infos to get factor names and look up
+        # weights/signs from the loaded JSON.
+        if METHODS_AVAILABLE:
+            self.factor_infos = [
+                FactorInfo(
+                    name=f["name"],
+                    expression=f["expression"],
+                    debate_score=f.get("debate_score", 0.0) or 0.0,
+                )
+                for f in saved_factors
+            ]
+        else:
+            print("  [error] methods modules not available — cannot create FactorInfo")
+            return None
+
+        # ── 4. Set fusion_result (step7 reads weights/signs from this) ──
+        self.fusion_result = fusion_result
+
+        # ── 5. Initialize backtest engine if not already done ──
+        if self.backtest_engine is None:
+            if holding_period is not None:
+                self.config.setdefault('backtest', {}).setdefault('trading', {})['holding_period'] = holding_period
+            self.backtest_engine = BacktestEngine(
+                commission=self.config['backtest']['trading']['commission'],
+                slippage=self.config['backtest']['trading']['slippage'],
+                holding_period=self.config.get('backtest', {}).get('trading', {}).get('holding_period', 1),
+            )
+            print("  Initialized backtest engine from config")
+        elif holding_period is not None:
+            # Override holding period on existing engine
+            self.config.setdefault('backtest', {}).setdefault('trading', {})['holding_period'] = holding_period
+            self.backtest_engine = BacktestEngine(
+                commission=self.config['backtest']['trading']['commission'],
+                slippage=self.config['backtest']['trading']['slippage'],
+                holding_period=holding_period,
+            )
+            print(f"  Re-initialized backtest engine with holding_period={holding_period}")
+
+        # ── 6. Run step7 (portfolio construction) ──
+        self.step7_construct_portfolio(test_data=test_data)
+
+        # ── 7. Run step8 (backtest) ──
+        self.step8_backtest(test_data=test_data)
+
+        print("\n" + "=" * 60)
+        print("  Test Pipeline Complete!")
+        print("=" * 60)
+
+        return self.performance_metrics
+
     def _calculate_factor_values(
         self,
         price_data: Optional[Dict] = None,
