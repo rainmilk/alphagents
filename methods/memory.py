@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -77,17 +78,17 @@ class MarketState:
     市场状态的四维离散表示。
     任意时点 t 可映射为一个 MarketState，用于检索对应状态下的历史优质因子。
     """
-    vol: VolRegime
+    volatility: VolRegime
     liquidity: LiquidityRegime
     trend: TrendRegime
     correlation: CorrelationRegime
 
     def to_string(self) -> str:
-        return f"{self.vol.value}/{self.liquidity.value}/{self.trend.value}/{self.correlation.value}"
+        return f"{self.volatility.value}/{self.liquidity.value}/{self.trend.value}/{self.correlation.value}"
 
     def to_dict(self) -> dict:
         return {
-            "vol": self.vol.value,
+            "volatility": self.volatility.value,
             "liquidity": self.liquidity.value,
             "trend": self.trend.value,
             "correlation": self.correlation.value,
@@ -95,8 +96,10 @@ class MarketState:
 
     @staticmethod
     def from_dict(d: dict) -> MarketState:
+        # Backward compat: old factors.json uses "vol" key
+        _vol = d.get("volatility", d.get("vol", "MEDIUM"))
         return MarketState(
-            vol=VolRegime(d["vol"]),
+            volatility=VolRegime(_vol),
             liquidity=LiquidityRegime(d["liquidity"]),
             trend=TrendRegime(d["trend"]),
             correlation=CorrelationRegime(d["correlation"]),
@@ -162,16 +165,16 @@ class MarketStateEncoder:
             else:
                 # Empty DataFrame: return conservative defaults
                 return MarketState(
-                    vol=VolRegime.MEDIUM,
+                    volatility=VolRegime.MEDIUM,
                     liquidity=LiquidityRegime.NORMAL,
                     trend=TrendRegime.SIDEWAYS,
                     correlation=CorrelationRegime.MEDIUM,
                 )
         # 1. Volatility regime
         if vix is not None:
-            vol = self._vol_from_vix(vix)
+            volatility = self._volatility_from_vix(vix)
         else:
-            vol = self._vol_from_price(price_df)
+            volatility = self._volatility_from_price(price_df)
 
         # 2. Liquidity regime
         liquidity = self._liquidity_from_shibor(shibor)
@@ -182,9 +185,9 @@ class MarketStateEncoder:
         # 4. Correlation regime
         correlation = self._correlation_from_matrix(corr_matrix)
 
-        return MarketState(vol=vol, liquidity=liquidity, trend=trend, correlation=correlation)
+        return MarketState(volatility=volatility, liquidity=liquidity, trend=trend, correlation=correlation)
 
-    def _vol_from_vix(self, vix: float) -> VolRegime:
+    def _volatility_from_vix(self, vix: float) -> VolRegime:
         if vix < self.vix_low:
             return VolRegime.LOW
         elif vix < self.vix_high:
@@ -192,17 +195,17 @@ class MarketStateEncoder:
         else:
             return VolRegime.HIGH
 
-    def _vol_from_price(self, price_df: pd.DataFrame) -> VolRegime:
+    def _volatility_from_price(self, price_df: pd.DataFrame) -> VolRegime:
         """用过去20日收益率波动率近似 VIX"""
         if "close" not in price_df.columns:
             return VolRegime.MEDIUM  # 保守默认
         returns = price_df["close"].pct_change().dropna()
         if len(returns) < 20:
             return VolRegime.MEDIUM
-        vol = returns.tail(20).std() * np.sqrt(252)  # 年化波动率
-        if vol < 0.15:
+        volatility = returns.tail(20).std() * np.sqrt(252)  # 年化波动率
+        if volatility < 0.15:
             return VolRegime.LOW
-        elif vol < 0.25:
+        elif volatility < 0.25:
             return VolRegime.MEDIUM
         else:
             return VolRegime.HIGH
@@ -353,37 +356,232 @@ class FactorEmbedder:
         return vec.astype(np.float32)
 
     @staticmethod
+    # ── Expression AST Parser ────────────────────────────────────────────────────
+    # Factor DSL grammar (recursive descent):
+    #
+    #   expr       := term (('+' | '-') term)*
+    #   term       := unary (('*' | '/' | '^') unary)*
+    #   unary      := '-' unary | '+' unary | primary
+    #   primary    := IDENT '(' args ')' | IDENT | NUMBER
+    #   args       := expr (',' expr)*
+    #
+    # Whitespace is ignored. Identifiers are [a-z_][a-z0-9_]*.
+    # Tokens: ident, number, '(', ')', ',', '+', '-', '*', '/', '^'
+
+    class _ExprTokenizer:
+        """Tokenize a factor expression string."""
+        TOKEN_RE = re.compile(r"""
+            \s*(                                  # leading whitespace
+                \d+(?:\.\d+)?                     # number
+              | [a-z_][a-z0-9_]*                 # identifier
+              | [+\-*/^(),]                       # single-char operators / delimiters
+            )
+        """, re.VERBOSE)
+
+        def __init__(self, text: str):
+            self.tokens = self.TOKEN_RE.findall(text)
+            self.pos = 0
+
+        def peek(self) -> str:
+            return self.tokens[self.pos] if self.pos < len(self.tokens) else ''
+
+        def consume(self) -> str:
+            t = self.peek()
+            self.pos += 1
+            return t
+
+        def expect(self, expected: str):
+            actual = self.consume()
+            if actual != expected:
+                raise ValueError(
+                    f"Expected '{expected}', got '{actual}' at position {self.pos}"
+                )
+
+    @staticmethod
+    def _parse_expr(tok) -> dict:
+        """Parse an additive expression → AST dict."""
+        left = FactorEmbedder._parse_term(tok)
+        while tok.peek() in ('+', '-'):
+            op = tok.consume()
+            right = FactorEmbedder._parse_term(tok)
+            left = {'op': op, 'left': left, 'right': right}
+        return left
+
+    @staticmethod
+    def _parse_term(tok) -> dict:
+        """Parse a multiplicative term → AST dict."""
+        left = FactorEmbedder._parse_unary(tok)
+        while tok.peek() in ('*', '/', '^'):
+            op = tok.consume()
+            right = FactorEmbedder._parse_unary(tok)
+            left = {'op': op, 'left': left, 'right': right}
+        return left
+
+    @staticmethod
+    def _parse_unary(tok) -> dict:
+        """Parse unary +/- or primary."""
+        if tok.peek() == '-':
+            tok.consume()
+            return {'op': 'neg', 'arg': FactorEmbedder._parse_unary(tok)}
+        if tok.peek() == '+':
+            tok.consume()
+            return FactorEmbedder._parse_unary(tok)
+        return FactorEmbedder._parse_primary(tok)
+
+    @staticmethod
+    def _parse_primary(tok) -> dict:
+        """Parse IDENT[(args)] or NUMBER."""
+        token = tok.consume()
+        if token == '(':
+            expr = FactorEmbedder._parse_expr(tok)
+            tok.expect(')')
+            return expr
+        if token.replace('.', '', 1).isdigit() or (token.startswith('-') and token[1:].replace('.', '', 1).isdigit()):
+            return {'num': float(token)}
+        # identifier — check for function call
+        if tok.peek() == '(':
+            tok.consume()  # eat '('
+            args = []
+            if tok.peek() != ')':
+                args.append(FactorEmbedder._parse_expr(tok))
+                while tok.peek() == ',':
+                    tok.consume()
+                    args.append(FactorEmbedder._parse_expr(tok))
+            tok.expect(')')
+            return {'fn': token, 'args': args}
+        return {'ident': token}
+
+    @staticmethod
+    def _ast_to_nl(node: dict) -> str:
+        """
+        Convert a parsed AST node to natural language.
+
+        Each function maps to an English description template.
+        Operators become 'plus', 'minus', 'times', 'divided by', 'to the power of'.
+        """
+        if 'num' in node:
+            return str(int(node['num'])) if node['num'] == int(node['num']) else str(node['num'])
+
+        if 'ident' in node:
+            return FactorEmbedder._field_name(node['ident'])
+
+        if 'op' in node and node['op'] == 'neg':
+            arg_nl = FactorEmbedder._ast_to_nl(node['arg'])
+            # Check if we should wrap in "negative ..."
+            if 'fn' in node['arg'] or 'op' in node['arg']:
+                return f"negative ({arg_nl})"
+            return f"negative {arg_nl}"
+
+        if 'op' in node and node['op'] in ('+', '-', '*', '/', '^'):
+            op_words = {'+': 'plus', '-': 'minus', '*': 'times', '/': 'divided by', '^': 'to the power of'}
+            left_nl = FactorEmbedder._ast_to_nl(node['left'])
+            right_nl = FactorEmbedder._ast_to_nl(node['right'])
+            return f"({left_nl} {op_words[node['op']]} {right_nl})"
+
+        if 'fn' in node:
+            fn = node['fn']
+            args = node.get('args', [])
+            return FactorEmbedder._function_to_nl(fn, args)
+
+        return 'unknown'
+
+    @staticmethod
+    def _function_to_nl(fn: str, args: list) -> str:
+        """Map each WorldQuant DSL function to English."""
+        arg_nls = [FactorEmbedder._ast_to_nl(a) for a in args]
+
+        # Cross-sectional functions
+        if fn == 'rank':
+            return f"cross-sectional rank of {arg_nls[0]}"
+
+        if fn == 'sign':
+            return f"sign of {arg_nls[0]}"
+
+        if fn == 'abs':
+            return f"absolute value of {arg_nls[0]}"
+
+        if fn == 'log':
+            return f"log of {arg_nls[0]}"
+
+        if fn == 'sqrt':
+            return f"square root of {arg_nls[0]}"
+
+        # Time-series functions
+        if fn == 'ts_corr':
+            # args: X, Y, window
+            return f"time-series correlation of {arg_nls[0]} and {arg_nls[1]} over {arg_nls[2]} days"
+
+        if fn == 'ts_mean':
+            return f"{arg_nls[0]} rolling mean over {arg_nls[1]} days"
+
+        if fn == 'ts_std' or fn == 'ts_stddev':
+            return f"{arg_nls[0]} rolling standard deviation over {arg_nls[1]} days"
+
+        if fn == 'ts_min':
+            return f"{arg_nls[0]} rolling minimum over {arg_nls[1]} days"
+
+        if fn == 'ts_max':
+            return f"{arg_nls[0]} rolling maximum over {arg_nls[1]} days"
+
+        if fn == 'ts_sum':
+            return f"{arg_nls[0]} rolling sum over {arg_nls[1]} days"
+
+        if fn == 'ts_rank':
+            return f"time-series rank of {arg_nls[0]} over {arg_nls[1]} days"
+
+        if fn == 'ts_zscore':
+            return f"rolling z-score of {arg_nls[0]} over {arg_nls[1]} days"
+
+        if fn == 'ts_delta':
+            return f"change in {arg_nls[0]} over {arg_nls[1]} days"
+
+        if fn == 'ts_decay':
+            return f"exponential weighted moving average of {arg_nls[0]} with span {arg_nls[1]} days"
+
+        if fn == 'delay':
+            return f"{arg_nls[0]} lagged by {arg_nls[1]} days"
+
+        # Compound: fallback
+        arg_str = ', '.join(arg_nls)
+        return f"{fn}({arg_str})"
+
+    @staticmethod
+    def _field_name(ident: str) -> str:
+        """Map data field identifiers to readable English names."""
+        names = {
+            'close':   'closing price',
+            'open':    'opening price',
+            'high':    'highest price',
+            'low':     'lowest price',
+            'volume':  'trading volume',
+            'amount':  'trading amount',
+            'returns': 'return rate',
+            'pe':      'P/E ratio',
+            'pb':      'P/B ratio',
+            'ps':      'P/S ratio',
+            'roe':     'return on equity',
+            'eps':     'earnings per share',
+            'market_cap': 'market capitalization',
+        }
+        return names.get(ident, ident)
+
+    @staticmethod
     def _expr_to_natural_language(expr: str) -> str:
         """
-        将因子表达式转换为伪自然语言描述，帮助 SBERT 理解。
-        例如：'rank(ts_corr(close, volume, 20))'
-        -> 'rank of time series correlation of close and volume over 20 days'
+        Parse a factor expression into an AST, then convert to natural language.
+
+        Uses recursive descent parser (not string replacement).
+        Falls back to the old string-replace method if parsing fails.
         """
-        import re
-        # 简单的关键词替换
-        replacements = {
-            "ts_corr": "time series correlation",
-            "ts_mean": "time series mean",
-            "ts_std": "time series standard deviation",
-            "ts_max": "time series max",
-            "ts_min": "time series min",
-            "ts_rank": "time series rank",
-            "cross_sectional_rank": "cross sectional rank",
-            "rank": "rank",
-            "delay": "delay",
-            "delta": "change",
-            "close": "closing price",
-            "open": "opening price",
-            "high": "highest price",
-            "low": "lowest price",
-            "volume": "trading volume",
-            "returns": "return rate",
-            "cap": "market capitalization",
-        }
-        result = expr
-        for k, v in replacements.items():
-            result = result.replace(k, v)
-        return result
+        try:
+            tok = FactorEmbedder._ExprTokenizer(expr)
+            ast = FactorEmbedder._parse_expr(tok)
+            if tok.peek() != '':
+                raise ValueError(f"Unexpected token after parse: {tok.peek()}")
+            return FactorEmbedder._ast_to_nl(ast)
+        except Exception as e:
+            # Fallback: return the original expression as-is
+            return expr
 
 
 # ──────────────────────────────────────────────
@@ -686,7 +884,11 @@ class FactorMemoryBank:
             return
 
         # 加载因子记录
-        with open(p / "factors.json", "r", encoding="utf-8") as f:
+        factors_file = p / "factors.json"
+        if not factors_file.exists():
+            print(f"[MemoryBank] No factors.json found at {p} — starting fresh")
+            return
+        with open(factors_file, "r", encoding="utf-8") as f:
             records = json.load(f)
         self.factors = [StoredFactor.from_dict(d) for d in records]
 
@@ -769,7 +971,7 @@ class FactorMemoryBank:
         """
         matches = 0
         total = 4
-        if s1.vol == s2.vol:
+        if s1.volatility == s2.volatility:
             matches += 1
         if s1.liquidity == s2.liquidity:
             matches += 1
@@ -812,6 +1014,7 @@ class MemoryAugmentedGenerator:
         task_description: str,
         price_df: pd.DataFrame,
         vix: Optional[float] = None,
+        retrieval_query: Optional[str] = None,
         **kwargs,
     ) -> list[dict]:
         """
@@ -819,9 +1022,13 @@ class MemoryAugmentedGenerator:
 
         Parameters
         ----------
-        task_description : str, 生成任务描述（如 "生成动量类因子"）
+        task_description : str, 给 LLM 的生成任务指令（如 "生成动量类因子"）
         price_df : pd.DataFrame, 当前市场数据（用于编码市场状态）
         vix : float, optional
+        retrieval_query : str, optional, 专用于 memory bank 检索的查询描述。
+            如果不传，默认等于 task_description。
+            检索查询应当是因子风格的描述（如 "动量因子，捕捉价格趋势"），
+            而不是任务指令，这样才能与库内因子的 description 有效匹配。
 
         Returns
         -------
@@ -832,8 +1039,10 @@ class MemoryAugmentedGenerator:
         print(f"[MemoryAugmented] Current market state: {current_state.to_string()}")
 
         # 2. 从记忆库检索相似历史因子
+        # retrieval_query 专门用于语义检索，应与库内因子的 description 风格一致
+        _retrieval_query = retrieval_query if retrieval_query is not None else task_description
         retrieved = self.memory_bank.retrieve(
-            query_description=task_description,
+            query_description=_retrieval_query,
             query_expression="",
             current_market_state=current_state,
             top_k=self.n_shots,
@@ -902,7 +1111,7 @@ if __name__ == "__main__":
 
     # 3. 编码当前市场状态（假设当前是牛市低波环境）
     current_state = MarketState(
-        vol=VolRegime.LOW,
+        volatility=VolRegime.LOW,
         liquidity=LiquidityRegime.ABUNDANT,
         trend=TrendRegime.BULL,
         correlation=CorrelationRegime.LOW,

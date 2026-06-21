@@ -16,9 +16,11 @@ Factor Fusion & Portfolio Construction
   - Pipeline: 端到端流水线（整合上述所有类）
 
 创新点（区别于传统多因子模型）：
-  1. 动态 ICIR 加权（传统使用静态 IC 加权，我们在线更新权重）
-  2. 相关性惩罚（避免类似因子重复计算 → 与 Alpha Grail 的 factor zoo 问题对比）
-  3. 换手率平滑（降低交易成本，提升真实收益）
+  1. ICIR² 收缩加权（ICIR² + James-Stein shrinkage，理论最优 SNR² 组合）
+  2. Sign-Aware 融合（负 IC 因子自动反转方向，不再丢弃）
+  3. 全样本 IPR 相关性惩罚（替代单日横截面 + hard floor）
+  4. Regime-Adaptive Tilt（基于市场状态动态调整因子权重）
+  5. Debate 分数作为贝叶斯先验（替代乘法 hack）
 
 Author: Independent Researcher
 Target: AAAI 2027
@@ -35,6 +37,16 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Safe import of MarketState types from memory module (no heavy deps)
+try:
+    from methods.memory import MarketState, TrendRegime, VolRegime
+    _HAS_MEMORY = True
+except Exception:
+    _HAS_MEMORY = False
+    MarketState = None
+    TrendRegime = None
+    VolRegime = None
 
 # ──────────────────────────────────────────────
 # Section 1: Factor Normalizer
@@ -145,11 +157,14 @@ class FactorInfo:
         信息系数（Information Coefficient），直接来自回测结果。
     icir : float
         ICIR = IC / std(IC)，直接来自回测结果。
-        `FactorFusion` 的 `icir_weighted` 策略直接使用此值。
+        `FactorFusion` 的 `icir2_shrinkage` 策略使用 |ICIR|² 加权。
     ic_std : float
         保留字段，仅用于向后兼容（旧代码可能直接设置 ic_std）。
     sharpe : float
         因子多空组合的 Sharpe Ratio，来自回测。
+    ic_sign : float
+        IC 的符号（+1 或 -1）。负 IC 因子的方向会被自动反转，
+        其 |ICIR| 仍参与权重计算，实现 sign-aware 融合。
     """
     name: str
     expression: str
@@ -158,6 +173,7 @@ class FactorInfo:
     ic_std: float = 0.0     # 保留，向后兼容
     sharpe: float = 0.0
     debate_score: float = 0.0  # 0-10, from multi-agent debate
+    ic_sign: float = 1.0       # sign(IC): +1 or -1, for sign-aware fusion
     values: Optional[pd.DataFrame] = None  # index=date, columns=stock_code
 
     @property
@@ -170,74 +186,92 @@ class FactorFusion:
     """
     将多个因子融合为单一复合得分。
 
-    支持四种加权策略：
+    支持五种加权策略：
       1. equal: 等权
-      2. ic_weighted: IC 绝对值加权
-      3. icir_weighted: ICIR 加权（IC 除以波动率）
-      4. decay_weighted: 指数衰减加权（越新的 IC 权重越高）
+      2. ic_weighted: IC 绝对值加权（baseline）
+      3. icir_weighted: 线性 ICIR 加权（baseline，保留旧行为用于 ablation）
+      4. decay_weighted: 指数衰减加权（baseline）
+      5. icir2_shrinkage: ICIR² 收缩 + Sign-Aware + Regime Tilt（创新策略）
 
-    可选步骤：
-      - 相关性惩罚：高相关因子的权重打折
-      - 正交化：PCA 或 Gram-Schmidt
+    所有策略均支持：
+      - Sign-Aware 融合（负 IC 因子自动反转方向）
+      - 全样本 IPR 相关性惩罚（可选）
+      - Debate 分数作为贝叶斯先验（icir2_shrinkage 策略）
+      - Regime-Adaptive Tilt（icir2_shrinkage 策略，需传入 market_state）
     """
 
     def __init__(
         self,
-        strategy: str = "icir_weighted",
+        strategy: str = "icir2_shrinkage",
         corr_penalty: bool = True,
         corr_threshold: float = 0.7,
         normalizer: Optional[FactorNormalizer] = None,
+        regime_tilt_strength: float = 0.2,
+        shrinkage_kappa: float = 0.3,
+        ipr_alpha: float = 2.0,
     ):
-        if strategy not in ("equal", "ic_weighted", "icir_weighted", "decay_weighted"):
+        if strategy not in (
+            "equal", "ic_weighted", "icir_weighted",
+            "decay_weighted", "icir2_shrinkage",
+        ):
             raise ValueError(f"Unknown fusion strategy: {strategy}")
         self.strategy = strategy
         self.corr_penalty = corr_penalty
         self.corr_threshold = corr_threshold
         self.normalizer = normalizer or FactorNormalizer(method="zscore")
+        # ICIR² shrinkage hyperparameters
+        self.regime_tilt_strength = regime_tilt_strength  # regime tilt magnitude
+        self.shrinkage_kappa = shrinkage_kappa            # debate prior confidence [0, 1]
+        self.ipr_alpha = ipr_alpha                        # IPR penalty sensitivity
+        # Signs dict — populated by _compute_weights, used by fuse()
+        self._signs: dict[str, float] = {}
+        # Saved weights from last fuse() call — used by predict()
+        self._saved_weights: dict[str, float] = {}
 
     def fuse(
         self,
         factors: list[FactorInfo],
         factor_values: dict[str, pd.DataFrame],
         industry: Optional[pd.Series] = None,
-        precomputed_weights: Optional[dict[str, float]] = None,
+        market_state=None,
     ) -> tuple[pd.DataFrame, dict]:
         """
         Parameters
         ----------
         factors : list[FactorInfo], 因子元信息
         factor_values : dict, {name: pd.DataFrame(index=date, columns=stock_code)}
-        industry : pd.Series, optional
-        weights : dict, optional, 预计算权重（来自训练期）
-            若提供，则跳过 _compute_weights() 和相关性惩罚，
-            直接使用权重（避免测试期数据泄露）。
+            用于权重计算（相关性惩罚使用此数据）以及生成 composite_scores。
+            若需在测试期数据上生成 scores，请先调用 fuse() 在训练期算权重，
+            再调用 predict() 在测试期数据上生成 scores。
+        industry : pd.Series, optional, 行业分类（用于行业中性化）
+        market_state : MarketState, optional, 当前市场状态（用于 regime-adaptive tilt）
+            仅对 icir2_shrinkage 策略生效。
 
         Returns
         -------
         composite_scores : pd.DataFrame, 融合后的复合得分
-        meta : dict, 融合元信息（权重、IC 等）
+        meta : dict, 融合元信息（权重、符号、IC 等）
         """
         n = len(factors)
         if n == 0:
             raise ValueError("No factors provided")
 
-        # 1. 计算原始权重（若未提供预计算权重）
-        _precomputed = (precomputed_weights is not None)
-        if _precomputed:
-            # 使用训练期确定的权重，跳过相关性惩罚（避免数据泄露）
-            raw_weights = precomputed_weights
-        else:
-            raw_weights = self._compute_weights(factors)
+        # 1. 计算权重（含 sign-aware）— 使用 factor_values
+        raw_weights = self._compute_weights(factors, market_state=market_state)
 
-        # 2. 相关性惩罚（仅当权重新鲜计算时应用；预计算权重已含惩罚）
-        if not _precomputed and self.corr_penalty and n > 1:
+        # 2. 相关性惩罚 — 使用 factor_values
+        if self.corr_penalty and n > 1:
             weights = self._apply_corr_penalty(raw_weights, factor_values)
         else:
             weights = raw_weights
 
-        # 3. 归一化各因子值 + 加权求和
+        # 3. 保存权重和 signs 供 step7 直接使用
+        self._saved_weights = dict(weights)
+        self._saved_signs = dict(self._signs)
+
+        # 4. Sign-Aware 归一化 + 加权求和
+        #    负 IC 因子的符号 sign = -1，在加权时自动反转方向
         weighted = None
-        # Align all factor DataFrames to a common date index
         common_dates = factor_values[factors[0].name].index
         for fv in factor_values.values():
             common_dates = common_dates.intersection(fv.index)
@@ -245,68 +279,153 @@ class FactorFusion:
         for f in factors:
             fv = self.normalizer.normalize(factor_values[f.name], industry)
             w = weights.get(f.name, 1.0 / n)
-            fv_aligned = fv.loc[common_dates] * w
+            s = self._signs.get(f.name, 1.0)
+            fv_aligned = fv.loc[common_dates] * w * s
 
             if weighted is None:
                 weighted = fv_aligned
             else:
                 weighted = weighted.add(fv_aligned, fill_value=0)
 
-        # 4. 最终标准化
+        # 5. 最终标准化
         composite_scores = self.normalizer.normalize(weighted, industry)
 
         meta = {
             "strategy": self.strategy,
-            "weights": weights,
+            "weights": dict(weights),
+            "signs": dict(self._signs),
             "n_factors": n,
             "corr_penalty_applied": self.corr_penalty,
+            "regime_tilt_applied": (
+                market_state is not None
+                and self.strategy == "icir2_shrinkage"
+                and _HAS_MEMORY
+            ),
             "timestamp": datetime.now().isoformat(),
         }
 
         return composite_scores, meta
 
-    def _compute_weights(self, factors: list[FactorInfo]) -> dict[str, float]:
-        """根据策略计算各因子的原始权重（含辩论分数融合）"""
+    def _compute_weights(
+        self,
+        factors: list[FactorInfo],
+        market_state=None,
+    ) -> dict[str, float]:
+        """
+        根据策略计算各因子的原始权重。
+
+        所有策略均实现 sign-aware：从 IC 提取方向符号存入 self._signs，
+        用 |IC| 或 |ICIR| 计算权重，在 fuse() 中乘以符号自动反转负 IC 因子。
+
+        Parameters
+        ----------
+        factors : list[FactorInfo]
+        market_state : MarketState, optional
+            仅对 icir2_shrinkage 策略生效，用于 regime-adaptive tilt。
+
+        Returns
+        -------
+        dict[str, float] : 因子名称 → 权重
+        """
         n = len(factors)
         names = [f.name for f in factors]
 
-        # Compute raw weights by strategy
+        # ── Helper: extract IC sign for all factors ──
+        def _extract_signs():
+            signs = {}
+            for f in factors:
+                s = np.sign(f.ic) if abs(f.ic) > 1e-10 else 1.0
+                signs[f.name] = float(s)
+            return signs
+
+        # ── Strategy dispatch ──
         if self.strategy == "equal":
-            weights = {name: 1.0 / n for name in names}
+            self._signs = _extract_signs()
+            return {name: 1.0 / n for name in names}
+
         elif self.strategy == "ic_weighted":
+            # Baseline: |IC| weighted
+            self._signs = _extract_signs()
             ics = np.array([abs(f.ic) for f in factors])
             total = ics.sum()
             if total < 1e-8:
-                weights = {name: 1.0 / n for name in names}
-            else:
-                weights = {f.name: abs(f.ic) / total for f in factors}
+                return {name: 1.0 / n for name in names}
+            return {f.name: abs(f.ic) / total for f in factors}
+
         elif self.strategy == "icir_weighted":
-            icirs = np.array([max(f.icir, 0.0) for f in factors])
+            # Baseline: linear |ICIR| weighted (fixed: no longer discards negative ICIR)
+            self._signs = _extract_signs()
+            icirs = np.array([abs(f.icir) for f in factors])
             total = icirs.sum()
             if total < 1e-8:
-                weights = {name: 1.0 / n for name in names}
-            else:
-                weights = {f.name: icirs[i] / total for i, f in enumerate(factors)}
+                return {name: 1.0 / n for name in names}
+            return {f.name: icirs[i] / total for i, f in enumerate(factors)}
+
         elif self.strategy == "decay_weighted":
-            decay_weights = np.exp(-0.3 * np.arange(n))
-            total = decay_weights.sum()
-            weights = {f.name: decay_weights[i] / total for i, f in enumerate(factors)}
+            # Baseline: exponential decay by list position
+            self._signs = _extract_signs()
+            decay_w = np.exp(-0.3 * np.arange(n))
+            total = decay_w.sum()
+            return {f.name: decay_w[i] / total for i, f in enumerate(factors)}
+
+        elif self.strategy == "icir2_shrinkage":
+            # ════════════════════════════════════════════════════════════
+            # Innovation: ICIR² + James-Stein Shrinkage + Bayesian Prior
+            #             + Regime-Adaptive Tilt
+            # ════════════════════════════════════════════════════════════
+
+            # 1. Sign-aware: extract IC sign, use |ICIR| for weighting
+            self._signs = _extract_signs()
+            icirs_abs = np.array([abs(f.icir) for f in factors])
+
+            # Edge case: all ICIRs are zero → equal weight
+            if icirs_abs.sum() < 1e-8:
+                return {name: 1.0 / n for name in names}
+
+            # 2. ICIR² weights (SNR² — optimal combining weight for
+            #    independent signals is proportional to SNR²)
+            raw_w = icirs_abs ** 2
+            raw_w = raw_w / (raw_w.sum() + 1e-12)
+
+            # 3. James-Stein shrinkage toward equal weight
+            #    When ICIR estimates are noisy (low cross-sectional dispersion),
+            #    shrink toward equal weight to reduce estimation variance.
+            #    δ = shrinkage intensity ∈ [0.1, 0.5]
+            #    High CV → trust ICIR → low δ;  Low CV → noise → high δ
+            cv = icirs_abs.std() / (icirs_abs.mean() + 1e-10)
+            delta = 1.0 / (1.0 + cv * np.sqrt(n))
+            delta = float(np.clip(delta, 0.1, 0.5))
+
+            equal_w = np.ones(n) / n
+            w = (1.0 - delta) * raw_w + delta * equal_w
+
+            # 4. Debate scores as Bayesian prior (not multiplicative hack)
+            #    posterior = κ · prior + (1 - κ) · likelihood
+            debate_scores = np.array(
+                [getattr(f, 'debate_score', 0.0) for f in factors]
+            )
+            if debate_scores.max() > 0:
+                prior = np.clip(debate_scores, 0.0, 10.0) / 10.0
+                prior_sum = prior.sum()
+                if prior_sum > 1e-8:
+                    prior = prior / prior_sum
+                    kappa = self.shrinkage_kappa
+                    w = kappa * prior + (1.0 - kappa) * w
+
+            # 5. Regime-adaptive tilt
+            #    Boost momentum factors in bull markets, low-vol in bear/high-vol,
+            #    value factors in sideways markets.
+            if market_state is not None and _HAS_MEMORY:
+                tilt = self._compute_regime_tilt(factors, market_state)
+                w = w * (1.0 + tilt)
+
+            # Normalize
+            w = w / (w.sum() + 1e-12)
+            return {names[i]: float(w[i]) for i in range(n)}
+
         else:
-            weights = {name: 1.0 / n for name in names}
-
-        # Blend with debate scores (if any factor has a non-zero debate score)
-        debate_scores = np.array([getattr(f, 'debate_score', 0.0) for f in factors])
-        if debate_scores.max() > 0:
-            # Normalize to [0,1], then blend: final = raw * (0.3 + 0.7 * norm)
-            norm = np.clip(debate_scores, 0.0, 10.0) / 10.0  # [0,1]
-            blend_factor = 0.3 + 0.7 * norm  # [0.3, 1.0]
-            for i, f in enumerate(factors):
-                weights[f.name] *= blend_factor[i]
-            # Renormalize
-            total = sum(weights.values())
-            weights = {k: v / total for k, v in weights.items()}
-
-        return weights
+            self._signs = _extract_signs()
+            return {name: 1.0 / n for name in names}
 
     def _apply_corr_penalty(
         self,
@@ -314,55 +433,180 @@ class FactorFusion:
         factor_values: dict[str, pd.DataFrame],
     ) -> dict[str, float]:
         """
-        对高相关因子的权重打折。
+        基于 Inverse Participation Ratio (IPR) 的相关性惩罚。
+
+        改进点（对比旧版）：
+        1. 全样本 rank correlation 替代单日横截面 — 统计显著
+        2. IPR 惩罚替代 hard floor 0.5 — 连续、无下限截断
+        3. 加权相关性暴露 — 考虑其他因子的权重，而非简单阈值
+
         算法：
-          对每个因子，找到与其相关性 > threshold 的其他因子，
-          取其平均相关性作为惩罚系数：(1 - avg_corr_with_neighbors)
-          最终权重 = 原始权重 * 惩罚系数，再 renormalize。
+          1. 对所有因子值做横截面 rank，flatten 成长向量
+          2. 计算 n×n 全样本 |correlation| 矩阵
+          3. 对每个因子 i，计算加权相关性暴露：
+             E_i = Σ_{j≠i} |corr(i,j)| × w_j / (1 - w_i)
+          4. IPR 惩罚：penalty_i = 1 / (1 + α × E_i)
+          5. 最终权重 = 原始权重 × penalty，再 renormalize
         """
         names = list(raw_weights.keys())
         n = len(names)
         if n <= 1:
             return raw_weights
 
-        # 构建相关性矩阵（基于最近一期因子暴露）
-        corr_mat = np.eye(n)
-        recent_values = {}
+        # ── Step 1: Build full-sample rank correlation matrix ──
+        # Collect aligned dates
+        common_dates = factor_values[names[0]].index
         for name in names:
-            fv = factor_values[name]
-            last_valid = fv.dropna(how="all").tail(1)
-            if not last_valid.empty:
-                recent_values[name] = last_valid.iloc[-1]
-            else:
-                recent_values[name] = pd.Series(dtype=float)
+            common_dates = common_dates.intersection(factor_values[name].index)
 
+        if len(common_dates) < 5:
+            # Not enough data for meaningful correlation → skip penalty
+            return raw_weights
+
+        # Rank each factor cross-sectionally, then flatten to 1D
+        flat_data = {}
+        for name in names:
+            fv = factor_values[name].loc[common_dates]
+            ranked = fv.rank(axis=1, pct=True)
+            flat_data[name] = ranked.values.flatten()
+
+        # Compute pairwise |correlation| using vectorized numpy
+        corr_mat = np.eye(n)
         for i in range(n):
             for j in range(i + 1, n):
-                common = recent_values[names[i]].dropna().index.intersection(
-                    recent_values[names[j]].dropna().index
-                )
-                if len(common) >= 10:
-                    corr = recent_values[names[i]][common].corr(recent_values[names[j]][common])
-                    corr_mat[i, j] = corr_mat[j, i] = abs(corr) if not pd.isna(corr) else 0.0
+                xi = flat_data[names[i]]
+                xj = flat_data[names[j]]
+                mask = ~(np.isnan(xi) | np.isnan(xj))
+                if mask.sum() >= 100:
+                    c = np.corrcoef(xi[mask], xj[mask])[0, 1]
+                    corr_mat[i, j] = corr_mat[j, i] = abs(c) if not np.isnan(c) else 0.0
 
-        # 惩罚：高相关性 → 低权重
-        penalized = {}
-        for i, name in enumerate(names):
-            # 找到高相关邻居
-            neighbors = [j for j in range(n) if j != i and corr_mat[i, j] > self.corr_threshold]
-            if neighbors:
-                avg_corr = np.mean([corr_mat[i, j] for j in neighbors])
-                penalty = max(0.5, 1.0 - avg_corr)  # 至少保留 50%
-            else:
-                penalty = 1.0
-            penalized[name] = raw_weights[name] * penalty
+        # ── Step 2: IPR (Inverse Participation Ratio) penalty ──
+        w_vec = np.array([raw_weights[names[i]] for i in range(n)])
 
-        # 重新归一化
-        total = sum(penalized.values())
-        if total > 1e-8:
-            penalized = {k: v / total for k, v in penalized.items()}
+        # Weighted correlation exposure (excluding diagonal / self-correlation)
+        off_diag = corr_mat - np.eye(n)
+        # E_i = Σ_{j≠i} |corr(i,j)| × w_j  (normalized by total weight of others)
+        weighted_exposure = off_diag @ w_vec  # shape: (n,)
+        denom = (1.0 - w_vec)  # weight of all other factors
+        denom = np.where(denom < 1e-10, 1.0, denom)
+        E = weighted_exposure / denom
 
-        return penalized
+        # IPR penalty: high exposure → low multiplier
+        # penalty_i = 1 / (1 + α × E_i)
+        #   E_i = 0  → penalty = 1.0  (no correlation, no penalty)
+        #   E_i = 0.5 → penalty = 1/(1+α·0.5)
+        #   E_i = 1.0 → penalty = 1/(1+α)  (fully redundant)
+        penalty = 1.0 / (1.0 + self.ipr_alpha * E)
+
+        # Apply penalty
+        penalized_w = w_vec * penalty
+
+        # Renormalize
+        total = penalized_w.sum()
+        if total > 1e-12:
+            penalized_w = penalized_w / total
+        else:
+            # Degenerate case → equal weight
+            penalized_w = np.ones(n) / n
+
+        return {names[i]: float(penalized_w[i]) for i in range(n)}
+
+    # ── Regime-Adaptive Tilt helpers ──
+
+    @staticmethod
+    def _classify_factor(expression: str) -> set[str]:
+        """
+        Classify a factor into categories based on its DSL expression.
+
+        Categories: momentum, lowvol, value, liquidity, other
+        A factor can belong to multiple categories.
+
+        This is a soft classification used only for regime tilt —
+        the actual factor value computation is always done by _FactorExprEvaluator.
+        """
+        expr_lower = expression.lower()
+        categories = set()
+
+        if any(kw in expr_lower for kw in [
+            'delta', 'ts_delta', 'delay', 'close/close', 'return', 'momentum',
+            'close/delay',
+        ]):
+            categories.add('momentum')
+
+        if any(kw in expr_lower for kw in [
+            'ts_std', 'ts_stddev', 'std', 'volatility',
+        ]):
+            categories.add('lowvol')
+
+        if any(kw in expr_lower for kw in [
+            '1/pe', '1/pb', 'pb', 'pe', 'roe', 'book', 'eps',
+        ]):
+            categories.add('value')
+
+        if any(kw in expr_lower for kw in [
+            'volume', 'amount', 'turnover',
+        ]):
+            categories.add('liquidity')
+
+        if not categories:
+            categories.add('other')
+
+        return categories
+
+    def _compute_regime_tilt(
+        self,
+        factors: list[FactorInfo],
+        market_state,
+    ) -> np.ndarray:
+        """
+        Compute per-factor tilt based on market regime.
+
+        Logic:
+          - Bull market  → boost momentum factors
+          - Bear market  → boost low-vol (defensive) factors
+          - High vol     → boost low-vol factors
+          - Sideways     → boost value (mean-reversion) factors
+
+        Parameters
+        ----------
+        factors : list[FactorInfo]
+        market_state : MarketState (from methods.memory)
+
+        Returns
+        -------
+        np.ndarray of shape (n_factors,) — tilt multipliers (can be 0)
+        """
+        n = len(factors)
+        tilt = np.zeros(n)
+        strength = self.regime_tilt_strength
+
+        if market_state is None or not _HAS_MEMORY:
+            return tilt
+
+        trend = market_state.trend
+        volatility = market_state.volatility
+
+        for i, f in enumerate(factors):
+            cats = self._classify_factor(f.expression)
+
+            # Bull → boost momentum
+            if trend == TrendRegime.BULL and 'momentum' in cats:
+                tilt[i] += strength
+
+            # Bear → boost low-vol (defensive)
+            if trend == TrendRegime.BEAR and 'lowvol' in cats:
+                tilt[i] += strength
+
+            # High volatility → boost low-vol
+            if volatility == VolRegime.HIGH and 'lowvol' in cats:
+                tilt[i] += strength * 0.75
+
+            # Sideways → boost value (mean-reversion)
+            if trend == TrendRegime.SIDEWAYS and 'value' in cats:
+                tilt[i] += strength * 0.5
+
+        return tilt
 
 
 # ──────────────────────────────────────────────
@@ -851,7 +1095,7 @@ if __name__ == "__main__":
     dates = pd.date_range("2024-01-01", periods=n_dates, freq="B")
     stock_codes = [f"STOCK_{i:04d}" for i in range(n_stocks)]
 
-    # 生成三个 mock 因子
+    # 生成四个 mock 因子（含一个负 IC 因子以演示 sign-aware 融合）
     def _make_factor(ic: float, noise: float) -> pd.DataFrame:
         base = np.random.randn(n_dates, n_stocks) * noise
         # 注入信号使 IC 接近目标
@@ -862,17 +1106,20 @@ if __name__ == "__main__":
     f_momentum = _make_factor(0.04, 0.3)
     f_value = _make_factor(0.03, 0.35)
     f_lowvol = _make_factor(0.025, 0.4)
+    f_neg_ic = _make_factor(-0.035, 0.3)  # 负 IC 因子 — sign-aware 会自动反转
 
     factors = [
-        FactorInfo("momentum", "rank(close/delay(close,60))", ic=0.04, icir=0.04/0.08, ic_std=0.08),
-        FactorInfo("value", "rank(1/pb)", ic=0.03, icir=0.03/0.10, ic_std=0.10),
-        FactorInfo("lowvol", "-ts_std(returns,20)", ic=0.025, icir=0.025/0.08, ic_std=0.08),
+        FactorInfo("momentum", "rank(close/delay(close,60))", ic=0.04, icir=0.04/0.08, ic_std=0.08, debate_score=7.5),
+        FactorInfo("value", "rank(1/pb)", ic=0.03, icir=0.03/0.10, ic_std=0.10, debate_score=6.0),
+        FactorInfo("lowvol", "-ts_std(returns,20)", ic=0.025, icir=0.025/0.08, ic_std=0.08, debate_score=5.5),
+        FactorInfo("neg_factor", "rank(ts_delta(close,5))", ic=-0.035, icir=-0.035/0.09, ic_std=0.09, debate_score=4.0),
     ]
 
     factor_values = {
         "momentum": f_momentum,
         "value": f_value,
         "lowvol": f_lowvol,
+        "neg_factor": f_neg_ic,
     }
 
     # Mock 股票价格
@@ -893,7 +1140,13 @@ if __name__ == "__main__":
     )
 
     # ---- Run Pipeline ----
-    fusion = FactorFusion(strategy="icir_weighted", corr_penalty=True)
+    fusion = FactorFusion(
+        strategy="icir2_shrinkage",
+        corr_penalty=True,
+        regime_tilt_strength=0.2,
+        shrinkage_kappa=0.3,
+        ipr_alpha=2.0,
+    )
     constructor = PortfolioConstructor(PortfolioConfig(
         top_n=30, method="score_proportional",
         max_weight=0.05, max_industry_exposure=0.30,
@@ -912,9 +1165,11 @@ if __name__ == "__main__":
     )
 
     # ---- Print Results ----
-    print(f"\nFactor Weights:")
+    print(f"\nFactor Weights & Signs:")
+    signs = result.meta.get("signs", {})
     for name, w in result.factor_weights.items():
-        print(f"  {name}: {w:.4f}")
+        s = signs.get(name, 1.0)
+        print(f"  {name:15s}  weight={w:.4f}  sign={s:+.0f}")
 
     print(f"\nPortfolios built: {len(result.portfolios)}")
     if result.portfolios:

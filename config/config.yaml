@@ -4,13 +4,8 @@
 # ==================== Data Configuration ====================
 data:
   # Data source
-  source: "tushare"  # or "akshare", "westock", "qlib", "auto"
+  source: "tushare"  # or "akshare", "westock", "auto"
   tushare_token: "d83808e8ee98957fe38996678210faacda9f68d8c22574f38f572704"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
-  
-  # Qlib config (used when source="qlib" or "auto")
-  qlib:
-    provider_uri: "qlib_data/cn_data"  # Qlib data directory (auto-download if missing)
-    auto_download: true  # auto-download cn_data if not found
   
   # Stock universe
   universe:
@@ -115,7 +110,7 @@ memory:
   
   # Retrieval
   retrieval:
-    top_k: 5
+    top_k: 2
     state_weight: 0.3
     min_ic: 0.02
     
@@ -142,9 +137,13 @@ fusion:
     
   # Weighting strategy
   weighting:
-    strategy: "icir_weighted"  # equal, ic_weighted, icir_weighted, decay
+    strategy: "icir2_shrinkage"  # equal, ic_weighted, icir_weighted, decay_weighted, icir2_shrinkage
     corr_penalty: true
     corr_threshold: 0.7
+    # ICIR² shrinkage hyperparameters (for icir2_shrinkage strategy)
+    regime_tilt_strength: 0.2   # regime tilt magnitude (0=disabled, 0.2=moderate, 0.5=aggressive)
+    shrinkage_kappa: 0.3        # debate prior confidence [0,1] (0=no prior, 1=full prior)
+    ipr_alpha: 2.0              # IPR penalty sensitivity (higher=more aggressive redundancy penalty)
     
   # Portfolio construction
   portfolio:
@@ -162,6 +161,7 @@ backtest:
     commission: 0.0003  # 0.03%
     slippage: 0.001  # 0.1%
     min_holding_days: 1
+    holding_period: 1  # Days between rebalances: 1=daily, 5=weekly, 20=monthly
     
   # Rebalancing
   rebalance:
@@ -171,15 +171,6 @@ backtest:
   # Benchmark
   benchmark:
     name: "hs300"
-
-  # Qlib backtesting engine (optional, pip install qlib)
-  qlib:
-    enable: false         # set to true to use Qlib for backtesting
-    topk: 50              # number of stocks in portfolio
-    n_drop: 5             # stocks replaced per rebalance
-    limit_threshold: 0.095  # A-share price limit (9.5%)
-    hold_thresh: 1        # minimum holding days
-    freq: "day"           # rebalance frequency ("day" or "week")
 
 # ==================== Experiment Configuration ====================
 experiment:

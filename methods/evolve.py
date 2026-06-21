@@ -55,6 +55,7 @@ class CandidateFactor:
     icir: float = 0.0
     sharpe: float = 0.0
     win_rate: float = 0.0
+    max_drawdown: float = 0.0
     
     
 @dataclass
@@ -134,7 +135,7 @@ class _FactorExprEvaluator:
         ts_rank(X, w)    — rolling time-series rank [0, 1]
         ts_corr(X, Y, w) — rolling Pearson correlation
         ts_mean(X, w)    — rolling mean
-        ts_std(X, w)     — rolling std (ddof=0)
+        ts_std(X, w)     — rolling std (ddof=0)  [alias: ts_stddev]
         ts_min(X, w)     — rolling minimum
         ts_max(X, w)     — rolling maximum
         ts_sum(X, w)     — rolling sum
@@ -322,8 +323,32 @@ class _FactorExprEvaluator:
 
     # ---- Function dispatch ----
 
+    # Common WorldQuant/quant DSL aliases → canonical name
+    # This lets the evaluator accept function names the LLM frequently generates
+    # even when they differ from the prompt's canonical spelling.
+    _FUNC_ALIASES = {
+        'ts_stddev':  'ts_std',      # WorldQuant Alpha 101 standard name
+        'ts_std_dev': 'ts_std',
+        'stddev':     'ts_std',
+        'ts_average': 'ts_mean',      # common alias
+        'ts_avg':     'ts_mean',
+        'ts_median':  'ts_mean',      # approximated by mean (rare alias)
+        'ts_diff':    'ts_delta',     # NumPy naming convention
+        'ts_delay':   'delay',
+        'ts_lag':     'delay',
+        'lag':        'delay',
+        'ts_var':     'ts_std',       # variance → std (approximate; rare)
+        'max':        'ts_max',       # bare max → ts_max (ambiguous but LLM uses it)
+        'min':        'ts_min',
+        'mean':       'ts_mean',
+        'sum':        'ts_sum',
+    }
+
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
         """Route function call to implementation."""
+        # Normalize aliases before lookup
+        name = self._FUNC_ALIASES.get(name, name)
+
         arity = len(args)
         # Check arity
         arity_map = {
@@ -514,9 +539,6 @@ class FactorBacktester:
         volume: Optional[pd.DataFrame] = None,
         fundamentals: Optional[Dict[str, pd.DataFrame]] = None,
         forward_period: int = _DEFAULT_FORWARD_PERIOD,
-        use_qlib: bool = False,
-        qlib_provider_uri: Optional[str] = None,
-        qlib_topk: int = 50,
     ):
         """
         Initialize the backtester.
@@ -527,9 +549,6 @@ class FactorBacktester:
             volume: Volume DataFrame, used only when prices is a DataFrame (legacy API).
             fundamentals: Optional dict of fundamental DataFrames (pe, pb, roe, market_cap).
             forward_period: Forward return horizon in trading days.
-            use_qlib: If True, use Qlib's professional backtesting for IC/metrics.
-            qlib_provider_uri: Qlib data path (only used when use_qlib=True).
-            qlib_topk: Portfolio size for Qlib backtest (only used when use_qlib=True).
         """
         # ---- Normalise price_data ----
         if isinstance(prices, dict):
@@ -540,11 +559,6 @@ class FactorBacktester:
                 self.price_data['volume'] = volume.copy()
         else:
             raise TypeError(f"prices must be dict or DataFrame, got {type(prices)}")
-
-        # Qlib integration flags
-        self.use_qlib = use_qlib
-        self.qlib_provider_uri = qlib_provider_uri
-        self.qlib_topk = qlib_topk
 
         # Pad missing price fields with empty DataFrames
         for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
@@ -607,9 +621,6 @@ class FactorBacktester:
         """
         Evaluate a candidate factor.
 
-        If self.use_qlib is True, delegates to evaluate_qlib() for
-        professional backtesting via Microsoft Qlib.
-
         Args:
             factor: CandidateFactor with .expression set.
 
@@ -617,14 +628,6 @@ class FactorBacktester:
             Dict with keys: ic, ic_ir, sharpe, win_rate, max_drawdown,
                             long_short_ret, factor_values.
         """
-        # Delegate to Qlib if enabled
-        if self.use_qlib:
-            return self.evaluate_qlib(
-                factor,
-                provider_uri=self.qlib_provider_uri,
-                topk=self.qlib_topk,
-            )
-
         expr = factor.expression
 
         # Check cache
@@ -635,6 +638,7 @@ class FactorBacktester:
             factor.icir = cached.get('icir', 0.0)
             factor.sharpe = cached['sharpe']
             factor.win_rate = cached['win_rate']
+            factor.max_drawdown = cached.get('max_drawdown', 0.0)
             return cached
 
         try:
@@ -676,6 +680,7 @@ class FactorBacktester:
             factor.icir = metrics['icir']
             factor.sharpe = metrics['sharpe']
             factor.win_rate = metrics['win_rate']
+            factor.max_drawdown = metrics['max_drawdown']
 
             # Cache
             self._metric_cache[expr] = {k: v for k, v in metrics.items()
@@ -697,125 +702,6 @@ class FactorBacktester:
             'long_short_ret': pd.Series(dtype=float),
             'factor_values': pd.DataFrame(),
         }
-
-    def evaluate_qlib(
-        self,
-        factor: 'CandidateFactor',
-        factor_values: Optional[pd.DataFrame] = None,
-        provider_uri: Optional[str] = None,
-        topk: int = 50,
-    ) -> Dict:
-        """
-        Evaluate a candidate factor using Qlib's professional backtesting.
-
-        Uses Qlib's TopkDropoutStrategy + BacktestExecutor for realistic
-        portfolio simulation with signal delay and trading costs.
-
-        Args:
-            factor: CandidateFactor with .expression set.
-            factor_values: Pre-computed factor values (optional; computed if None).
-            provider_uri: Qlib data path (default: ~/.qlib/qlib_data/cn_data).
-            topk: Number of stocks in portfolio.
-
-        Returns:
-            Dict with keys: ic, ic_ir, rank_ic, rank_icir,
-                            long_short_sharpe, long_short_return,
-                            win_rate, max_drawdown
-        """
-        from backtest.qlib_backtester import QlibBacktester
-
-        expr = factor.expression
-
-        # Compute factor values if not provided
-        if factor_values is None:
-            try:
-                factor_values = self.compute_factor_values(expr)
-            except Exception as e:
-                logger.warning("Qlib eval: failed to compute factor values for '%s': %s", expr, e)
-                return self._empty_metrics()
-
-        if factor_values.empty or factor_values.isna().all().all():
-            return self._empty_metrics()
-
-        # Get date bounds from data
-        close_df = self.price_data.get('close')
-        if close_df is None or close_df.empty:
-            return self._empty_metrics()
-
-        start_time = str(close_df.index[0].date())
-        end_time = str(close_df.index[-1].date())
-
-        # Convert stock codes to Qlib format (SH600000 / SZ000001)
-        factor_values_qlib = self._to_qlib_codes(factor_values)
-
-        # Run Qlib evaluation
-        bt = QlibBacktester(
-            provider_uri=provider_uri or '~/.qlib/qlib_data/cn_data',
-            topk=topk,
-        )
-        qlib_metrics = bt.evaluate_factor(
-            factor_values_qlib,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        # Update factor object with Qlib metrics
-        factor.ic = qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0))
-        factor.icir = qlib_metrics.get('icir', qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0)))
-        # Map long_short_sharpe to sharpe for compatibility
-        factor.sharpe = qlib_metrics.get('long_short_sharpe', 0.0)
-        factor.win_rate = qlib_metrics.get('win_rate', 0.5)
-
-        # Normalize output to match standard evaluate() return format
-        return {
-            'ic': qlib_metrics.get('rank_ic', qlib_metrics.get('ic', 0.0)),
-            'icir': qlib_metrics.get('icir', qlib_metrics.get('rank_icir', qlib_metrics.get('ic_ir', 0.0))),
-            'sharpe': qlib_metrics.get('long_short_sharpe', 0.0),
-            'win_rate': qlib_metrics.get('win_rate', 0.5),
-            'max_drawdown': qlib_metrics.get('max_drawdown', 0.0),
-            'long_short_ret': pd.Series(dtype=float),  # Qlib handles internally
-            'factor_values': factor_values,             # Computed locally
-        }
-
-    def _to_qlib_codes(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Convert stock codes to Qlib format (SH600000 / SZ000001).
-
-        Recognizes common A-share code formats:
-          - 600000.SH, 000001.SZ → SH600000, SZ000001
-          - SH600000, SZ000001   → unchanged (already Qlib format)
-          - 600000, 000001       → SH600000, SZ000001 (inferred from first digit)
-        """
-        new_cols = []
-        for col in df.columns:
-            col_str = str(col).strip()
-            # Already Qlib format?
-            if col_str.startswith(('SH', 'SZ', 'BJ')) and len(col_str) == 8:
-                new_cols.append(col_str)
-                continue
-
-            # Remove .SH/.SZ/.BJ suffix
-            for suffix in ('.SH', '.SZ', '.BJ', '.sh', '.sz', '.bj'):
-                if col_str.endswith(suffix):
-                    code = col_str[:-len(suffix)]
-                    market = suffix.upper().replace('.', '')
-                    new_cols.append(f'{market}{code}')
-                    break
-            else:
-                # Bare number — infer market from first digit
-                if col_str.startswith('6'):
-                    new_cols.append(f'SH{col_str}')
-                elif col_str.startswith(('0', '3')):
-                    new_cols.append(f'SZ{col_str}')
-                elif col_str.startswith(('8', '4')):
-                    new_cols.append(f'BJ{col_str}')
-                else:
-                    # Unknown format, keep as-is
-                    new_cols.append(col_str)
-
-        result = df.copy()
-        result.columns = new_cols
-        return result
 
     def clear_cache(self):
         """Clear cached metrics."""
@@ -869,6 +755,7 @@ class FactorBacktester:
                     factor.icir = cached.get('icir', 0.0)
                     factor.sharpe = cached['sharpe']
                     factor.win_rate = cached['win_rate']
+                    factor.max_drawdown = cached.get('max_drawdown', 0.0)
                     return cached
 
             try:
@@ -1439,18 +1326,19 @@ Supported functions (WorldQuant style):
 - ts_rank(X, w): rolling time-series rank within window w
 - ts_corr(X, Y, w): rolling correlation between X and Y over window w
 - ts_mean(X, w): rolling mean over window w
-- ts_std(X, w): rolling standard deviation over window w
+- ts_std(X, w): rolling standard deviation over window w (alias: ts_stddev)
 - ts_min(X, w): rolling minimum over window w
 - ts_max(X, w): rolling maximum over window w
 - ts_sum(X, w): rolling sum over window w
-- ts_delta(X, w): X - delay(X, w)
+- ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
 - ts_zscore(X, w): rolling z-score over window w
-- delay(X, d): lag by d periods
+- delay(X, d): lag by d periods (alias: ts_lag, lag)
 - sign(X): element-wise sign
 - abs(X): element-wise absolute value
 - log(X): element-wise natural log
 - sqrt(X): element-wise square root
 
+Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag are accepted as aliases.
 Supported operators: +, -, *, /, ^
 
 Factor categories to cover:
@@ -1573,7 +1461,99 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             seed_factors.append(factor)
         
         return seed_factors
-    
+
+    def generate(
+        self,
+        prompt: str,
+        n_factors: int = None,
+    ) -> list[dict]:
+        """
+        Generate factors using a custom prompt (called by MemoryAugmentedGenerator).
+
+        Parameters
+        ----------
+        prompt : str, augmented prompt with few-shot examples from memory bank
+        n_factors : int, number of factors to generate (default: self.n_seeds)
+
+        Returns
+        -------
+        list[dict], each with "expression" and "description" keys
+        """
+        n = n_factors or self.n_seeds
+
+        if self.use_llm and self.client:
+            try:
+                return self._generate_via_llm_with_prompt(prompt, n)
+            except Exception as e:
+                print(f"  [SelfEvolvingGenerator.generate] LLM failed: {e}, falling back to rule-based")
+                return self._generate_fallback_dict(n)
+
+        # LLM not available — rule-based fallback
+        return self._generate_fallback_dict(n)
+
+    def _generate_via_llm_with_prompt(self, user_prompt: str, n_factors: int) -> list[dict]:
+        """Call LLM with a custom user_prompt (from MemoryAugmentedGenerator)."""
+        system_prompt = """You are a quantitative factor research expert specializing in A-share stock selection.
+Your task is to generate diverse, economically meaningful factor expressions for stock selection.
+
+Supported data sources:
+- open, high, low, close, volume, amount (price and volume data)
+- pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
+
+Supported functions (WorldQuant style):
+- rank(X): cross-sectional percentile rank [0, 1]
+- ts_rank(X, w): rolling time-series rank within window w
+- ts_corr(X, Y, w): rolling correlation between X and Y over window w
+- ts_mean(X, w): rolling mean over window w (alias: ts_average, ts_avg)
+- ts_std(X, w): rolling standard deviation over window w (alias: ts_stddev)
+- ts_min(X, w): rolling minimum over window w
+- ts_max(X, w): rolling maximum over window w
+- ts_sum(X, w): rolling sum over window w
+- ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
+- ts_zscore(X, w): rolling z-score over window w
+- delay(X, d): lag by d periods (alias: ts_lag, lag)
+- sign(X): element-wise sign
+- abs(X): element-wise absolute value
+- log(X): element-wise natural log
+- sqrt(X): element-wise square root
+
+Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag are accepted as aliases.
+
+Supported operators: +, -, *, /, ^
+
+Return a JSON object with a "factors" key, which is an array of objects.
+Each object must have "expression" and "description" keys.
+Ensure expressions are valid and can be evaluated by the factor engine."""
+
+        resp = self._call_llm(
+            system_prompt=system_prompt,
+            user_prompt=f"Generate {n_factors} factors. {user_prompt}",
+            temperature=0.8,
+            expect_json=True,
+        )
+
+        import json
+        try:
+            parsed = json.loads(resp)
+            raw_factors = parsed.get("factors", parsed) if isinstance(parsed, dict) else parsed
+            results = []
+            for f in raw_factors[:n_factors]:
+                if isinstance(f, dict) and "expression" in f:
+                    results.append({
+                        "expression": f["expression"],
+                        "description": f.get("description", ""),
+                    })
+            print(f"  [SelfEvolvingGenerator] LLM generated {len(results)} factors from augmented prompt")
+            return results
+        except Exception as e:
+            print(f"  [SelfEvolvingGenerator] Failed to parse LLM response: {e}")
+            return []
+
+    def _generate_fallback_dict(self, n_factors: int) -> list[dict]:
+        """Rule-based fallback returning list[dict] format."""
+        factors = self._generate_factors_rule_based(n_factors)
+        return [{"expression": f.expression, "description": f.description} for f in factors]
+
     def evolve(
         self,
         seed_factors: List[CandidateFactor],
@@ -1614,6 +1594,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 factor.icir = metrics.get('icir', 0.0)
                 factor.sharpe = metrics.get('sharpe', 0.0)
                 factor.win_rate = metrics.get('win_rate', 0.5)
+                factor.max_drawdown = metrics.get('max_drawdown', 0.0)
                 evaluated_factors.append(factor)
                 
                 if factor.ic > best_ic:
@@ -1677,6 +1658,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 factor.icir = metrics.get('icir', 0.0)
                 factor.sharpe = metrics.get('sharpe', 0.0)
                 factor.win_rate = metrics.get('win_rate', 0.5)
+                factor.max_drawdown = metrics.get('max_drawdown', 0.0)
                 if factor.ic > best_ic:
                     best_ic = factor.ic
             # Save improved factors with real IC/Sharpe/win_rate after backtest evaluation

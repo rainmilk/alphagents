@@ -15,7 +15,6 @@ Usage:
 """
 
 import os
-import sys
 import argparse
 import json
 import pandas as pd
@@ -25,7 +24,6 @@ from datetime import datetime
 import yaml
 import warnings
 
-import config
 from config import config_path
 
 warnings.filterwarnings('ignore')
@@ -33,14 +31,14 @@ warnings.filterwarnings('ignore')
 # Import all modules
 from dataloader.loader import DataLoader, load_sample_data, load_real_data
 from backtest.engine import BacktestEngine
-from metrics.evaluator import FactorEvaluator, evaluate_portfolio_comprehensive
 
 # Import methods (with error handling for missing dependencies)
 try:
     from methods.debate import DebateEvaluator, FactorProposal
     from methods.evolve import SelfEvolvingGenerator, FactorBacktester, CandidateFactor
     from methods.memory import FactorMemoryBank, FactorEmbedder, MarketStateEncoder, MemoryAugmentedGenerator
-    from methods.fusion import FactorFusion, PortfolioConstructor, FactorInfo, PortfolioConfig
+    from methods.fusion import FactorFusion, PortfolioConstructor, FactorInfo, PortfolioConfig, FactorNormalizer
+
     METHODS_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: Some methods modules not available: {e}")
@@ -152,6 +150,7 @@ class AAAI2027Pipeline:
         self.backtest_engine = BacktestEngine(
             commission=self.config['backtest']['trading']['commission'],
             slippage=self.config['backtest']['trading']['slippage'],
+            holding_period=self.config.get('backtest', {}).get('trading', {}).get('holding_period', 1),
         )
 
         # --- Train/Test Split (Critical for preventing overfitting) ---
@@ -337,6 +336,13 @@ class AAAI2027Pipeline:
                 market_df = pd.DataFrame({'close': market_close})
                 augmented_factors = memory_generator.generate(
                     task_description=f"Generate {n_seeds} alpha factors for A-share stock selection",
+                    retrieval_query=(
+                        "quality factor with stable profitability and ROE, "
+                        "value reversal factor using valuation metrics like PE and PB, "
+                        "momentum factor capturing price trends with moving averages, "
+                        "volatility factor for low-volatility effect, "
+                        "liquidity factor for small-cap premium"
+                    ),
                     price_df=market_df,
                 )
                 if augmented_factors:
@@ -384,21 +390,11 @@ class AAAI2027Pipeline:
         
         # Initialize backtester for evolution — USE TRAINING DATA ONLY
         # Critical: factors must NOT see test data during evolution
-        qlib_cfg = self.config.get('backtest', {}).get('qlib', {})
-        use_qlib = qlib_cfg.get('enable', False)
         backtester = FactorBacktester(
             prices=self.train_data['price_data'],
             fundamentals=self.train_data['fundamental_data'],
             forward_period=forward_period,
-            use_qlib=use_qlib,
-            qlib_provider_uri=self.config.get('data', {}).get('qlib', {}).get(
-                'provider_uri', '~/.qlib/qlib_data/cn_data'
-            ),
-            qlib_topk=qlib_cfg.get('topk', 50),
         )
-        
-        if use_qlib:
-            print("  [evolution] Using Qlib professional backtesting engine")
         print(f"  [evolution] Using TRAIN data only: {self._train_end_date}")
         evolution_result = self.evolving_generator.evolve(
             seed_factors=self.generated_factors,
@@ -413,13 +409,207 @@ class AAAI2027Pipeline:
         best_ic = self.best_factors[0].ic if self.best_factors else 0.0
         print(f"  Best IC: {best_ic:.4f}")
         print("  [✓] Factor evolution complete")
+
+        def step4b_retrieve_from_memory(self):
+            """
+            Step 4b: Retrieve historical high-quality factors from memory bank.
+
+            Runs AFTER step4_evolve_factors but BEFORE step5_evaluate_factors so that
+            retrieved factors join the candidate pool and are debate-evaluated alongside
+            newly evolved factors. This ensures retrieved factors also receive a
+            debate_score for fusion.
+
+            Uses state-aware retrieval to find factors from memory that performed
+            well in similar market conditions, augmenting the evolved factor pool
+            with proven historical factors.
+
+            Retrieved factors are tagged with _from_memory=True so step5 will not
+            redundantly re-write them back to the memory bank.
+            """
+            if not METHODS_AVAILABLE:
+                print("\n[Step 4b] Skipped: methods modules not available")
+                return
+
+            if self.memory_bank is None or len(self.memory_bank) == 0:
+                print("\n[Step 4b] Skipped: memory bank is empty")
+                return
+
+            print("\n[Step 4b] Retrieving factors from memory (state-aware)...")
+
+            # Encode current market state using TRAIN data (not test data)
+            # This prevents data leak from test period
+            close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
+            # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
+            # Build market index proxy by cross-sectional mean
+            market_close = close_df.mean(axis=1)
+            market_df = pd.DataFrame({'close': market_close})
+            try:
+                current_state = self.market_encoder.encode(market_df)
+            except Exception as e:
+                print(f"  [warn] Market state encoding failed: {e}")
+                current_state = None
+
+            # Retrieve similar factors from memory
+            # Use best evolved factors as query (higher quality than raw seeds)
+            query_desc = "multi-factor stock selection using technical indicators"
+            query_expr = ""
+            query_source = self.best_factors if (
+                        hasattr(self, 'best_factors') and self.best_factors) else self.generated_factors
+            if query_source:
+                # Use the first factor as query
+                f = query_source[0]
+                if isinstance(f, dict):
+                    query_desc = f.get('description', query_desc)
+                    query_expr = f.get('expression', '')
+                else:
+                    query_desc = getattr(f, 'description', query_desc)
+                    query_expr = getattr(f, 'expression', '')
+
+            retrieved_factors = self.memory_bank.retrieve(
+                query_description=query_desc,
+                query_expression=query_expr,
+                current_market_state=current_state,
+                top_k=self.config['memory'].get('top_k', 5),
+            )
+
+            if retrieved_factors:
+                print(f"  Retrieved {len(retrieved_factors)} factors from memory")
+
+                # Merge retrieved factors into the factor pool
+                # Retrieved factors augment the best evolved factors
+                # Deduplicate by expression to avoid duplicates (step5b may be re-run)
+                existing_exprs = set()
+                if hasattr(self, 'best_factors') and self.best_factors:
+                    for f in self.best_factors:
+                        if isinstance(f, dict):
+                            expr = f.get('expression', '')
+                        else:
+                            expr = getattr(f, 'expression', '')
+                        if expr:
+                            existing_exprs.add(expr)
+
+                added = 0
+                if hasattr(self, 'best_factors') and self.best_factors:
+                    for rf in retrieved_factors:
+                        if rf.expression not in existing_exprs:
+                            # Mark as memory-sourced so step5 won't re-save it to memory bank
+                            rf._from_memory = True
+                            self.best_factors.append(rf)
+                            existing_exprs.add(rf.expression)
+                            added += 1
+
+                print(f"  Added {added} new factors from memory (skipped {len(retrieved_factors) - added} duplicates)")
+                print(f"  Factor pool size after merge: {len(self.best_factors)}")
+            else:
+                print("  No relevant factors found in memory")
+
+            print("  [✓] Memory retrieval complete")
+
+    def step4b_retrieve_from_memory(self):
+        """
+        Step 4b: Retrieve historical high-quality factors from memory bank.
+
+        Runs AFTER step4_evolve_factors but BEFORE step5_evaluate_factors so that
+        retrieved factors join the candidate pool and are debate-evaluated alongside
+        newly evolved factors. This ensures retrieved factors also receive a
+        debate_score for fusion.
+
+        Uses state-aware retrieval to find factors from memory that performed
+        well in similar market conditions, augmenting the evolved factor pool
+        with proven historical factors.
+
+        Retrieved factors are tagged with _from_memory=True so step5 will not
+        redundantly re-write them back to the memory bank.
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 4b] Skipped: methods modules not available")
+            return
+
+        if self.memory_bank is None or len(self.memory_bank) == 0:
+            print("\n[Step 4b] Skipped: memory bank is empty")
+            return
+
+        print("\n[Step 4b] Retrieving factors from memory (state-aware)...")
+
+        # Encode current market state using TRAIN data (not test data)
+        # This prevents data leak from test period
+        close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
+        # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
+        # Build market index proxy by cross-sectional mean
+        market_close = close_df.mean(axis=1)
+        market_df = pd.DataFrame({'close': market_close})
+        try:
+            current_state = self.market_encoder.encode(market_df)
+        except Exception as e:
+            print(f"  [warn] Market state encoding failed: {e}")
+            current_state = None
+
+        # Retrieve similar factors from memory
+        # Use best evolved factors as query (higher quality than raw seeds)
+        query_desc = "multi-factor stock selection using technical indicators"
+        query_expr = ""
+        query_source = self.best_factors if (
+                    hasattr(self, 'best_factors') and self.best_factors) else self.generated_factors
+        if query_source:
+            # Use the first factor as query
+            f = query_source[0]
+            if isinstance(f, dict):
+                query_desc = f.get('description', query_desc)
+                query_expr = f.get('expression', '')
+            else:
+                query_desc = getattr(f, 'description', query_desc)
+                query_expr = getattr(f, 'expression', '')
+
+        retrieved_factors = self.memory_bank.retrieve(
+            query_description=query_desc,
+            query_expression=query_expr,
+            current_market_state=current_state,
+            top_k=self.config['memory'].get('top_k', 5),
+        )
+
+        if retrieved_factors:
+            print(f"  Retrieved {len(retrieved_factors)} factors from memory")
+
+            # Merge retrieved factors into the factor pool
+            # Retrieved factors augment the best evolved factors
+            # Deduplicate by expression to avoid duplicates (step5b may be re-run)
+            existing_exprs = set()
+            if hasattr(self, 'best_factors') and self.best_factors:
+                for f in self.best_factors:
+                    if isinstance(f, dict):
+                        expr = f.get('expression', '')
+                    else:
+                        expr = getattr(f, 'expression', '')
+                    if expr:
+                        existing_exprs.add(expr)
+
+            added = 0
+            if hasattr(self, 'best_factors') and self.best_factors:
+                for rf in retrieved_factors:
+                    if rf.expression not in existing_exprs:
+                        # Mark as memory-sourced so step5 won't re-save it to memory bank
+                        rf._from_memory = True
+                        self.best_factors.append(rf)
+                        existing_exprs.add(rf.expression)
+                        added += 1
+
+            print(f"  Added {added} new factors from memory (skipped {len(retrieved_factors) - added} duplicates)")
+            print(f"  Factor pool size after merge: {len(self.best_factors)}")
+        else:
+            print("  No relevant factors found in memory")
+
+        print("  [✓] Memory retrieval complete")
         
     def step5_evaluate_factors(self):
         """
-        Step 5: Evaluate the evolved best factors via multi-agent debate.
+        Step 5: Evaluate ALL candidate factors via multi-agent debate.
 
-        Debate runs AFTER evolution — it serves as the final quality gate,
-        applying 5-expert cross-validation to the top evolved factors.
+        Runs AFTER step4b_retrieve_from_memory — both newly evolved factors
+        and memory-retrieved factors are evaluated together. This ensures every
+        factor entering step6 fusion has a valid debate_score.
+
+        Debate serves as the final quality gate, applying 5-expert cross-
+        validation to the full candidate pool before fusion.
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 5] Skipped: methods modules not available")
@@ -496,10 +686,15 @@ class AAAI2027Pipeline:
                 if isinstance(factor, dict):
                     expr = factor.get('expression', '')
                     desc = factor.get('description', '')
+                    is_from_memory = factor.get('_from_memory', False)
                 else:
                     expr = getattr(factor, 'expression', '')
                     desc = getattr(factor, 'description', '')
+                    is_from_memory = getattr(factor, '_from_memory', False)
                 if not expr:
+                    continue
+                # Skip factors retrieved from memory — they're already stored there
+                if is_from_memory:
                     continue
                 try:
                     self.memory_bank.add(
@@ -519,93 +714,9 @@ class AAAI2027Pipeline:
             if saved:
                 print(f"  Saved {saved} factors to memory bank")
         
-    def step5b_retrieve_from_memory(self):
+    def step5b_chair_synthesis(self):
         """
-        Step 5b: Retrieve historical high-quality factors from memory bank.
-        
-        This step uses state-aware retrieval to find factors from memory
-        that performed well in similar market conditions, augmenting the
-        evolved factor pool with proven historical factors.
-        """
-        if not METHODS_AVAILABLE:
-            print("\n[Step 5b] Skipped: methods modules not available")
-            return
-        
-        if self.memory_bank is None or len(self.memory_bank) == 0:
-            print("\n[Step 5b] Skipped: memory bank is empty")
-            return
-        
-        print("\n[Step 5b] Retrieving factors from memory (state-aware)...")
-        
-        # Encode current market state using TRAIN data (not test data)
-        # This prevents data leak from test period
-        close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
-        # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
-        # Build market index proxy by cross-sectional mean
-        market_close = close_df.mean(axis=1)
-        market_df = pd.DataFrame({'close': market_close})
-        try:
-            current_state = self.market_encoder.encode(market_df)
-        except Exception as e:
-            print(f"  [warn] Market state encoding failed: {e}")
-            current_state = None
-        
-        # Retrieve similar factors from memory
-        # Use best evolved factors as query (higher quality than raw seeds)
-        query_desc = "multi-factor stock selection using technical indicators"
-        query_expr = ""
-        query_source = self.best_factors if (hasattr(self, 'best_factors') and self.best_factors) else self.generated_factors
-        if query_source:
-            # Use the first factor as query
-            f = query_source[0]
-            if isinstance(f, dict):
-                query_desc = f.get('description', query_desc)
-                query_expr = f.get('expression', '')
-            else:
-                query_desc = getattr(f, 'description', query_desc)
-                query_expr = getattr(f, 'expression', '')
-
-        retrieved_factors = self.memory_bank.retrieve(
-            query_description=query_desc,
-            query_expression=query_expr,
-            current_market_state=current_state,
-            top_k=self.config['memory'].get('top_k', 5),
-        )
-        
-        if retrieved_factors:
-            print(f"  Retrieved {len(retrieved_factors)} factors from memory")
-
-            # Merge retrieved factors into the factor pool
-            # Retrieved factors augment the best evolved factors
-            # Deduplicate by expression to avoid duplicates (step5b may be re-run)
-            existing_exprs = set()
-            if hasattr(self, 'best_factors') and self.best_factors:
-                for f in self.best_factors:
-                    if isinstance(f, dict):
-                        expr = f.get('expression', '')
-                    else:
-                        expr = getattr(f, 'expression', '')
-                    if expr:
-                        existing_exprs.add(expr)
-
-            added = 0
-            if hasattr(self, 'best_factors') and self.best_factors:
-                for rf in retrieved_factors:
-                    if rf.expression not in existing_exprs:
-                        self.best_factors.append(rf)
-                        existing_exprs.add(rf.expression)
-                        added += 1
-
-            print(f"  Added {added} new factors from memory (skipped {len(retrieved_factors) - added} duplicates)")
-            print(f"  Factor pool size after merge: {len(self.best_factors)}")
-        else:
-            print("  No relevant factors found in memory")
-        
-        print("  [✓] Memory retrieval complete")
-        
-    def step5c_chair_synthesis(self):
-        """
-        Step 5c: Chair Agent synthesizes ALL debate results into a comprehensive
+        Step 5b: Chair Agent synthesizes ALL debate results into a comprehensive
         cross-factor report with final rankings, selection reasons, and rejection reasons.
 
         This is the capstone of the multi-agent debate module. The Chair Agent
@@ -619,14 +730,14 @@ class AAAI2027Pipeline:
         Output: experiments/{yyyymmdd}/chair_synthesis.json
         """
         if not METHODS_AVAILABLE:
-            print("\n[Step 5c] Skipped: methods modules not available")
+            print("\n[Step 5b] Skipped: methods modules not available")
             return
 
         if not hasattr(self, 'debate_results') or not self.debate_results:
-            print("\n[Step 5c] Skipped: no debate results available")
+            print("\n[Step 5b] Skipped: no debate results available")
             return
 
-        print("\n[Step 5c] Chair Agent synthesizing all debate results...")
+        print("\n[Step 5b] Chair Agent synthesizing all debate results...")
 
         # Build (FactorProposal, DebateResult) pairs
         proposals_and_results = []
@@ -657,30 +768,41 @@ class AAAI2027Pipeline:
 
     def step6_fuse_factors(self):
         """
-        Step 6: Fuse factors using ICIR-weighted fusion.
+        Step 6: Fuse factors using ICIR² shrinkage fusion with sign-aware,
+        IPR correlation penalty, and regime-adaptive tilt.
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 6] Skipped: methods modules not available")
             return
         
         print("\n[Step 6] Fusing factors...")
-        
-        # Initialize fusion
-        fusion = FactorFusion(
-            strategy=self.config['fusion']['weighting']['strategy'],
-            corr_penalty=self.config['fusion']['weighting']['corr_penalty'],
-        )
-        
-        # Prepare factor values (use TRAIN data to determine fusion weights — in-sample)
-        # Fusion weights are model parameters; they must be determined on training data,
-        # then applied to test data in step8 for out-of-sample evaluation.
-        if hasattr(self, 'train_data') and self.train_data:
-            _train_price = self.train_data.get('price_data', {})
-            factor_dict = self._calculate_factor_values(price_data=_train_price)
-        else:
-            factor_dict = self._calculate_factor_values()
 
-        # Build factor metadata lookup from best_factors (has ic, icir, sharpe from backtest)
+        # ── Guard: need train/test split ──
+        if not hasattr(self, 'train_data') or not self.train_data:
+            print("  [error] train_data not available. Run step1 (load_data) first.")
+            return
+
+        # Initialize fusion with strategy and hyperparameters from config
+        weighting_cfg = self.config['fusion']['weighting']
+        fusion = FactorFusion(
+            strategy=weighting_cfg.get('strategy', 'icir2_shrinkage'),
+            corr_penalty=weighting_cfg.get('corr_penalty', True),
+            corr_threshold=weighting_cfg.get('corr_threshold', 0.7),
+            regime_tilt_strength=weighting_cfg.get('regime_tilt_strength', 0.2),
+            shrinkage_kappa=weighting_cfg.get('shrinkage_kappa', 0.3),
+            ipr_alpha=weighting_cfg.get('ipr_alpha', 2.0),
+        )
+
+        # ── 1. Compute factor values on TRAIN data (for weight computation) ──
+        train_price = self.train_data['price_data']
+        train_fund = self.train_data.get('fundamental_data', {})
+        print("  Computing factor values on TRAIN data (no leakage)...")
+        train_factor_dict = self._calculate_factor_values(
+            price_data=train_price,
+            fundamental_data=train_fund,
+        )
+
+        # ── 2. Build factor_infos from backtest results (IC/ICIR from train data) ──
         factor_meta_lookup = {}
         if hasattr(self, 'best_factors') and self.best_factors:
             for f in self.best_factors:
@@ -689,8 +811,7 @@ class AAAI2027Pipeline:
                 icir_val = getattr(f, 'icir', 0.0)
                 sharpe_val = getattr(f, 'sharpe', 0.0)
                 factor_meta_lookup[expr] = (ic_val, icir_val, sharpe_val)
-        
-        # Build debate_score lookup from step5 debate results
+
         debate_score_map = {}
         if hasattr(self, 'debate_results') and self.debate_results:
             for factor, result in self.debate_results:
@@ -699,71 +820,71 @@ class AAAI2027Pipeline:
                 else:
                     expr = getattr(factor, 'expression', '')
                 if expr:
-                    debate_score_map[expr] = result.final_score
-        
-        # Build factor_values_dict and factor_infos
-        factor_values_dict = {}
+                    # result is a DebateResult or dict with final_score
+                    score = result.final_score if hasattr(result, 'final_score') else result.get('final_score', 0.0)
+                    debate_score_map[expr] = score
+
+        # Use train_factor_dict keys (same factor names, train-period only)
         factor_infos = []
-        for name, values_df in factor_dict.items():
-            # Ensure index is datetime
+        for name, values_df in train_factor_dict.items():
             if not isinstance(values_df.index, pd.DatetimeIndex):
                 values_df = values_df.copy()
                 values_df.index = pd.to_datetime(values_df.index)
-            factor_values_dict[name] = values_df
-            
-            # Look up ic/icir/sharpe from backtest results
+
             meta = factor_meta_lookup.get(name)
             if meta:
                 ic_val, icir_val, sharpe_val = meta
-                # Compute ic_std from icir (icir = ic / ic_std)
                 if abs(icir_val) > 1e-8:
                     ic_std_val = ic_val / icir_val
                 else:
-                    ic_std_val = 1.0  # default: equivalent to ic_weighted
+                    ic_std_val = 1.0
             else:
                 ic_val = ic_std_val = sharpe_val = 0.0
-            
+
             dscore = debate_score_map.get(name, 0.0)
+            ic_sign = float(np.sign(ic_val)) if abs(ic_val) > 1e-10 else 1.0
             factor_infos.append(FactorInfo(
                 name=name, expression=name,
                 ic=ic_val, icir=icir_val, ic_std=ic_std_val,
                 sharpe=sharpe_val, debate_score=dscore,
+                ic_sign=ic_sign,
             ))
 
-        # Fuse factors
-        self._composite_scores, fusion_meta = fusion.fuse(
-            factor_infos, factor_values_dict
-        )
-        
-        # Save fusion weights and object for step7 (out-of-sample application)
-        self.fusion_weights = fusion_meta["weights"]
-        self.fusion_obj = fusion
-        self.factor_infos = factor_infos  # Reuse in step7
+        # Save for step7 (which reads weights/signs from JSON, but still needs
+        # factor names to iterate over test_factor_dict)
+        self.factor_infos = factor_infos
 
-        print(f"  Fused {len(factor_infos)} factors")
+        # ── 4. Encode market state from TRAIN data (avoid lookahead) ──
+        market_state = None
+        try:
+            train_close = train_price.get('close')
+            if train_close is not None and isinstance(train_close, pd.DataFrame):
+                encoder = MarketStateEncoder()
+                market_state = encoder.encode(train_close)
+                print(f"  Market state (from TRAIN): {market_state.to_string()}")
+        except Exception as e:
+            print(f"  [warn] Could not encode market state: {e}")
+
+        # ── 5. Fuse: weights and scores from train data only ──
+        composite_scores, fusion_meta = fusion.fuse(
+            factor_infos,
+            train_factor_dict,
+            market_state=market_state,
+        )
+
+        print(f"  Fused {len(factor_infos)} factors (strategy={fusion.strategy})")
+        print(f"  Corr penalty (train-only): {fusion_meta.get('corr_penalty_applied', False)}")
+        print(f"  Regime tilt: {fusion_meta.get('regime_tilt_applied', False)}")
+        for fi in factor_infos:
+            w = fusion_meta["weights"].get(fi.name, 0.0)
+            s = fusion_meta.get("signs", {}).get(fi.name, 1.0)
+            print(f"    {fi.name:40s}  w={w:.4f}  sign={s:+.0f}  ic={fi.ic:+.4f}  icir={fi.icir:+.4f}")
 
         # --- Save fusion results to experiments/{yyyymmdd}/fusion/final_factors.json ---
         date_str = datetime.now().strftime("%Y%m%d")
         fusion_dir = os.path.join(date_str, "fusion")
         fusion_dir = config_path("experiments", fusion_dir)
         os.makedirs(fusion_dir, exist_ok=True)
-
-        # Build serializable composite scores (train-period, where fusion weights were determined)
-        # Filter to train dates if available
-        if hasattr(self, 'train_data') and self.train_data:
-            train_dates = self.train_data['price_data']['close'].index
-            _score_df = self._composite_scores.loc[train_dates.intersection(self._composite_scores.index)]
-        else:
-            _score_df = self._composite_scores
-
-        scores_serializable = {}
-        for dt, row in _score_df.iterrows():
-            date_key = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
-            stock_scores = {}
-            for stock, val in row.items():
-                if pd.notna(val):
-                    stock_scores[str(stock)] = float(val)
-            scores_serializable[date_key] = stock_scores
 
         # Build factor info list
         factor_details = []
@@ -775,29 +896,49 @@ class AAAI2027Pipeline:
                 "debate_score": getattr(fi, "debate_score", None),
             })
 
-        fusion_output = {
+        self.fusion_result = {
             "meta": fusion_meta,
-            "factors": factor_details,
-            "composite_scores": scores_serializable,
+            "factors": factor_details
         }
 
         fusion_path = os.path.join(fusion_dir, "final_factors.json")
         with open(fusion_path, "w", encoding="utf-8") as f:
-            json.dump(fusion_output, f, ensure_ascii=False, indent=2)
+            json.dump(self.fusion_result, f, ensure_ascii=False, indent=2)
 
         print(f"  Fusion results saved to {fusion_path}")
         print("  [✓] Factor fusion complete")
         
-    def step7_construct_portfolio(self):
+    def step7_construct_portfolio(self, fusion_result=None, test_data=None):
         """
-        Step 7: Construct portfolio from fused factors.
+        Step7: Construct portfolio from fused factors.
+
+        Uses the weights trained in step6 (via fuse() on train_data) and
+        applies them to test_data factor values via FactorFusion.predict().
+
+        Args:
+            test_data: Optional external test data dict with keys
+                      {'price_data': dict, 'fundamental_data': dict, 'industry_data': Series-like}.
+                      If None, uses self.test_data (from step1 split).
+                      This allows callers to supply a custom test period without
+                      re-running the entire pipeline.
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 7] Skipped: methods modules not available")
             return
         
         print("\n[Step 7] Constructing portfolio...")
-        
+
+        # --- Resolve test data: explicit arg > self.test_data ---
+        if test_data is not None:
+            _test = test_data
+            print("  Using externally provided test_data")
+        elif hasattr(self, 'test_data') and self.test_data:
+            _test = self.test_data
+            print("  Using self.test_data (from step1 split)")
+        else:
+            print("  [error] No test_data available. Pass test_data= or run step1 first.")
+            return
+
         # Initialize portfolio constructor
         portfolio_cfg = self.config['fusion']['portfolio']
         constructor = PortfolioConstructor(PortfolioConfig(
@@ -807,40 +948,78 @@ class AAAI2027Pipeline:
             max_industry_exposure=portfolio_cfg.get('max_industry_exposure', 0.30),
         ))
         
-        # --- Use TRAIN-determined weights to build TEST-period portfolios ---
-        # Correct out-of-sample evaluation:
-        # 1. Weights determined on train data (step6)
-        # 2. Apply to test data factor values → test-period composite scores
-        # 3. Build portfolios for test period
-        # 4. Backtest on test data (step8)
-
+        # --- Compute test-period composite scores using trained weights ---
+        # step6 called fuse() on train_data, saving weights to self.fusion_obj
+        # Now apply those weights to test_data factor values directly (no predict())
         if not hasattr(self, 'fusion_obj') or self.fusion_obj is None:
             print("  [error] fusion_obj not available. Run step6 first.")
             return
 
-        # 1. Calculate factor values on TEST data
-        if not hasattr(self, 'test_data') or not self.test_data:
-            print("  [error] test_data not available, cannot construct out-of-sample portfolios")
-            return
-        _test_price = self.test_data.get('price_data', {})
-        test_factor_dict = self._calculate_factor_values(price_data=_test_price)
-
-        # 2. Apply train-determined weights to test data factor values
-        if not hasattr(self, 'factor_infos'):
-            print("  [error] factor_infos not available (step6 not run?). Run step6 first.")
-            return
-        test_composite_scores, _ = self.fusion_obj.fuse(
-            self.factor_infos, test_factor_dict,
-            precomputed_weights=self.fusion_weights
+        # 1. Compute factor values on test data
+        print("  Computing test-period factor values...")
+        test_price = _test.get('price_data', {})
+        test_fund = _test.get('fundamental_data', None)
+        test_factor_dict = self._calculate_factor_values(
+            price_data=test_price,
+            fundamental_data=test_fund,
         )
-        self._composite_scores = test_composite_scores  # Update to test-period scores
 
-        # 3. Build portfolios for test period
-        close_copy = self.test_data['price_data']['close'].copy()
+        # 2. 从 final_factors.json 加载训练好的权重和符号
+        if fusion_result is None:
+            fusion_result = self.fusion_result
+        meta = fusion_result['meta']
+        saved_weights = meta['weights']
+        saved_signs  = meta.get('signs', {})
+
+        # normalizer 是无状态的（横截面标准化）
+        normalizer = FactorNormalizer(method="zscore")
+
+        if not saved_weights:
+            print("  [error] No saved weights. Run step6 first.")
+            return
+
+        _industry = _test.get('industry_data', None)
+
+        # 2a. 找所有因子值的公共日期
+        common_dates = None
+        for f in self.factor_infos:
+            fv = test_factor_dict[f.name]
+            if common_dates is None:
+                common_dates = fv.index
+            else:
+                common_dates = common_dates.intersection(fv.index)
+
+        if common_dates is None or len(common_dates) == 0:
+            print("  [error] No common dates in test factor values")
+            return
+
+        # 2b. Sign-Aware 加权求和: Σ w_i * sign_i * normalize(factor_i)
+        weighted = None
+        for f in self.factor_infos:
+            fv = test_factor_dict[f.name].loc[common_dates]
+            fv_norm = normalizer.normalize(fv, _industry)
+            w = saved_weights.get(f.name, 0.0)
+            s = saved_signs.get(f.name, 1.0)
+            fv_weighted = fv_norm * w * s
+            if weighted is None:
+                weighted = fv_weighted
+            else:
+                weighted = weighted.add(fv_weighted, fill_value=0)
+
+        test_composite_scores = normalizer.normalize(weighted, _industry)
+
+        if test_composite_scores.empty:
+            print("  [error] Computed composite scores are empty")
+            return
+
+        print(f"  Test-period composite scores: {len(test_composite_scores)} dates")
+
+        # Build portfolios for test period
+        close_copy = _test['price_data']['close'].copy()
         raw_portfolios = constructor.build(
-            composite_scores=self._composite_scores,
+            composite_scores=test_composite_scores,
             prices=close_copy,
-            industry=self.industry_data,
+            industry=_industry,
         )
 
         # Convert list[Portfolio] to DataFrame (n_dates x n_stocks) for backtester
@@ -851,15 +1030,36 @@ class AAAI2027Pipeline:
         self.portfolios.index = pd.to_datetime(self.portfolios.index)
         self.portfolios = self.portfolios.fillna(0.0)
 
-        print(f"  Constructed {len(self.portfolios)} portfolios (test period)")
+        # Align portfolios to actual trading days (same index as test close prices)
+        trading_days = _test['price_data']['close'].index
+        self.portfolios = self.portfolios.reindex(trading_days.intersection(self.portfolios.index))
+        # Fill any missing dates with previous weights (hold positions on skipped dates)
+        self.portfolios = self.portfolios.ffill().fillna(0.0)
+
+        print(f"  Constructed {len(self.portfolios)} portfolios (test period, trading days only)")
         print("  [✓] Portfolio construction complete")
-        
-    def step8_backtest(self):
+
+    def step8_backtest(self, test_data=None):
         """
         Step 8: Backtest the portfolio strategy.
         """
         print("\n[Step 8] Backtesting...")
-        
+
+        # --- Resolve test data: explicit arg > self.test_data ---
+        if test_data is not None:
+            _test = test_data
+        elif hasattr(self, 'test_data') and self.test_data:
+            _test = self.test_data
+        else:
+            print("  [error] No test_data available for backtest.")
+            self.performance_metrics = {
+                'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+                'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+                'n_trading_days': 0,
+            }
+            return
+
         if self.portfolios is None:
             print("  Error: No portfolios constructed. Run step7 first.")
             self.performance_metrics = {
@@ -874,10 +1074,10 @@ class AAAI2027Pipeline:
         # Critical: this must use test_data, NOT the full price_data
         self.performance_metrics = self.backtest_engine.run(
             portfolios=self.portfolios,
-            prices=self.test_data['price_data']['close'],
+            prices=_test['price_data']['close'],
         )
         
-        print(f"\n  [backtest] Out-of-sample results (test period: {self._test_start_date})")
+        print(f"\n  [backtest] Out-of-sample results (test period: {getattr(self, '_test_start_date', 'unknown')})")
         for key, value in self.performance_metrics.items():
             if isinstance(value, float):
                 print(f"    {key}: {value:.4f}")
@@ -941,6 +1141,8 @@ class AAAI2027Pipeline:
         split_train_end: str = None,
         split_test_start: str = None,
         forward_period: int = None,
+        holding_period: int = None,
+        test_data=None,
     ):
         """
         Run the full end-to-end pipeline.
@@ -958,11 +1160,20 @@ class AAAI2027Pipeline:
             split_train_end: Explicit train end date for train/test split
             split_test_start: Explicit test start date for train/test split
             forward_period: Forward return horizon in trading days (None → config or 20)
+            holding_period: Backtest holding period in trading days.
+                           1 = daily rebalance, 5 = weekly, 20 = monthly.
+                           None → use config or default 1.
+            test_data: Optional external test data dict to use in step7/step8.
+                       If provided, overrides self.test_data from step1 split.
         """
         print("\n" + "=" * 60)
         data_label = "SAMPLE DATA (fast test)" if use_sample else "REAL DATA"
         print(f"  Running Full Pipeline — {data_label}")
         print("=" * 60)
+
+        # Apply CLI overrides to config before step1 (so BacktestEngine picks them up)
+        if holding_period is not None:
+            self.config.setdefault('backtest', {}).setdefault('trading', {})['holding_period'] = holding_period
 
         # Run all steps
         self.step1_load_data(
@@ -975,20 +1186,25 @@ class AAAI2027Pipeline:
         self.step2_initialize_memory()
         self.step3_generate_factors()
         self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
-        self.step5_evaluate_factors()
-        self.step5b_retrieve_from_memory()
-        self.step5c_chair_synthesis()
+        self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
+        self.step5_evaluate_factors()        # debate ALL candidates (incl. memory factors)
+        self.step5b_chair_synthesis()     # Chair synthesis (step 5b)
         self.step6_fuse_factors()
-        self.step7_construct_portfolio()
-        self.step8_backtest()
+        self.step7_construct_portfolio(test_data=test_data)
+        self.step8_backtest(test_data=test_data)
         self.step9_save_results(output_dir)
 
         # If portfolios are still None after full pipeline, generate fallback
         if self.portfolios is None:
             print("\n[Fallback] No portfolios constructed, generating random ones...")
-            n_dates = min(100, len(self.price_data['close']))
             n_stocks = min(50, self.price_data['close'].shape[1])
-            dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
+            # Use actual trading days from test_data (or price_data fallback)
+            if hasattr(self, 'test_data') and self.test_data:
+                _trading_days = self.test_data['price_data']['close'].index
+            else:
+                _trading_days = self.price_data['close'].index
+            n_dates = min(100, len(_trading_days))
+            dates = _trading_days[:n_dates]
             stock_codes = self.price_data['close'].columns[:n_stocks]
 
             self.portfolios = pd.DataFrame(
@@ -996,14 +1212,7 @@ class AAAI2027Pipeline:
                 index=dates,
                 columns=stock_codes,
             )
-            self.step8_backtest()
-            
-            self.portfolios = pd.DataFrame(
-                np.random.dirichlet(np.ones(n_stocks), size=n_dates),
-                index=dates,
-                columns=stock_codes,
-            )
-            self.step8_backtest()
+            self.step8_backtest(test_data=test_data)
         
         print("\n" + "=" * 60)
         print("  Pipeline Complete!")
@@ -1011,25 +1220,41 @@ class AAAI2027Pipeline:
         
         return self.performance_metrics
     
-    def _calculate_factor_values(self, price_data: Optional[Dict] = None) -> pd.DataFrame:
+    def _calculate_factor_values(
+        self,
+        price_data: Optional[Dict] = None,
+        fundamental_data: Optional[Dict] = None,
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Calculate factor values for all stocks from REAL price/volume data.
+        Calculate factor values for all stocks by evaluating each factor's DSL expression.
+
+        Uses the same _FactorExprEvaluator (recursive-descent parser) that FactorBacktester
+        uses during evolution, so the computed values are the REAL factor values defined by
+        the expression — not keyword-matched proxies.
 
         Parameters
         ----------
         price_data : dict, optional
             If provided, use this instead of self.price_data.
-            Callers should pass train_data['price_data'] for step6 (fusion weight
-            determination, in-sample), or test_data['price_data'] for true
-            out-of-sample evaluation (though step8 handles that separately).
-            If None, falls back to self.price_data (backward compatible).
+            Callers should pass train_data['price_data'] for weight computation,
+            or self.price_data (full data) for composite score generation.
+        fundamental_data : dict, optional
+            If provided, use this instead of self.fundamental_data.
+            Callers should pass train_data['fundamental_data'] when computing
+            factor values on train-period data, to avoid using future fundamental
+            values in the weight computation.
 
-        Returns:
-            dict[str, DataFrame]: each DataFrame is (n_dates, n_stocks), indexed by date.
+        Returns
+        -------
+        dict[str, DataFrame]
+            Each value is a DataFrame of shape (n_dates, n_stocks) indexed by date.
         """
+        from methods.evolve import _FactorExprEvaluator
+
         _price_data = price_data if price_data is not None else self.price_data
         close = _price_data.get('close')
-        volume = _price_data.get('volume')
+
+        # ---- Fallback: no valid price data ----
         if close is None or not isinstance(close, pd.DataFrame):
             dates = pd.date_range('2024-01-01', periods=100, freq='B')
             stocks = [f'STOCK_{i:04d}' for i in range(100)]
@@ -1039,76 +1264,84 @@ class AAAI2027Pipeline:
                 )
             }
 
-        returns = close.pct_change().fillna(0.0)
+        # ---- Build unified data map for the expression evaluator ----
+        # Mirrors what FactorBacktester.__init__ does so expressions evaluate identically.
+        data_map: Dict[str, pd.DataFrame] = {}
+        for field in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            if field in _price_data and isinstance(_price_data[field], pd.DataFrame):
+                data_map[field] = _price_data[field]
+            else:
+                # Pad with NaN so expressions referencing missing fields degrade gracefully
+                data_map[field] = pd.DataFrame(
+                    np.nan, index=close.index, columns=close.columns
+                )
+        # Fundamental data (pe, pb, roe, market_cap, …)
+        # Use the explicit parameter if provided; otherwise fall back to self.fundamental_data.
+        # This allows callers to pass train-period fundamental data to avoid lookahead.
+        _fund = fundamental_data if fundamental_data is not None \
+            else (getattr(self, 'fundamental_data', {}) or {})
+        for key, df in _fund.items():
+            if isinstance(df, pd.DataFrame):
+                data_map[key] = df
+        # Derived fields
+        if 'close' in data_map and 'pe' in data_map:
+            pe_safe = data_map['pe'].replace(0, np.nan)
+            data_map['eps'] = data_map['close'] / pe_safe
+        # 1-day forward returns (used by some expressions that reference `forward_returns`)
+        data_map['forward_returns'] = close.pct_change(1).shift(-1)
 
-        # Use best_factors / generated_factors expressions if available
+        # ---- Factor list ----
         factors = getattr(self, 'best_factors', None)
-        if factors is None:
+        if not factors:
             factors = getattr(self, 'generated_factors', [])
 
+        factor_dict: Dict[str, pd.DataFrame] = {}
+
         if not factors:
-            # Default factor suite
-            factor_exprs = [
-                ('momentum_20d', returns.rolling(20).sum()),
-                ('mean_reversion_5d', -returns.rolling(5).sum()),
-                ('volatility_20d', -returns.rolling(20).std()),
-                ('volume_zscore', (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)),
-                ('momentum_5d', returns.rolling(5).sum()),
-                ('high_low_spread', (close / close.rolling(10).min() - 1.0).fillna(0.0)),
+            # ---- Default factor suite (no LLM factors available) ----
+            _ret = close.pct_change().fillna(0.0)
+            _vol = data_map['volume']
+            default_factors = [
+                ('momentum_20d',      _ret.rolling(20).sum()),
+                ('mean_reversion_5d', -_ret.rolling(5).sum()),
+                ('volatility_20d',    -_ret.rolling(20).std()),
+                ('volume_zscore',     (_vol / _vol.rolling(20).mean() - 1.0).fillna(0.0)),
+                ('momentum_5d',       _ret.rolling(5).sum()),
+                ('high_low_spread',   (close / close.rolling(10).min() - 1.0).fillna(0.0)),
             ]
+            for name, vals in default_factors:
+                factor_dict[name] = vals
         else:
-            # Parse expressions into actual computations (simplified)
-            factor_exprs = []
+            # ---- Evaluate each factor's DSL expression with the real parser ----
+            evaluator = _FactorExprEvaluator(data_map)
+            seen_exprs: Dict[str, int] = {}   # dedup: expression → count
+
             for f in factors:
-                expr = f['expression'] if isinstance(f, dict) else f.expression
-                expr_lower = expr.lower()
-                # 注意匹配顺序：先匹配长词，再匹配短词，避免子串误判
-                if 'momentum' in expr_lower or 'return' in expr_lower:
-                    factor_exprs.append((expr, returns.rolling(20).sum()))
-                elif 'volume' in expr_lower or '量' in expr:
-                    if volume is not None:
-                        factor_exprs.append((expr, (volume / volume.rolling(20).mean() - 1.0).fillna(0.0)))
-                    else:
-                        # volume 数据不可用，退回 random
-                        rng = np.random.RandomState(abs(hash(expr)) % (2**32))
-                        vals = pd.DataFrame(
-                            rng.randn(len(close), close.shape[1]),
-                            index=close.index, columns=close.columns,
-                        )
-                        factor_exprs.append((expr, vals))
-                elif 'vol' in expr_lower:
-                    # 必须在 'volume' 之后匹配，避免 'vol' 被 'volume' 子串误判
-                    factor_exprs.append((expr, -returns.rolling(20).std()))
-                else:
-                    # Default: random with seed from expr for reproducibility
-                    rng = np.random.RandomState(abs(hash(expr)) % (2**32))
-                    vals = pd.DataFrame(
+                expr = f['expression'] if isinstance(f, dict) else getattr(f, 'expression', '')
+                if not expr or not expr.strip():
+                    continue
+
+                # Deduplicate identical expressions by appending a suffix
+                count = seen_exprs.get(expr, 0)
+                seen_exprs[expr] = count + 1
+                factor_key = expr if count == 0 else f'{expr}__dup{count}'
+
+                try:
+                    # Reset parser state for each expression (evaluator is stateful)
+                    evaluator._tokens = []
+                    evaluator._pos = 0
+                    vals = evaluator.evaluate(expr)
+                    factor_dict[factor_key] = vals
+                except Exception as e:
+                    print(f"  [warn] Factor expression eval failed ({expr!r}): {e}")
+                    # Deterministic random fallback — keeps pipeline alive,
+                    # but with a clearly low IC so the fusion stage down-weights it.
+                    rng = np.random.RandomState(abs(hash(expr)) % (2 ** 32))
+                    factor_dict[factor_key] = pd.DataFrame(
                         rng.randn(len(close), close.shape[1]),
-                        index=close.index, columns=close.columns,
+                        index=close.index,
+                        columns=close.columns,
                     )
-                    factor_exprs.append((expr, vals))
-
-        # Build DataFrame: each column is a factor, each row is a (date, stock) pair
-        # Actually, we want: index=date, columns=stocks, values=factor_value
-        # But we have multiple factors. Let's return a dict of DataFrames, one per factor.
-        # Wait - the caller expects a DataFrame of shape (n_stocks, n_factors).
-        # But for time-series, it should be (n_dates, n_stocks) per factor.
-
-        # For the fuse() method, we need dict[str, DataFrame] where each DataFrame is (n_dates, n_stocks)
-        # Let's return a dict instead of a single DataFrame.
-
-        # Actually, looking at the caller in step6:
-        #   factor_values_dict[name] = full_values   # (n_dates, n_stocks) DataFrame
-        # So _calculate_factor_values should return a DataFrame of shape (n_stocks, n_factors) [cross-section]
-        # and the caller will expand it to (n_dates, n_stocks) per factor.
-
-        # BUT that doesn't make sense for real factors that vary over time!
-        # Let's change the return format to be a dict of (n_dates, n_stocks) DataFrames.
-
-        # Actually, the simplest fix: return a dict of DataFrames, one per factor.
-        factor_dict = {}
-        for name, values in factor_exprs:
-            factor_dict[name] = values
 
         # For backward compatibility, also store as attribute
         self._factor_dict = factor_dict
@@ -1133,11 +1366,12 @@ def run_demo():
     print("\n[Demo] Skipping LLM-dependent steps (Steps 2-7)")
     print("[Demo] Running backtest with random portfolios...")
     
-    # Generate random portfolios for demo
-    n_dates = 100
-    n_stocks = 50
-    dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
-    stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
+    # Generate random portfolios for demo — use actual trading days from price_data
+    n_stocks = min(50, pipeline.price_data['close'].shape[1])
+    _trading_days = pipeline.price_data['close'].index
+    n_dates = min(100, len(_trading_days))
+    dates = _trading_days[:n_dates]
+    stock_codes = pipeline.price_data['close'].columns[:n_stocks]
     
     portfolios = pd.DataFrame(
         np.random.dirichlet(np.ones(n_stocks), size=n_dates),
@@ -1170,7 +1404,6 @@ Examples:
   python main.py --full                                   Full pipeline with sample data
   python main.py --full --real                            Full pipeline with real data
   python main.py --full --real --source westock            Real data via westock (WorkBuddy)
-  python main.py --full --real --source qlib                Real data via Qlib (.bin format)
   python main.py --full --real --start 2023-01-01 --end 2024-12-31
   python main.py --full --real --force-refresh             Skip cache, re-download
         """,
@@ -1190,8 +1423,8 @@ Examples:
     )
     parser.add_argument(
         '--source', type=str, default='auto',
-        choices=['auto', 'westock', 'akshare', 'tushare', 'qlib'],
-        help='Real data source: auto (try westock→qlib→akshare→tushare), westock, qlib, akshare, tushare (default: auto)',
+        choices=['auto', 'westock', 'akshare', 'tushare'],
+        help='Real data source: auto (try westock→akshare→tushare), westock, akshare, tushare (default: auto)',
     )
     parser.add_argument(
         '--force-refresh', action='store_true', default=False,
@@ -1223,6 +1456,10 @@ Examples:
         help='Forward return horizon in trading days (None → config or 20)',
     )
     parser.add_argument(
+        '--holding-period', type=int, default=None,
+        help='Backtest holding period in trading days: 1=daily rebalance (default), 5=weekly, 20=monthly',
+    )
+    parser.add_argument(
         '--n-best-factors', type=int, default=None,
         help='Override evolution.n_best_factors (default: use config value)',
     )
@@ -1234,11 +1471,6 @@ Examples:
         '--config', type=str, default='config/config.yaml',
         help='Path to configuration file (default: config/config.yaml)',
     )
-    parser.add_argument(
-        '--qlib-backtest', action='store_true', default=False,
-        help='Use Qlib professional backtesting engine for factor evaluation (requires: pip install qlib)',
-    )
-
     args = parser.parse_args()
 
     if args.full:
@@ -1252,8 +1484,6 @@ Examples:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
             pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
-        if args.qlib_backtest:
-            pipeline.config['backtest']['qlib']['enable'] = True
         
         metrics = pipeline.run_full_pipeline(
             start_date=args.start,
@@ -1263,6 +1493,7 @@ Examples:
             n_evolution_rounds=args.n_evolution_rounds,
             output_dir=args.output_dir,
             forward_period=args.forward_period,
+            holding_period=args.holding_period,
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")

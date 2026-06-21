@@ -33,6 +33,7 @@ class BacktestEngine:
         slippage: float = 0.001,
         benchmark: str = 'hs300',
         risk_free_rate: float = 0.0,
+        holding_period: int = 1,
     ):
         """
         Initialize backtest engine.
@@ -42,11 +43,15 @@ class BacktestEngine:
             slippage: Slippage rate (default: 0.1%)
             benchmark: Benchmark index name
             risk_free_rate: Annualized risk-free rate for Sharpe ratio (default: 0.0)
+            holding_period: Number of trading days to hold positions before rebalancing.
+                           1 = daily rebalance (T+1), 5 = weekly, 20 = monthly.
+                           On non-rebalance days, positions drift with price changes.
         """
         self.commission = commission
         self.slippage = slippage
         self.benchmark = benchmark
         self.risk_free_rate = risk_free_rate
+        self.holding_period = holding_period
         
         # Performance tracking
         self.portfolio_values = []
@@ -59,6 +64,7 @@ class BacktestEngine:
         portfolios: pd.DataFrame,
         prices: pd.DataFrame,
         market_cap: Optional[pd.DataFrame] = None,
+        holding_period: Optional[int] = None,
     ) -> Dict:
         """
         Run backtest simulation.
@@ -67,11 +73,20 @@ class BacktestEngine:
             portfolios: DataFrame of portfolio weights (n_dates x n_stocks)
             prices: DataFrame of stock prices (n_dates x n_stocks)
             market_cap: DataFrame of market capitalization (optional)
+            holding_period: Number of days between rebalances.
+                            None → use self.holding_period (default: 1 = daily).
+                            5 = weekly, 20 = monthly.
+                            On non-rebalance days, positions drift with price changes;
+                            no transaction costs are incurred.
             
         Returns:
             Dict with performance metrics
         """
-        print("Running backtest...")
+        # Resolve holding_period
+        hp = holding_period if holding_period is not None else self.holding_period
+        hp = max(1, hp)  # Minimum 1 day
+        
+        print(f"Running backtest (holding_period={hp}d)...")
         
         # Align dates
         common_dates = portfolios.index.intersection(prices.index)
@@ -93,33 +108,54 @@ class BacktestEngine:
         turnovers = []
         
         prev_weights = None
+        n_rebalances = 0
         
         for i, date in enumerate(common_dates):
-            # Current portfolio weights
-            weights = portfolios.loc[date]
-            weights = weights / weights.sum()  # Normalize to sum = 1
+            # --- Determine if this is a rebalance date ---
+            is_rebalance = (i % hp == 0)
             
-            # Calculate turnover (if not first period)
-            if prev_weights is not None:
-                turnover = np.sum(np.abs(weights - prev_weights)) / 2
-                turnovers.append(turnover)
+            if is_rebalance:
+                # Use the pre-computed portfolio weights
+                target_weights = portfolios.loc[date]
+                target_weights = target_weights / target_weights.sum()
                 
-                # Apply transaction costs
-                transaction_cost = turnover * (self.commission + self.slippage)
-                portfolio_value *= (1 - transaction_cost)
+                # Calculate turnover vs previous holdings
+                if prev_weights is not None:
+                    turnover = np.sum(np.abs(target_weights - prev_weights)) / 2
+                    turnovers.append(turnover)
+                    transaction_cost = turnover * (self.commission + self.slippage)
+                    portfolio_value *= (1 - transaction_cost)
+                
+                current_weights = target_weights
+                n_rebalances += 1
+            else:
+                # Hold: drift previous weights by today's price change
+                if prev_weights is not None and i > 0:
+                    prev_date = common_dates[i - 1]
+                    price_ratio = prices.loc[date] / prices.loc[prev_date]
+                    current_weights = prev_weights * price_ratio
+                    current_weights = current_weights.fillna(0.0)
+                    w_sum = current_weights.sum()
+                    current_weights = current_weights / w_sum if w_sum > 0 else current_weights
+                else:
+                    # First date fallback (should not reach here with hp >= 1)
+                    current_weights = portfolios.loc[date]
+                    current_weights = current_weights / current_weights.sum()
             
-            # Calculate daily return
+            # Calculate next-day return (always computed, regardless of rebalance)
             if i < n_dates - 1:
                 next_date = common_dates[i + 1]
                 daily_returns_pct = prices.loc[next_date] / prices.loc[date] - 1
-                portfolio_return = np.sum(weights * daily_returns_pct)
+                portfolio_return = np.sum(current_weights * daily_returns_pct)
                 portfolio_value *= (1 + portfolio_return)
                 
                 daily_returns.append(portfolio_return)
                 portfolio_values.append(portfolio_value)
-                positions_list.append(weights)
+                positions_list.append(current_weights)
             
-            prev_weights = weights.copy()
+            prev_weights = current_weights.copy()
+        
+        print(f"  Rebalanced {n_rebalances} times over {n_dates} trading days")
         
         # Convert to Series
         # portfolio_values has n_dates entries (initial 1.0 + n_dates-1 daily updates)
@@ -152,65 +188,6 @@ class BacktestEngine:
         
         return metrics
     
-    def run_qlib(
-        self,
-        factor_values: pd.DataFrame,
-        start_time: str,
-        end_time: str,
-        provider_uri: Optional[str] = None,
-        topk: Optional[int] = None,
-        **kwargs,
-    ) -> Dict:
-        """
-        Run backtest using Qlib's professional framework.
-
-        This delegates to QlibBacktester for a full portfolio simulation
-        with realistic signal delay, trading costs, and risk controls.
-
-        Args:
-            factor_values: DataFrame of factor values (dates × Qlib-format stock codes)
-            start_time: Backtest start date (YYYY-MM-DD)
-            end_time: Backtest end date (YYYY-MM-DD)
-            provider_uri: Qlib data path (default from config or ~/.qlib/qlib_data/cn_data)
-            topk: Number of stocks in portfolio (default 50)
-            **kwargs: Passed to QlibBacktester constructor
-
-        Returns:
-            Dict of performance metrics compatible with run() output
-        """
-        from .qlib_backtester import QlibBacktester
-
-        bt_kwargs = {
-            'commission': self.commission,
-            'slippage': self.slippage,
-        }
-        if provider_uri:
-            bt_kwargs['provider_uri'] = provider_uri
-        if topk:
-            bt_kwargs['topk'] = topk
-        bt_kwargs.update(kwargs)
-
-        qlib_bt = QlibBacktester(**bt_kwargs)
-        result = qlib_bt.run(factor_values, start_time, end_time)
-
-        # Store results in engine state for compatibility
-        self.qlib_metrics = result
-
-        # Map to our standard metric names where possible
-        mapped = {
-            'total_return': result.get('total_return', 0),
-            'annual_return': result.get('annual_return', 0),
-            'annual_volatility': result.get('annual_volatility', 0),
-            'sharpe_ratio': result.get('sharpe', 0),
-            'max_drawdown': result.get('max_drawdown', 0),
-            'calmar_ratio': result.get('calmar_ratio', 0),
-            'information_ratio': result.get('information_ratio', 0),
-            'win_rate': result.get('win_rate', 0.5),
-            'avg_turnover': result.get('turnover', 0),
-            'n_trading_days': 0,  # Qlib handles this internally
-        }
-        return mapped
-
     def _calculate_metrics(
         self,
         portfolio_values: pd.Series,
@@ -267,6 +244,10 @@ class BacktestEngine:
     def get_positions(self) -> List[pd.Series]:
         """Get position history."""
         return self.positions
+    
+    def get_turnovers(self) -> List[float]:
+        """Get turnover history."""
+        return self.turnovers
     
     def plot_performance(self, save_path: Optional[str] = None):
         """
