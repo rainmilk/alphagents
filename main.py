@@ -410,101 +410,6 @@ class AAAI2027Pipeline:
         print(f"  Best IC: {best_ic:.4f}")
         print("  [✓] Factor evolution complete")
 
-        def step4b_retrieve_from_memory(self):
-            """
-            Step 4b: Retrieve historical high-quality factors from memory bank.
-
-            Runs AFTER step4_evolve_factors but BEFORE step5_evaluate_factors so that
-            retrieved factors join the candidate pool and are debate-evaluated alongside
-            newly evolved factors. This ensures retrieved factors also receive a
-            debate_score for fusion.
-
-            Uses state-aware retrieval to find factors from memory that performed
-            well in similar market conditions, augmenting the evolved factor pool
-            with proven historical factors.
-
-            Retrieved factors are tagged with _from_memory=True so step5 will not
-            redundantly re-write them back to the memory bank.
-            """
-            if not METHODS_AVAILABLE:
-                print("\n[Step 4b] Skipped: methods modules not available")
-                return
-
-            if self.memory_bank is None or len(self.memory_bank) == 0:
-                print("\n[Step 4b] Skipped: memory bank is empty")
-                return
-
-            print("\n[Step 4b] Retrieving factors from memory (state-aware)...")
-
-            # Encode current market state using TRAIN data (not test data)
-            # This prevents data leak from test period
-            close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
-            # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
-            # Build market index proxy by cross-sectional mean
-            market_close = close_df.mean(axis=1)
-            market_df = pd.DataFrame({'close': market_close})
-            try:
-                current_state = self.market_encoder.encode(market_df)
-            except Exception as e:
-                print(f"  [warn] Market state encoding failed: {e}")
-                current_state = None
-
-            # Retrieve similar factors from memory
-            # Use best evolved factors as query (higher quality than raw seeds)
-            query_desc = "multi-factor stock selection using technical indicators"
-            query_expr = ""
-            query_source = self.best_factors if (
-                        hasattr(self, 'best_factors') and self.best_factors) else self.generated_factors
-            if query_source:
-                # Use the first factor as query
-                f = query_source[0]
-                if isinstance(f, dict):
-                    query_desc = f.get('description', query_desc)
-                    query_expr = f.get('expression', '')
-                else:
-                    query_desc = getattr(f, 'description', query_desc)
-                    query_expr = getattr(f, 'expression', '')
-
-            retrieved_factors = self.memory_bank.retrieve(
-                query_description=query_desc,
-                query_expression=query_expr,
-                current_market_state=current_state,
-                top_k=self.config['memory'].get('top_k', 5),
-            )
-
-            if retrieved_factors:
-                print(f"  Retrieved {len(retrieved_factors)} factors from memory")
-
-                # Merge retrieved factors into the factor pool
-                # Retrieved factors augment the best evolved factors
-                # Deduplicate by expression to avoid duplicates (step5b may be re-run)
-                existing_exprs = set()
-                if hasattr(self, 'best_factors') and self.best_factors:
-                    for f in self.best_factors:
-                        if isinstance(f, dict):
-                            expr = f.get('expression', '')
-                        else:
-                            expr = getattr(f, 'expression', '')
-                        if expr:
-                            existing_exprs.add(expr)
-
-                added = 0
-                if hasattr(self, 'best_factors') and self.best_factors:
-                    for rf in retrieved_factors:
-                        if rf.expression not in existing_exprs:
-                            # Mark as memory-sourced so step5 won't re-save it to memory bank
-                            rf._from_memory = True
-                            self.best_factors.append(rf)
-                            existing_exprs.add(rf.expression)
-                            added += 1
-
-                print(f"  Added {added} new factors from memory (skipped {len(retrieved_factors) - added} duplicates)")
-                print(f"  Factor pool size after merge: {len(self.best_factors)}")
-            else:
-                print("  No relevant factors found in memory")
-
-            print("  [✓] Memory retrieval complete")
-
     def step4b_retrieve_from_memory(self):
         """
         Step 4b: Retrieve historical high-quality factors from memory bank.
@@ -560,11 +465,14 @@ class AAAI2027Pipeline:
                 query_desc = getattr(f, 'description', query_desc)
                 query_expr = getattr(f, 'expression', '')
 
+        retrieval_cfg = self.config['memory'].get('retrieval', {})
         retrieved_factors = self.memory_bank.retrieve(
             query_description=query_desc,
             query_expression=query_expr,
             current_market_state=current_state,
-            top_k=self.config['memory'].get('top_k', 5),
+            top_k=retrieval_cfg.get('top_k', 5),
+            state_weight=retrieval_cfg.get('state_weight', 0.3),
+            min_ic=retrieval_cfg.get('min_ic', 0.02),
         )
 
         if retrieved_factors:
@@ -782,12 +690,18 @@ class AAAI2027Pipeline:
             print("  [error] train_data not available. Run step1 (load_data) first.")
             return
 
-        # Initialize fusion with strategy and hyperparameters from config
+        # Initialize fusion with strategy, normalizer and hyperparameters from config
         weighting_cfg = self.config['fusion']['weighting']
+        norm_cfg = self.config['fusion'].get('normalization', {})
+        normalizer = FactorNormalizer(
+            method=norm_cfg.get('method', 'zscore'),
+            neutralize_industry=norm_cfg.get('neutralize_industry', True),
+        )
         fusion = FactorFusion(
             strategy=weighting_cfg.get('strategy', 'icir2_shrinkage'),
             corr_penalty=weighting_cfg.get('corr_penalty', True),
             corr_threshold=weighting_cfg.get('corr_threshold', 0.7),
+            normalizer=normalizer,
             regime_tilt_strength=weighting_cfg.get('regime_tilt_strength', 0.2),
             shrinkage_kappa=weighting_cfg.get('shrinkage_kappa', 0.3),
             ipr_alpha=weighting_cfg.get('ipr_alpha', 2.0),
@@ -971,8 +885,12 @@ class AAAI2027Pipeline:
         saved_weights = meta['weights']
         saved_signs  = meta.get('signs', {})
 
-        # normalizer 是无状态的（横截面标准化）
-        normalizer = FactorNormalizer(method="zscore")
+        # normalizer 是无状态的（横截面标准化），参数从 config 读取
+        norm_cfg = self.config['fusion'].get('normalization', {})
+        normalizer = FactorNormalizer(
+            method=norm_cfg.get('method', 'zscore'),
+            neutralize_industry=norm_cfg.get('neutralize_industry', True),
+        )
 
         if not saved_weights:
             print("  [error] No saved weights. Run step6 first.")

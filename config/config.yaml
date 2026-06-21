@@ -1,10 +1,14 @@
-# AAAI 2027 LLM Multi-Factor Stock Selection Project
+# LLM Multi-Factor Stock Selection Project
 # Configuration File
+#
+# Active config keys are marked with [ACTIVE].
+# Keys marked [UNUSED] are defined here as reference/roadmap but
+# are not yet read by any code path — they have no runtime effect.
 
-# ==================== Data Configuration ====================
+# ==================== Data Configuration [ALL ACTIVE] ====================
 data:
-  # Data source
-  source: "tushare"  # or "akshare", "westock", "auto"
+  # Data source — loader supports westock, tushare, akshare, auto
+  source: "tushare"  # tushare | akshare | westock | auto
   tushare_token: "d83808e8ee98957fe38996678210faacda9f68d8c22574f38f572704"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
   
   # Stock universe
@@ -50,9 +54,9 @@ data:
     outlier_method: "winsorize"  # winsorize, clip, none
     outlier_threshold: 3.0  # sigma for clip, percentile for winsorize
 
-# ==================== LLM Configuration ====================
+# ==================== LLM Configuration [ALL ACTIVE] ====================
 llm:
-  # Factor generation
+  # Factor generation → used by step4_evolve_factors
   generator:
     model: "bailian/deepseek-v4-flash"
     base_url: "http://35.220.164.252:3888/v1"
@@ -60,135 +64,138 @@ llm:
     temperature: 0.7
     max_tokens: 2000
     
-  # Factor evaluation (debate)
+  # Multi-agent debate evaluation → used by step5_evaluate_factors
   evaluator:
     model: "bailian/deepseek-v4-flash"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.3
-    n_agents: 5
-    n_debate_rounds: 3
-    parallel_eval: true   # true = 5 agents evaluate concurrently (ThreadPoolExecutor); false = serial for debugging
+    n_agents: 5        # number of debate agents (higher = more diverse opinions)
+    n_debate_rounds: 3 # debate rounds per factor
+    parallel_eval: true  # true = concurrent eval via ThreadPoolExecutor; false = serial (debug)
 
-  # Chair Agent (仲裁 / 跨因子综合报告)
-  # 设计理念：5位专家用低成本模型（DeepSeek），主席用强推理模型（GPT-4o）
-  # 主席负责：分歧仲裁 + 所有因子的综合排名 + 入选/淘汰理由
+  # Chair Agent — synthesizes debate results into ranked cross-factor report
+  # Used by step5b_chair_synthesis (runs after step5_evaluate_factors)
   chair:
-    model: "bailian/deepseek-v4-flash"              # 理想: gpt-4o；当前使用与专家相同模型
+    model: "bailian/deepseek-v4-flash"   # 当前与专家 evaluator 共用相同模型
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.2  # 主席需要更确定性的输出
+    # 设计理念：专家用低成本模型做大量评估，主席做最终的跨因子综合排名
+    # 理想场景下 chair 应使用更强的推理模型（如 GPT-4o），当前出于成本考虑使用相同模型
     
 # ==================== Evolution Configuration ====================
 evolution:
-  forward_period: 20  # forward return horizon in trading days (factor evaluation)
-  n_seeds: 10  # number of candidate factors per round
-  n_best_factors: 10
-  n_improve: 10
-  n_mutate: 5
-  max_rounds: 15
-  convergence_delta: 0.003
-  convergence_window: 2
-  patience: 3
-  
-  # Quality threshold
-  min_ic: 0.02
-  min_sharpe: 0.5
-  max_drawdown: -0.20
+  # --- Active keys ---
+  forward_period: 20   # [ACTIVE] forward return horizon in trading days
+  n_seeds: 10          # [ACTIVE] number of candidate factors per round
+  n_best_factors: 10   # [ACTIVE] top-N factors to retain per round
+  max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
+
+  # --- Unused keys (defined as roadmap, no runtime effect) ---
+  n_improve: 10        # [UNUSED] improve count — hardcoded in FactorEvolver
+  n_mutate: 5          # [UNUSED] mutation count — hardcoded in FactorEvolver
+  convergence_delta: 0.003  # [UNUSED] hardcoded as literal in evolve.py
+  convergence_window: 2     # [UNUSED] not read by any code
+  patience: 3               # [UNUSED] not read by any code
+  min_ic: 0.02              # [UNUSED] quality threshold not wired (see memory.retrieval.min_ic instead)
+  min_sharpe: 0.5           # [UNUSED] not read by any code
+  max_drawdown: -0.20       # [UNUSED] not read by any code
 
 # ==================== Memory Bank Configuration ====================
 memory:
-  # Market state encoding
+  # Market state encoding → used by MarketEncoder (step1 init)
   market_state:
-    recent_days: 60    # recent data window for encoding current market state
-    vix_low: 15.0
-    vix_high: 25.0
-    ma_short: 20
-    ma_long: 60
-    corr_threshold_low: 0.3
-    corr_threshold_high: 0.6
+    recent_days: 60    # [ACTIVE] recent data window for encoding current market state
+    vix_low: 15.0      # [ACTIVE]
+    vix_high: 25.0     # [ACTIVE]
+    ma_short: 20       # [ACTIVE]
+    ma_long: 60        # [ACTIVE]
+    corr_threshold_low: 0.3   # [ACTIVE]
+    corr_threshold_high: 0.6  # [ACTIVE]
   
-  # Retrieval
+  # Retrieval → used by step4b_retrieve_from_memory
   retrieval:
-    top_k: 2
-    state_weight: 0.3
-    min_ic: 0.02
+    top_k: 2           # [ACTIVE] number of factors to retrieve from memory per query
+    state_weight: 0.3  # [ACTIVE] weight of market-state similarity vs semantic similarity
+    min_ic: 0.02       # [ACTIVE] minimum IC threshold to filter retrieved factors
     
-  # Update
+  # Update → used by MemoryBank.update_quality / _update_existing_factor
   update:
-    alpha: 0.3  # EMA decay
+    alpha: 0.3  # [UNUSED] EMA decay factor — currently hardcoded as 0.3 in memory.py
     
-  # Storage
+  # Storage → used by MemoryBank (step1 init)
   storage:
-    db_path: "data/memory_bank"
-    faiss_path: "data/memory_bank"
+    db_path: "data/memory_bank"     # [ACTIVE]
+    faiss_path: "data/memory_bank"  # [ACTIVE]
   
-  # Embedder
+  # Embedder → used by FactorEmbedder (step1 init)
   encoder:
-    model: "all-MiniLM-L12-v2"
-    device: "cuda"
+    model: "all-MiniLM-L12-v2"  # [ACTIVE] sentence-transformers model for factor embedding
+    device: "cuda"              # [ACTIVE] cuda | cpu
 
-# ==================== Fusion Configuration ====================
+# ==================== Fusion Configuration [ALL ACTIVE] ====================
 fusion:
-  # Normalization
+  # Normalization → used by FactorNormalizer in step6 (FactorFusion) and step7 (portfolio)
   normalization:
-    method: "zscore"  # zscore, rank, minmax
-    neutralize_industry: true
-    
-  # Weighting strategy
+    method: "zscore"  # zscore | rank | minmax
+    neutralize_industry: true  # cross-sectional industry-dummy residualization
+
+  # Weighting strategy → used by FactorFusion in step6_fuse_factors
   weighting:
-    strategy: "icir2_shrinkage"  # equal, ic_weighted, icir_weighted, decay_weighted, icir2_shrinkage
-    corr_penalty: true
-    corr_threshold: 0.7
+    strategy: "icir2_shrinkage"  # equal | ic_weighted | icir_weighted | decay_weighted | icir2_shrinkage
+    corr_penalty: true           # whether to apply correlation-based redundancy penalty
+    corr_threshold: 0.7          # correlation threshold for redundancy detection
     # ICIR² shrinkage hyperparameters (for icir2_shrinkage strategy)
-    regime_tilt_strength: 0.2   # regime tilt magnitude (0=disabled, 0.2=moderate, 0.5=aggressive)
-    shrinkage_kappa: 0.3        # debate prior confidence [0,1] (0=no prior, 1=full prior)
-    ipr_alpha: 2.0              # IPR penalty sensitivity (higher=more aggressive redundancy penalty)
-    
-  # Portfolio construction
+    regime_tilt_strength: 0.2    # regime tilt magnitude (0=disabled, 0.2=moderate, 0.5=aggressive)
+    shrinkage_kappa: 0.3         # debate prior confidence [0,1] (0=no prior, 1=full prior)
+    ipr_alpha: 2.0               # IPR penalty sensitivity (higher = more aggressive redundancy penalty)
+
+  # Portfolio construction → used by step7_construct_portfolio
   portfolio:
-    top_n: 50
-    method: "score_proportional"  # top_n, score_proportional
-    max_weight: 0.05
-    max_industry_exposure: 0.30
-    min_market_cap_percentile: 10
+    top_n: 50                     # number of stocks to hold
+    method: "score_proportional"  # top_n | score_proportional
+    max_weight: 0.05              # single-stock weight cap
+    max_industry_exposure: 0.30   # single-industry weight cap
+    min_market_cap_percentile: 10 # exclude bottom percentile by market cap
 
 # ==================== Backtest Configuration ====================
 backtest:
-  # Trading
+  # Trading → used by BacktestEngine (step8_backtest)
   trading:
-    frequency: "daily"  # daily, weekly, monthly
-    commission: 0.0003  # 0.03%
-    slippage: 0.001  # 0.1%
-    min_holding_days: 1
-    holding_period: 1  # Days between rebalances: 1=daily, 5=weekly, 20=monthly
-    
-  # Rebalancing
+    commission: 0.0003     # [ACTIVE] 0.03% per trade
+    slippage: 0.001        # [ACTIVE] 0.1% per trade
+    holding_period: 1      # [ACTIVE] days between rebalances: 1=daily, 5=weekly, 20=monthly
+
+    # --- Unused keys ---
+    frequency: "daily"     # [UNUSED] rebalance is controlled solely by holding_period above
+    min_holding_days: 1    # [UNUSED] not read by any code
+
+  # Rebalancing → entire section is unused; holding_period (above) is the sole control
   rebalance:
-    frequency: "weekly"  # daily, weekly, monthly
-    lookback_window: 20  # trading days
-    
+    frequency: "weekly"       # [UNUSED]
+    lookback_window: 20       # [UNUSED]
+
   # Benchmark
   benchmark:
-    name: "hs300"
+    name: "hs300"          # [UNUSED] benchmark is passed directly as a constructor argument
 
-# ==================== Experiment Configuration ====================
+# ==================== Experiment Configuration [UNUSED — future roadmap] ====================
+# This section is defined as a placeholder for planned cross-validation / baseline
+# comparison features. No code reads these keys at runtime.
 experiment:
-  # Cross-validation
   cv:
     method: "rolling"  # rolling, expanding, kfold
     n_splits: 5
     train_window: 252  # trading days
     test_window: 63  # trading days
     
-  # Baselines
   baselines:
     - "equal_weight"
     - "ic_weighted"
     - "alpha_grail"
     - "gpt_factor"
     
-  # Metrics
   metrics:
     - "annual_return"
     - "sharpe_ratio"
@@ -197,22 +204,21 @@ experiment:
     - "calmar_ratio"
     - "win_rate"
 
-# ==================== Logging Configuration ====================
+# ==================== Logging Configuration [UNUSED — future roadmap] ====================
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR
   save_dir: "logs"
   save_frequency: 10  # save every N rounds
 
-# ==================== Output Configuration ====================
+# ==================== Output Configuration [UNUSED — future roadmap] ====================
+# Output paths are currently hardcoded as experiments/{YYYYMMDD}/ in the code.
+# These keys are placeholders for future config-driven output routing.
 output:
-  # Results
   results_dir: "experiments/results"
-  
-  # Paper
   paper_dir: "paper"
   figures_dir: "paper/figures"
   
-  # Feishu sync
+  # Feishu sync — planned feature, not yet implemented
   feishu:
     enable: true
     doc_ids:
