@@ -1641,31 +1641,40 @@ class DataLoader:
         method: str = 'chronological',
         train_end_date: str = None,
         test_start_date: str = None,
+        context_days: int = 30,
     ) -> Tuple[Dict, Dict]:
         """
         Split ALL loaded data into train and test sets.
-        
+
         This splits the full price_data dict (all columns: open/high/low/close/volume/amount),
         fundamental_data, and industry_data — NOT just close prices.
-        
+
+        **Context window**: To compute factor values (e.g. rolling means) on the first
+        few test dates, test_data is prepended with `context_days` of training data.
+        The logical test boundary is unchanged; the context window is metadata only.
+        Callers should filter results to dates >= test_start_date.
+
         Args:
             test_ratio: Ratio of test data (used only when train_end_date is not given)
             method: Split method ('chronological', 'rolling')
             train_end_date: Explicit train/test split date (YYYY-MM-DD).
                          If given, overrides test_ratio.
             test_start_date: Explicit test start date. If None, derived from train_end_date.
-            
+            context_days: Number of trading days from end of training to prepend as context
+                         for factor calculation. Default 30 (covers typical rolling windows).
+
         Returns:
             Tuple of (train_data_dict, test_data_dict)
-            Each dict has keys: 'price_data', 'fundamental_data', 'industry_data'
+            Each dict has keys: 'price_data', 'fundamental_data', 'industry_data',
+            and a '_meta' key with context info.
         """
         if self.price_data is None:
             raise ValueError("Price data not loaded. Call load_data() first.")
-        
+
         close_prices = self.price_data['close']
         n_days = len(close_prices)
         dates = close_prices.index
-        
+
         # --- Determine split index ---
         if train_end_date is not None:
             # Use explicit date boundary
@@ -1677,14 +1686,23 @@ class DataLoader:
                 raise ValueError(f"train_end_date {train_end_date} is before the first date {dates[0]}")
         else:
             split_idx = int(n_days * (1 - test_ratio))
-        
+
+        # --- Determine context start index ---
+        # test_data includes context_days from end of training so factor
+        # expressions with rolling/ts_* functions have enough history
+        context_start = max(0, split_idx - context_days)
+        if context_start < split_idx:
+            context_dates = dates[context_start:split_idx]
+        else:
+            context_dates = pd.DatetimeIndex([])
+
         # --- Split price_data (ALL columns) ---
         train_price = {}
         test_price = {}
         for col in self.price_data:
             train_price[col] = self.price_data[col].iloc[:split_idx]
-            test_price[col] = self.price_data[col].iloc[split_idx:]
-        
+            test_price[col] = self.price_data[col].iloc[context_start:]  # includes context
+
         # --- Split fundamental_data (all keys) ---
         train_fund = {}
         test_fund = {}
@@ -1692,8 +1710,8 @@ class DataLoader:
             for key in self.fundamental_data:
                 df = self.fundamental_data[key]
                 train_fund[key] = df.iloc[:split_idx]
-                test_fund[key] = df.iloc[split_idx:]
-        
+                test_fund[key] = df.iloc[context_start:]  # includes context
+
         # --- Split industry_data (Series) ---
         train_industry = None
         test_industry = None
@@ -1702,7 +1720,7 @@ class DataLoader:
             # It's cross-sectional, not time-series — use the latest available for both
             train_industry = self.industry_data
             test_industry = self.industry_data
-        
+
         train_data = {
             'price_data': train_price,
             'fundamental_data': train_fund,
@@ -1712,11 +1730,26 @@ class DataLoader:
             'price_data': test_price,
             'fundamental_data': test_fund,
             'industry_data': test_industry,
+            # Metadata: the REAL test period boundary, used to crop results
+            '_meta': {
+                'context_days': context_days,
+                'context_start_idx': int(context_start),
+                'test_start_idx': int(split_idx),
+                'test_start_date': test_start_date if test_start_date is not None
+                                  else (str(dates[split_idx].date()) if split_idx < n_days else None),
+            },
         }
-        
-        print(f"  [split] Train: {train_price['close'].index[0].date()} ~ {train_price['close'].index[-1].date()} ({len(train_price['close'])} days)")
-        print(f"  [split] Test:  {test_price['close'].index[0].date()} ~ {test_price['close'].index[-1].date()} ({len(test_price['close'])} days)")
-        
+
+        train_n = len(train_price['close'])
+        test_n = len(test_price['close'])
+        ctx_n = len(context_dates)
+        print(f"  [split] Train: {train_price['close'].index[0].date()} ~ {train_price['close'].index[-1].date()} ({train_n} days)")
+        if ctx_n > 0:
+            print(f"  [split] Test:  {test_price['close'].index[0].date()} ~ {test_price['close'].index[-1].date()} ({test_n} days, incl. {ctx_n}d context)")
+        else:
+            print(f"  [split] Test:  {test_price['close'].index[0].date()} ~ {test_price['close'].index[-1].date()} ({test_n} days, no context)")
+        print(f"  [split] Real test boundary: {test_data['_meta']['test_start_date']}")
+
         return train_data, test_data
 
 

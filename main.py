@@ -179,12 +179,17 @@ class AAAI2027Pipeline:
         else:
             print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
         
+        # Context days: prepend N training days to test_data so rolling-window
+        # factor expressions (ts_mean, ts_std, etc.) have history on day 1.
+        context_days = self.config.get('data', {}).get('context_days', 30)
         self.train_data, self.test_data = self.data_loader.split_data(
             train_end_date=train_end_date,
             test_start_date=test_start_date,
+            context_days=context_days,
         )
         self._train_end_date = train_end_date
         self._test_start_date = test_start_date
+        self._context_days = context_days
         
         # --- Save train/test data to data directory ---
         self._save_split_data(train_end_date, test_start_date)
@@ -956,6 +961,19 @@ class AAAI2027Pipeline:
         # Fill any missing dates with previous weights (hold positions on skipped dates)
         self.portfolios = self.portfolios.ffill().fillna(0.0)
 
+        # Crop context window: portfolios built on context dates are invalid for backtest.
+        # The real test period starts at _test_start_date (or inferred from test_data._meta).
+        test_start = self._test_start_date
+        if test_start is None and '_meta' in _test:
+            test_start = _test['_meta'].get('test_start_date')
+        if test_start is not None:
+            test_start_ts = pd.Timestamp(test_start)
+            n_before = len(self.portfolios)
+            self.portfolios = self.portfolios[self.portfolios.index >= test_start_ts]
+            n_cropped = n_before - len(self.portfolios)
+            if n_cropped > 0:
+                print(f"  Cropped {n_cropped} context dates (test data starts {test_start_ts.date()})")
+
         print(f"  Constructed {len(self.portfolios)} portfolios (test period, trading days only)")
         print("  [✓] Portfolio construction complete")
 
@@ -1125,6 +1143,7 @@ class AAAI2027Pipeline:
         factor_path: str,
         test_data: dict,
         holding_period: int = None,
+        context_days: int = None,
     ):
         """
         Load saved factors from JSON and run test-period portfolio construction + backtest.
@@ -1137,9 +1156,15 @@ class AAAI2027Pipeline:
         Args:
             factor_path: Path to final_factors.json (saved by step6_fuse_factors).
             test_data: Dict with keys {'price_data', 'fundamental_data', 'industry_data'}
-                       for the test period. Required — no fallback to self.test_data.
+                       for the test period. May optionally include context days before
+                       the real test start date (prepended by split_data). Required —
+                       no fallback to self.test_data.
             holding_period: Backtest holding period override (1=daily, 5=weekly, 20=monthly).
                             None → use config or existing engine setting.
+            context_days: Number of calendar days prepended before the real test
+                          start date. Used for cropping portfolios in step7 so that
+                          rolling-window factors have history on day 1. If None,
+                          reads from test_data['_meta'] or falls back to config.
 
         Returns:
             Performance metrics dict from step8.
@@ -1220,6 +1245,38 @@ class AAAI2027Pipeline:
                 holding_period=holding_period,
             )
             print(f"  Re-initialized backtest engine with holding_period={holding_period}")
+
+        # ── 5b. Resolve context_days & test_start_date ──
+        # context_days tells step7 how many days to crop from the start of
+        # computed portfolios. Resolution order:
+        #   1. Explicit context_days parameter
+        #   2. test_data['_meta']['context_days'] (set by split_data)
+        #   3. config['data']['context_days']
+        #   4. Fallback to 0 (no cropping — assumes test_data has no context)
+        if context_days is not None:
+            self._context_days = context_days
+        elif test_data.get('_meta', {}).get('context_days') is not None:
+            self._context_days = test_data['_meta']['context_days']
+        else:
+            self._context_days = self.config.get('data', {}).get('context_days', 0)
+
+        # Resolve test_start_date — step7 uses this to crop context dates.
+        # Priority: _meta > _test_start_date from a prior step1 > infer from context_days
+        meta = test_data.get('_meta', {})
+        if meta.get('test_start_date'):
+            self._test_start_date = meta['test_start_date']
+        elif not hasattr(self, '_test_start_date') or self._test_start_date is None:
+            # Infer: skip context_days rows from the price index
+            if self._context_days > 0:
+                close_idx = test_data['price_data']['close'].index
+                inferred_start = close_idx[min(self._context_days, len(close_idx) - 1)]
+                self._test_start_date = str(inferred_start.date())
+                print(f"  Inferred test_start_date from context_days={self._context_days}: {self._test_start_date}")
+            else:
+                # No context — use the first date in test_data
+                self._test_start_date = str(test_data['price_data']['close'].index[0].date())
+
+        print(f"  context_days={self._context_days}, test_start_date={self._test_start_date}")
 
         # ── 6. Run step7 (portfolio construction) ──
         self.step7_construct_portfolio(test_data=test_data)
