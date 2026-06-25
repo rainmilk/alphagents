@@ -782,7 +782,28 @@ class AAAI2027Pipeline:
         # factor names to iterate over test_factor_dict)
         self.factor_infos = factor_infos
 
-        # ── 4. Encode market state from TRAIN data (avoid lookahead) ──
+        # ── 4b. Extract training industry data (for industry-neutral normalization) ──
+        train_industry = None
+        if hasattr(self, 'industry_data') and self.industry_data is not None:
+            train_close = train_price.get('close')
+            if train_close is not None and isinstance(train_close, pd.DataFrame):
+                common_stocks = train_close.columns
+                train_industry = self.industry_data[
+                    self.industry_data.index.isin(common_stocks)
+                ]
+                if len(train_industry) > 0:
+                    print(f"  Industry data: {len(train_industry)} stocks, "
+                          f"{train_industry.nunique()} industries")
+                else:
+                    train_industry = None
+                    print("  [warn] Industry data empty after filtering to train stocks")
+            else:
+                print("  [warn] train_price['close'] not available for industry filtering")
+        else:
+            print("  [warn] No industry_data available — "
+                  "industry-neutral normalization will be skipped")
+
+        # ── 4c. Encode market state from TRAIN data (avoid lookahead) ──
         market_state = None
         try:
             train_close = train_price.get('close')
@@ -797,6 +818,7 @@ class AAAI2027Pipeline:
         composite_scores, fusion_meta = fusion.fuse(
             factor_infos,
             train_factor_dict,
+            industry=train_industry,
             market_state=market_state,
         )
 

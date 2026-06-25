@@ -466,7 +466,11 @@ class _FactorExprEvaluator:
         w = _FactorExprEvaluator._safe_int(window)
         mean = x.rolling(window=w, min_periods=max(5, w * 2 // 3)).mean()
         std = x.rolling(window=w, min_periods=max(5, w * 2 // 3)).std(ddof=0)
-        return (x - mean) / std.replace(0, np.nan)
+        # When std == 0 (e.g. ROE updates quarterly, values constant in window),
+        # all values equal the mean, so z-score should be 0, not NaN.
+        z = (x - mean) / std
+        z[std == 0] = 0.0
+        return z
 
     @staticmethod
     def _fn_delay(x: pd.DataFrame, d) -> pd.DataFrame:
