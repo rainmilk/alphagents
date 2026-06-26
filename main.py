@@ -418,7 +418,8 @@ class AAAI2027Pipeline:
         
         self.evolution_history = evolution_result.evolution_history
         self.best_factors = evolution_result.best_factors
-        
+        self._forward_period = forward_period   # persist for step6/_calculate_factor_values
+
         print(f"  Evolution complete: {len(self.best_factors)} best factors")
         best_ic = self.best_factors[0].ic if self.best_factors else 0.0
         print(f"  Best IC: {best_ic:.4f}")
@@ -728,6 +729,7 @@ class AAAI2027Pipeline:
         train_factor_dict = self._calculate_factor_values(
             price_data=train_price,
             fundamental_data=train_fund,
+            forward_period=getattr(self, '_forward_period', None),
         )
 
         # ── 2. Build factor_infos from backtest results (IC/ICIR from train data) ──
@@ -905,6 +907,7 @@ class AAAI2027Pipeline:
         test_factor_dict = self._calculate_factor_values(
             price_data=test_price,
             fundamental_data=test_fund,
+            forward_period=getattr(self, '_forward_period', None),
         )
 
         # 2. 从 final_factors.json 加载训练好的权重和符号
@@ -1316,6 +1319,7 @@ class AAAI2027Pipeline:
         self,
         price_data: Optional[Dict] = None,
         fundamental_data: Optional[Dict] = None,
+        forward_period: int = None,
     ) -> Dict[str, pd.DataFrame]:
         """
         Calculate factor values for all stocks by evaluating each factor's DSL expression.
@@ -1379,8 +1383,14 @@ class AAAI2027Pipeline:
         if 'close' in data_map and 'pe' in data_map:
             pe_safe = data_map['pe'].replace(0, np.nan)
             data_map['eps'] = data_map['close'] / pe_safe
-        # 1-day forward returns (used by some expressions that reference `forward_returns`)
-        data_map['forward_returns'] = close.pct_change(1).shift(-1)
+        # Forward returns — period must match step4 to keep IC computation consistent.
+        # Resolution order: explicit arg → self._forward_period (set in step4) → config → 20
+        if forward_period is None:
+            forward_period = getattr(self, '_forward_period', None)
+        if forward_period is None:
+            forward_period = self.config.get('evolution', {}).get('forward_period', 20)
+        data_map['forward_returns'] = close.pct_change(forward_period).shift(-forward_period)
+
 
         # ---- Factor list ----
         factors = getattr(self, 'best_factors', None)
