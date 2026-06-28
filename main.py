@@ -454,15 +454,9 @@ class AAAI2027Pipeline:
         # Encode current market state using TRAIN data (not test data)
         # This prevents data leak from test period
         close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
-        # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
-        # Build market index proxy by cross-sectional mean
-        market_close = close_df.mean(axis=1)
-        market_df = pd.DataFrame({'close': market_close})
-        try:
-            current_state = self.market_encoder.encode(market_df)
-        except Exception as e:
-            print(f"  [warn] Market state encoding failed: {e}")
-            current_state = None
+        # Pass the full multi-stock DataFrame so _build_market_state can compute
+        # corr_matrix from actual pairwise return correlations.
+        current_state = self._build_market_state(close_df)
 
         # Retrieve similar factors from memory
         # Use best evolved factors as query (higher quality than raw seeds)
@@ -595,11 +589,9 @@ class AAAI2027Pipeline:
                 # Use TRAIN data for market state encoding (not test data)
                 if self.train_data:
                     close_df = self.train_data['price_data']['close'].iloc[-self.recent_days:]
-                    # close_df: DataFrame(dates × stocks); encode() expects columns=['close']
-                    # Build market index proxy by cross-sectional mean
-                    market_close = close_df.mean(axis=1)
-                    market_df = pd.DataFrame({'close': market_close})
-                    current_state = self.market_encoder.encode(market_df)
+                    # Pass multi-stock DataFrame so corr_matrix is computed from
+                    # actual pairwise return correlations (CorrelationRegime is real).
+                    current_state = self._build_market_state(close_df)
                 else:
                     current_state = None
             except Exception:
@@ -773,11 +765,16 @@ class AAAI2027Pipeline:
 
             dscore = debate_score_map.get(name, 0.0)
             ic_sign = float(np.sign(ic_val)) if abs(ic_val) > 1e-10 else 1.0
+            # Effective sample size for IC/ICIR:
+            # factor values have T dates, but last forward_period dates lack forward returns
+            _fwd = getattr(self, '_forward_period', 20)
+            n_periods = max(2, len(values_df) - _fwd)
             factor_infos.append(FactorInfo(
                 name=name, expression=name,
                 ic=ic_val, icir=icir_val, ic_std=ic_std_val,
                 sharpe=sharpe_val, debate_score=dscore,
                 ic_sign=ic_sign,
+                n_periods=n_periods,
             ))
 
         # Save for step7 (which reads weights/signs from JSON, but still needs
@@ -810,9 +807,10 @@ class AAAI2027Pipeline:
         try:
             train_close = train_price.get('close')
             if train_close is not None and isinstance(train_close, pd.DataFrame):
-                encoder = MarketStateEncoder()
-                market_state = encoder.encode(train_close)
-                print(f"  Market state (from TRAIN): {market_state.to_string()}")
+                # Use the shared helper so corr_matrix is computed from actual
+                # pairwise return correlations (rather than defaulting to MEDIUM).
+                market_state = self._build_market_state(train_close)
+                print(f"  Market state (from TRAIN): {market_state.to_string() if market_state else 'None'}")
         except Exception as e:
             print(f"  [warn] Could not encode market state: {e}")
 
@@ -846,6 +844,7 @@ class AAAI2027Pipeline:
                 "expression": fi.expression,
                 "weight": fusion_meta["weights"].get(fi.name, 0.0),
                 "debate_score": getattr(fi, "debate_score", None),
+                "n_periods": getattr(fi, "n_periods", 50),
             })
 
         self.fusion_result = {
@@ -979,6 +978,13 @@ class AAAI2027Pipeline:
         self.portfolios = pd.DataFrame(weight_dict).T
         self.portfolios.index = pd.to_datetime(self.portfolios.index)
         self.portfolios = self.portfolios.fillna(0.0)
+
+        # 修复：将 portfolios 对齐到价格数据的全部股票
+        # pf.weights 只含 top-N 股票（每天数量可能不同），
+        # 需 pad 到全股票列表，否则 backtest 中 current_weights
+        # 与 price_ratio 形状不匹配（列数不一致）
+        all_stocks = _test['price_data']['close'].columns
+        self.portfolios = self.portfolios.reindex(columns=all_stocks, fill_value=0.0)
 
         # Align portfolios to actual trading days (same index as test close prices)
         trading_days = _test['price_data']['close'].index
@@ -1241,6 +1247,7 @@ class AAAI2027Pipeline:
                     name=f["name"],
                     expression=f["expression"],
                     debate_score=f.get("debate_score", 0.0) or 0.0,
+                    n_periods=f.get("n_periods", 50),
                 )
                 for f in saved_factors
             ]
@@ -1314,6 +1321,62 @@ class AAAI2027Pipeline:
         print("=" * 60)
 
         return self.performance_metrics
+
+    # ──────────────────────────────────────────────────────────────
+    # Helper: build MarketState from close DataFrame
+    # ──────────────────────────────────────────────────────────────
+    def _build_market_state(
+        self,
+        close_df: pd.DataFrame,
+        shibor: Optional[float] = None,
+    ) -> Optional['MarketState']:
+        """
+        Encode a MarketState from a multi-stock (or single-column) close DataFrame.
+
+        Parameters
+        ----------
+        close_df : pd.DataFrame
+            Shape (dates × stocks) **or** single-column DataFrame with 'close'.
+        shibor : float, optional
+            Overnight SHIBOR rate used to determine LiquidityRegime.
+            When None (default), falls back to LiquidityRegime.NORMAL because
+            this project does not currently source SHIBOR data.  Pass an actual
+            value if you add macro data to the data pipeline.
+
+        Returns
+        -------
+        MarketState or None on failure.
+
+        Notes
+        -----
+        corr_matrix is computed here from rolling stock returns so that
+        CorrelationRegime reflects the actual cross-sectional correlation
+        during the recent window, rather than always defaulting to MEDIUM.
+        """
+        try:
+            # --- Build corr_matrix from recent returns ---
+            corr_matrix: Optional[pd.DataFrame] = None
+            if close_df is not None and not close_df.empty:
+                # Determine whether this is a multi-stock (dates×stocks) DataFrame
+                # or a single-column 'close' series
+                if "close" not in close_df.columns and close_df.shape[1] > 1:
+                    # Multi-stock: compute pairwise correlation of daily returns
+                    ret = close_df.pct_change().dropna(how='all')
+                    if ret.shape[0] >= 10 and ret.shape[1] >= 2:
+                        # Drop all-NaN columns before computing corr
+                        ret = ret.dropna(axis=1, how='any')
+                        if ret.shape[1] >= 2:
+                            corr_matrix = ret.corr()
+
+            market_state = self.market_encoder.encode(
+                close_df,
+                shibor=shibor,        # None → LiquidityRegime.NORMAL (acceptable default)
+                corr_matrix=corr_matrix,  # now computed from actual returns
+            )
+            return market_state
+        except Exception as e:
+            print(f"  [warn] Market state encoding failed: {e}")
+            return None
 
     def _calculate_factor_values(
         self,

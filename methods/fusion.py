@@ -174,6 +174,7 @@ class FactorInfo:
     sharpe: float = 0.0
     debate_score: float = 0.0  # 0-10, from multi-agent debate
     ic_sign: float = 1.0       # sign(IC): +1 or -1, for sign-aware fusion
+    n_periods: int = 50        # 计算 IC/ICIR 所用的有效样本量 T，用于 Bayesian SNR 收缩
     values: Optional[pd.DataFrame] = None  # index=date, columns=stock_code
 
     @property
@@ -387,14 +388,36 @@ class FactorFusion:
             raw_w = icirs_abs ** 2
             raw_w = raw_w / (raw_w.sum() + 1e-12)
 
-            # 3. James-Stein shrinkage toward equal weight
-            #    When ICIR estimates are noisy (low cross-sectional dispersion),
-            #    shrink toward equal weight to reduce estimation variance.
-            #    δ = shrinkage intensity ∈ [0.1, 0.5]
-            #    High CV → trust ICIR → low δ;  Low CV → noise → high δ
-            cv = icirs_abs.std() / (icirs_abs.mean() + 1e-10)
-            delta = 1.0 / (1.0 + cv * np.sqrt(n))
-            delta = float(np.clip(delta, 0.1, 0.5))
+            # 3. Bayesian SNR shrinkage (Efron & Morris 1975)
+            #    ─────────────────────────────────────────────────────────
+            #    Model:
+            #      ICIR_i_obs ~ N(ICIR_i_true, SE_i²)
+            #      ICIR_i_true ~ N(μ_0, τ²)          (empirical Bayes prior)
+            #
+            #    Optimal shrinkage toward prior mean:
+            #      ICIR_i_shrunk = (1-δ)·ICIR_i_obs + δ·μ_0
+            #      δ = SE² / (SE² + τ²)
+            #
+            #    Estimated from data (method of moments):
+            #      var(ICIR_obs) = τ² + SE²    (in expectation)
+            #      → τ²_hat = max(0, var(ICIR_obs) - SE²)
+            #
+            #    With SE² ≈ 1/T  (T = n_periods, effective sample size):
+            #      δ_hat = 1 / (1 + max(0, var(ICIR_obs) × T - 1))
+            #
+            #    Interpretation:
+            #      high var(ICIR)×T  →  ICIR estimates reliable  →  low δ
+            #      low  var(ICIR)×T  →  ICIR estimates noisy     →  high δ
+            #    ─────────────────────────────────────────────────────────
+            n_periods_arr = np.array([max(2, f.n_periods) for f in factors])
+            T = int(n_periods_arr.min())  # conservative: use min T across factors
+            var_icir = float(np.var(icirs_abs))
+            # SNR of ICIR estimates = estimated signal variance / noise variance
+            # signal_var_hat = max(0, var(ICIR_obs) - 1/T)
+            # snr_icir = signal_var_hat / (1/T) = max(0, var(ICIR_obs) × T - 1)
+            snr_icir = max(0.0, var_icir * T - 1.0)
+            delta = 1.0 / (1.0 + snr_icir)
+            delta = float(np.clip(delta, 0.05, 0.5))
 
             equal_w = np.ones(n) / n
             w = (1.0 - delta) * raw_w + delta * equal_w
