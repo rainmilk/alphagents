@@ -130,14 +130,23 @@ class _FactorExprEvaluator:
 
     Supported data sources:
         open, high, low, close, volume, amount  (price_data dict keys)
-        pe, pb, roe, market_cap                  (fundamental_data dict keys)
+        pe, pb, ps, roe, market_cap             (fundamental_data dict keys)
+        eps, return, returns, vwap, forward_returns  (derived fields)
+        — eps = close / pe
+        — return / returns = 1-day daily return (close.pct_change(1))
+        — vwap = amount / volume
+        — forward_returns = N-day forward return (precomputed)
 
     Supported functions:
         rank(X)          — cross-sectional percentile rank [0, 1]
         ts_rank(X, w)    — rolling time-series rank [0, 1]
         ts_corr(X, Y, w) — rolling Pearson correlation
+        ts_cov(X, Y, w)  — rolling covariance
         ts_mean(X, w)    — rolling mean
         ts_std(X, w)     — rolling std (ddof=0)  [alias: ts_stddev]
+        ts_var(X, w)     — rolling variance (ddof=0)
+        ts_skew(X, w)    — rolling skewness
+        ts_kurt(X, w)    — rolling kurtosis
         ts_min(X, w)     — rolling minimum
         ts_max(X, w)     — rolling maximum
         ts_sum(X, w)     — rolling sum
@@ -339,7 +348,10 @@ class _FactorExprEvaluator:
         'ts_delay':   'delay',
         'ts_lag':     'delay',
         'lag':        'delay',
-        'ts_var':     'ts_std',       # variance → std (approximate; rare)
+        'cov':        'ts_cov',
+        'skew':       'ts_skew',
+        'kurt':       'ts_kurt',
+        'kurtosis':   'ts_kurt',
         'max':        'ts_max',       # bare max → ts_max (ambiguous but LLM uses it)
         'min':        'ts_min',
         'mean':       'ts_mean',
@@ -357,8 +369,12 @@ class _FactorExprEvaluator:
             'rank':       (1, 1),
             'ts_rank':    (2, 2),
             'ts_corr':    (3, 3),
+            'ts_cov':     (3, 3),
             'ts_mean':    (2, 2),
             'ts_std':     (2, 2),
+            'ts_var':     (2, 2),
+            'ts_skew':    (2, 2),
+            'ts_kurt':    (2, 2),
             'ts_min':     (2, 2),
             'ts_max':     (2, 2),
             'ts_sum':     (2, 2),
@@ -432,6 +448,13 @@ class _FactorExprEvaluator:
         return x.rolling(window=w, min_periods=min_p).corr(y)
 
     @staticmethod
+    def _fn_ts_cov(x: pd.DataFrame, y: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling covariance between x and y (per stock)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        min_p = min(max(3, w // 2), w)
+        return x.rolling(window=w, min_periods=min_p).cov(y)
+
+    @staticmethod
     def _fn_ts_mean(x: pd.DataFrame, window) -> pd.DataFrame:
         w = _FactorExprEvaluator._safe_int(window)
         return x.rolling(window=w, min_periods=max(1, w // 2)).mean()
@@ -442,6 +465,27 @@ class _FactorExprEvaluator:
         # min_periods must be <= window; never exceed w
         min_p = min(max(2, w * 2 // 3), w)
         return x.rolling(window=w, min_periods=min_p).std(ddof=0)
+
+    @staticmethod
+    def _fn_ts_var(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling variance (ddof=0)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        min_p = min(max(2, w * 2 // 3), w)
+        return x.rolling(window=w, min_periods=min_p).var(ddof=0)
+
+    @staticmethod
+    def _fn_ts_skew(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling skewness."""
+        w = _FactorExprEvaluator._safe_int(window)
+        min_p = min(max(3, w * 2 // 3), w)
+        return x.rolling(window=w, min_periods=min_p).skew()
+
+    @staticmethod
+    def _fn_ts_kurt(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling kurtosis (Fisher's definition, normal → 0)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        min_p = min(max(4, w * 2 // 3), w)
+        return x.rolling(window=w, min_periods=min_p).kurt()
 
     @staticmethod
     def _fn_ts_min(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -587,8 +631,21 @@ class FactorBacktester:
             pe_safe = self._data_map['pe'].replace(0, np.nan)
             self._data_map['eps'] = self._data_map['close'] / pe_safe
 
+        # Daily returns (1-day pct_change) — 'return' and 'returns' are aliases
+        if 'close' in self._data_map:
+            _ret = self._data_map['close'].pct_change(1)
+            self._data_map['return'] = _ret
+            self._data_map['returns'] = _ret
+
+        # VWAP (volume-weighted average price) = amount / volume
+        if 'amount' in self._data_map and 'volume' in self._data_map:
+            vol_safe = self._data_map['volume'].replace(0, np.nan)
+            self._data_map['vwap'] = self._data_map['amount'] / vol_safe
+
         # ---- Compute forward returns ----
         self._forward_returns = self._compute_forward_returns()
+        # Make forward_returns accessible from expressions (docstring promises it)
+        self._data_map['forward_returns'] = self._forward_returns
 
         # ---- Expression evaluator (lazy init) ----
         self._evaluator = None
@@ -1381,13 +1438,20 @@ Your task is to generate diverse, economically meaningful factor expressions for
 Supported data sources:
 - open, high, low, close, volume, amount (price and volume data)
 - pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
+- return / returns (1-day daily return; alias: close.pct_change(1))
+- vwap (volume-weighted average price = amount / volume)
+- forward_returns (N-day forward return, precomputed)
 
 Supported functions (WorldQuant style):
 - rank(X): cross-sectional percentile rank [0, 1]
 - ts_rank(X, w): rolling time-series rank within window w
 - ts_corr(X, Y, w): rolling correlation between X and Y over window w
+- ts_cov(X, Y, w): rolling covariance between X and Y over window w
 - ts_mean(X, w): rolling mean over window w
 - ts_std(X, w): rolling standard deviation over window w (alias: ts_stddev)
+- ts_var(X, w): rolling variance over window w
+- ts_skew(X, w): rolling skewness over window w
+- ts_kurt(X, w): rolling kurtosis over window w
 - ts_min(X, w): rolling minimum over window w
 - ts_max(X, w): rolling maximum over window w
 - ts_sum(X, w): rolling sum over window w
@@ -1399,7 +1463,7 @@ Supported functions (WorldQuant style):
 - log(X): element-wise natural log
 - sqrt(X): element-wise square root
 
-Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag are accepted as aliases.
+Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, cov, skew, kurt/kurtosis are accepted as aliases.
 Supported operators: +, -, *, /, ^
 
 Factor categories to cover:
@@ -1560,6 +1624,9 @@ Your task is to generate diverse, economically meaningful factor expressions for
 Supported data sources:
 - open, high, low, close, volume, amount (price and volume data)
 - pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
+- return / returns (1-day daily return; alias: close.pct_change(1))
+- vwap (volume-weighted average price = amount / volume)
+- forward_returns (N-day forward return, precomputed)
 
 Supported functions (WorldQuant style):
 - rank(X): cross-sectional percentile rank [0, 1]

@@ -1456,6 +1456,15 @@ class AAAI2027Pipeline:
         if 'close' in data_map and 'pe' in data_map:
             pe_safe = data_map['pe'].replace(0, np.nan)
             data_map['eps'] = data_map['close'] / pe_safe
+        # Daily returns — 'return' and 'returns' are aliases
+        if 'close' in data_map:
+            _ret = data_map['close'].pct_change(1)
+            data_map['return'] = _ret
+            data_map['returns'] = _ret
+        # VWAP = amount / volume
+        if 'amount' in data_map and 'volume' in data_map:
+            vol_safe = data_map['volume'].replace(0, np.nan)
+            data_map['vwap'] = data_map['amount'] / vol_safe
         # Forward returns — period must match step4 to keep IC computation consistent.
         # Resolution order: explicit arg → self._forward_period (set in step4) → config → 20
         if forward_period is None:
