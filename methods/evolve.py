@@ -56,6 +56,8 @@ class CandidateFactor:
     sharpe: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
+    is_valid: bool = True          # False when evaluation raises ValueError (parse error)
+    parse_error: str = ""          # stores error message for debugging / reflection
     
     
 @dataclass
@@ -694,17 +696,33 @@ class FactorBacktester:
 
         except Exception as e:
             import traceback
-            logger.warning("Factor evaluation failed for '%s': %s", expr, e)
+            err_msg = str(e)
+            logger.warning("Factor evaluation failed for '%s': %s", expr, err_msg)
             traceback.print_exc()
-            return self._empty_metrics()
+            # Mark the factor as invalid so the evolution loop can exclude it
+            factor.is_valid = False
+            factor.ic = float('nan')
+            factor.icir = float('nan')
+            factor.parse_error = err_msg
+            return self._empty_metrics(error=err_msg)
 
-    def _empty_metrics(self) -> Dict:
-        """Return a safe empty-result dict."""
+    def _empty_metrics(self, error: str = "") -> Dict:
+        """Return a safe empty-result dict for failed / invalid factors.
+
+        ic / icir are set to NaN (not 0.0) so that downstream sort / filter
+        logic can correctly identify parse-failed factors rather than treating
+        them as factors with a neutral IC of 0.
+        """
         return {
-            'ic': 0.0, 'icir': 0.0, 'sharpe': 0.0,
-            'win_rate': 0.5, 'max_drawdown': 0.0,
+            'ic': float('nan'),
+            'icir': float('nan'),
+            'sharpe': 0.0,
+            'win_rate': 0.5,
+            'max_drawdown': 0.0,
             'long_short_ret': pd.Series(dtype=float),
             'factor_values': pd.DataFrame(),
+            'is_valid': False,
+            'parse_error': error,
         }
 
     def clear_cache(self):
@@ -1156,12 +1174,27 @@ class SelfEvolvingGenerator:
         save_dir = config_path("experiments", save_dir)
         os.makedirs(save_dir, exist_ok=True)
 
-        factors_dicts = [asdict(f) for f in factors]
+        # Filter out parse-failed (is_valid=False) factors before saving
+        valid_factors = [f for f in factors if getattr(f, 'is_valid', True)]
+        skipped = len(factors) - len(valid_factors)
+        if skipped:
+            logger.info("[evolve] Skipping %d invalid factor(s) when saving to %s", skipped, filename)
+
+        def _sanitize(d):
+            """Replace nan/inf float values with None so json.dump produces valid JSON."""
+            import math
+            for k, v in d.items():
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    d[k] = None
+            return d
+
+        factors_dicts = [_sanitize(asdict(f)) for f in valid_factors]
         save_path = os.path.join(save_dir, filename)
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(factors_dicts, f, indent=2, ensure_ascii=False)
 
-        print(f"  [evolve] Saved {len(factors)} factors to {save_path}")
+        print(f"  [evolve] Saved {len(valid_factors)} factors to {save_path}"
+              + (f" ({skipped} invalid skipped)" if skipped else ""))
 
     def _generate_reflection(self, evaluated_factors: List['CandidateFactor'], top_factors: List['CandidateFactor'], round_id: int = 0) -> str:
         """
@@ -1320,7 +1353,7 @@ class SelfEvolvingGenerator:
                 if seed_factors and len(seed_factors) >= 1:
                     result = seed_factors[:n_factors]
                     print(f"Generated {len(result)} seed factors via LLM")
-                    self._save_factors_to_file(result, round_id=0)
+                    # self._save_factors_to_file(result, round_id=0)
                     return result
             except Exception as e:
                 print(f"  [evolve] LLM factor generation failed: {e}")
@@ -1329,7 +1362,7 @@ class SelfEvolvingGenerator:
         # Fallback: rule-based generation
         print(f"  [evolve] Using rule-based factor generation.")
         fallback_factors = self._generate_factors_rule_based(n_factors)
-        self._save_factors_to_file(fallback_factors, round_id=0)
+        # self._save_factors_to_file(fallback_factors, round_id=0)
         return fallback_factors
     
     def _generate_factors_via_llm(self, n_factors: int) -> List[CandidateFactor]:
@@ -1619,20 +1652,30 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             evaluated_factors = []
             for i, factor in enumerate(current_factors):
                 metrics = metrics_list[i]
-                factor.ic = metrics.get('ic', 0.0)
-                factor.icir = metrics.get('icir', 0.0)
+                factor.ic = metrics.get('ic', float('nan'))
+                factor.icir = metrics.get('icir', float('nan'))
                 factor.sharpe = metrics.get('sharpe', 0.0)
                 factor.win_rate = metrics.get('win_rate', 0.5)
                 factor.max_drawdown = metrics.get('max_drawdown', 0.0)
+                # Sync is_valid / parse_error from metrics dict
+                factor.is_valid = metrics.get('is_valid', True)
+                if not factor.is_valid:
+                    factor.parse_error = metrics.get('parse_error', '')
+                    logger.info(
+                        "Excluding invalid factor '%s' from candidate set: %s",
+                        factor.expression, factor.parse_error,
+                    )
                 evaluated_factors.append(factor)
-                
-                if factor.ic > best_ic:
+
+                # Only update best_ic with valid factors that have a real IC value
+                if factor.is_valid and not np.isnan(factor.ic) and factor.ic > best_ic:
                     best_ic = factor.ic
 
             self._save_factors_to_file(current_factors, round_id, filename="improved_factors.json")
-            
-            # Select top factors
-            top_factors = sorted(evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
+
+            # Select top factors — exclude parse-failed factors before sorting
+            valid_evaluated = [f for f in evaluated_factors if f.is_valid and not np.isnan(f.ic)]
+            top_factors = sorted(valid_evaluated, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
             
             # Generate reflection based on backtest results
             reflection_notes = self._generate_reflection(evaluated_factors, top_factors, round_id)
@@ -1674,7 +1717,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             print(f"  Avg IC (top {self.n_best_factors}): {round_record.avg_ic:.4f}")
             
             # Track patience: consecutive rounds without IC improvement
-            if round_best_ic > best_ic:
+            if round_best_ic >= best_ic:
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
@@ -1694,23 +1737,30 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             print(f"\n[evolve] Evaluating final improved factors ({len(current_factors)})...")
             final_metrics = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
             for factor, metrics in zip(current_factors, final_metrics):
-                factor.ic = metrics.get('ic', 0.0)
-                factor.icir = metrics.get('icir', 0.0)
+                factor.ic = metrics.get('ic', float('nan'))
+                factor.icir = metrics.get('icir', float('nan'))
                 factor.sharpe = metrics.get('sharpe', 0.0)
                 factor.win_rate = metrics.get('win_rate', 0.5)
                 factor.max_drawdown = metrics.get('max_drawdown', 0.0)
-                if factor.ic > best_ic:
+                factor.is_valid = metrics.get('is_valid', True)
+                if not factor.is_valid:
+                    factor.parse_error = metrics.get('parse_error', '')
+                if factor.is_valid and not np.isnan(factor.ic) and factor.ic > best_ic:
                     best_ic = factor.ic
             # Save improved factors with real IC/Sharpe/win_rate after backtest evaluation
             self._save_factors_to_file(current_factors, len(evolution_history), filename="improved_factors.json")
             all_evaluated_factors.extend(current_factors)
 
         # Select best factors from all evaluated factors across all rounds
-        best_factors = sorted(all_evaluated_factors, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
+        # Exclude parse-failed factors (is_valid=False / ic=nan) before sorting
+        valid_all = [f for f in all_evaluated_factors if f.is_valid and not np.isnan(f.ic)]
+        best_factors = sorted(valid_all, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
         
         # Quality filter: remove factors that don't meet minimum thresholds
         quality_filtered = []
         for f in best_factors:
+            if not f.is_valid or np.isnan(f.ic):
+                continue
             if f.ic < self.min_ic:
                 continue
             if f.sharpe < self.min_sharpe:

@@ -11,19 +11,19 @@ This is the complete codebase for the AAAI 2027 paper:
 ```
 AAAI2027_LLM_MultiFactor/
 ├── config/                 # Configuration files
-│   └── config.yaml        # Main configuration
+│   └── config.yaml        # Main configuration ([ACTIVE]/[UNUSED] annotated)
 ├── data/                  # Data loading and output
 │   ├── loader.py          # Data loader (sample / real A-share data)
 │   ├── train/             # Train split CSVs (price/fundamental/industry)
 │   ├── test/              # Test split CSVs (price/fundamental/industry)
 │   └── memory_bank.json/  # Factor memory bank snapshots
 ├── methods/               # Core methods (4 modules)
-│   ├── debate.py         # Multi-agent debate evaluator
-│   ├── evolve.py         # Self-evolving factor generator
+│   ├── debate.py         # Multi-agent debate evaluator + Chair synthesis
+│   ├── evolve.py         # Self-evolving factor generator (config-driven)
 │   ├── memory.py         # State-aware factor memory bank (FAISS)
-│   └── fusion.py         # ICIR-weighted factor fusion + portfolio construction
+│   └── fusion.py         # Factor fusion + normalization + portfolio construction
 ├── backtest/              # Backtest engine
-│   └── engine.py         # Backtest simulation
+│   └── engine.py         # Backtest simulation (holding_period, turnover-aware)
 ├── metrics/               # Evaluation metrics
 │   └── evaluator.py      # Comprehensive metrics
 ├── viz/                   # Visualization tools
@@ -32,13 +32,13 @@ AAAI2027_LLM_MultiFactor/
 │   ├── results/          # Fixed output directory (portfolios, baselines, etc.)
 │   └── {yyyymmdd}/       # Date-stamped run outputs
 │       ├── self_evolve/  # LLM-generated factors per round
-│       │   ├── round_0/  # Seed factors (generated_factors.json + backtest csv)
-│       │   └── round_N/  # Evolved factors (improved_factors.json + backtest csv)
+│       │   ├── round_0/  # Seed factors (generated_factors.json)
+│       │   └── round_N/  # Evolved factors (improved_factors.json)
 │       ├── debate/       # Debate expert opinions (debate_factors_result.json)
 │       └── fusion/       # Final fused factors (final_factors.json)
 ├── paper/                 # Paper-related files
 │   └── figures/          # Generated figures
-├── main.py                # Main pipeline (argparse CLI)
+├── main.py                # Main pipeline (argparse CLI + --test mode)
 ├── run_experiments.py     # Experiment runner
 ├── test_train_test_split.py # Train/test split verification script
 ├── sync_evolve_to_feishu.py # Feishu sync helper
@@ -72,25 +72,21 @@ For full LLM-driven functionality, you need API access to:
 
 ## Usage
 
-### Data Source Selection
-
-The pipeline supports two data modes controlled by a single switch:
+### Data Modes
 
 | Mode | Flag | Data | Use Case |
 |---|---|---|---|
-| **Sample** (default) | `--sample` or no flag | Synthetic random walk data (100 stocks × 500 days) | Fast testing, CI, no external API needed |
+| **Sample** (default) | no flag or `--sample` | Synthetic random walk data (100 stocks x 500 days) | Fast testing, CI, no API needed |
+| **Real** | `--real` | A-share data via westock / AkShare / Tushare | Production research |
 
 **Real data source chain** (automatic fallback):
 1. **westock** — WorkBuddy built-in A-share data (preferred, no extra setup)
 2. **AkShare** — Open-source Python library (`pip install akshare`)
 3. **Tushare** — Requires token (`pip install tushare`, set `TUSHARE_TOKEN`)
-5. **Synthetic** — Final fallback (same shape, random data)
 
 Real data is cached to `data/cache_*.pkl` after first load. Use `--force-refresh` to skip cache.
 
 ### Quick Demo (No LLM Required)
-
-Run a quick demo without LLM calls:
 
 ```bash
 python main.py
@@ -100,8 +96,6 @@ This runs the pipeline with sample data and random portfolios.
 
 ### Full Pipeline (Sample Data)
 
-Run the complete end-to-end pipeline with synthetic data:
-
 ```bash
 python main.py --full
 ```
@@ -110,7 +104,7 @@ python main.py --full
 
 ```bash
 # Auto-detect best available source
-python main.py --full --real --n-seeds=1 --n-best-factors=2
+python main.py --full --real
 
 # Specify data source
 python main.py --full --real --source akshare
@@ -118,22 +112,48 @@ python main.py --full --real --source akshare
 # Custom date range + universe
 python main.py --full --real --start 2023-01-01 --end 2024-12-31 --universe hs300
 
+# Custom forward period and holding period
+python main.py --full --real --forward-period 20 --holding-period 5
+
 # Skip cache, force re-download
 python main.py --full --real --force-refresh
 ```
 
+### Test Pipeline (Skip Evolution, Run Backtest Only)
+
+Load a previously saved `final_factors.json` and run step7+step8 directly on test data.
+This reuses trained factor weights without re-running the full pipeline.
+
+```bash
+# Specify factor file explicitly
+python main.py --test --factor-path experiments/20260601/results/final_factors.json
+
+# Auto-detect latest final_factors.json under experiments/
+python main.py --test
+
+# With real data and custom date range
+python main.py --test --factor-path PATH --real --start 2023-01-01 --end 2024-12-31
+
+# Custom holding period (1=daily, 5=weekly, 20=monthly)
+python main.py --test --factor-path PATH --holding-period 5
+
+# Custom context days for rolling-window factors
+python main.py --test --factor-path PATH --context-days 60
+```
+
 ### Pipeline Steps (--full mode)
 
-1. **Load data** — sample or real A-share data with preprocessing; saves train/test splits as CSVs to `data/train/` and `data/test/`
+1. **Load data** — sample or real A-share data with preprocessing; saves train/test splits as CSVs to `data/train/` and `data/test/`; prepends `context_days` of training data to test split for rolling-window factor lookback
 2. **Initialize memory** — FAISS-backed factor memory bank
 3. **Generate factors** — LLM-driven seed factor generation
-4. **Evolve factors** — Self-improving iterative evolution (backtester coarse filter)
-5. **Evaluate factors** — Multi-agent debate with 5 experts (final quality gate)
-5c. **Chair synthesis** — Chair Agent cross-factor ranking with selection/rejection reasons (chair_synthesis.json)
-6. **Retrieve from memory** — State-aware top-k factor retrieval
-7. **Fuse factors** — ICIR-weighted fusion with correlation penalty
-8. **Construct portfolio** — Top-N portfolio with risk constraints
-9. **Backtest & save** — Performance metrics + evolution history
+4. **Evolve factors** — Self-improving iterative evolution (backtester coarse filter, patience-based early stopping)
+5. **4b. Retrieve from memory** — State-aware top-k factor retrieval from memory bank _(before debate so memory factors also get debate scores)_
+6. **5. Evaluate factors** — Multi-agent debate with 5 experts (final quality gate)
+7. **5b. Chair synthesis** — Chair Agent cross-factor ranking with selection/rejection reasons (chair_synthesis.json)
+8. **6. Fuse factors** — ICIR-weighted fusion with Bayesian SNR shrinkage + IPR correlation penalty + industry neutralization
+9. **7. Construct portfolio** — Top-N portfolio with risk constraints (weights reindexed to full stock universe)
+10. **8. Backtest** — Out-of-sample performance metrics on test period
+11. **9. Save results** — Metrics + portfolios + evolution history to disk
 
 ### CLI Reference
 
@@ -142,6 +162,7 @@ python main.py [OPTIONS]
 
 Options:
   --full                   Run full end-to-end pipeline (default: quick demo)
+  --test                   Run test pipeline: load saved factors from JSON → step7+step8
   --real                   Use real A-share data (default: sample data)
   --sample                 Use sample/synthetic data (default)
   --source {auto,westock,akshare,tushare}
@@ -151,17 +172,20 @@ Options:
   --end DATE               End date for real data (default: 2024-12-31)
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
-  --n-seeds N             Override llm.generator.n_seeds from config
+  --n-seeds N              Override llm.generator.n_seeds from config
   --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
-  --n-best-factors N       Override evolution.n_best_factors from config (controls n_best_factors in SelfEvolvingGenerator)
+  --n-best-factors N       Override evolution.n_best_factors from config
   --forward-period N       Forward return horizon in trading days (None → config or 20)
+  --holding-period N       Backtest holding period: 1=daily, 5=weekly, 20=monthly
+  --factor-path PATH       Path to final_factors.json for --test mode
+                           (default: auto-detect from experiments/*/results/)
+  --context-days N         Context days prepended before test_start_date for
+                           rolling-window factors (None → auto-detect from data or config)
   --config PATH            Path to config file (default: config/config.yaml)
   --output-dir PATH        Output directory (default: experiments/YYYYMMDD/results/)
 ```
 
 ### Run Experiments
-
-Run all experiments for the paper:
 
 ```bash
 python run_experiments.py
@@ -174,8 +198,6 @@ This runs:
 - Robustness tests
 
 ### Generate Figures
-
-Generate all figures for the paper:
 
 ```bash
 python viz/plotter.py
@@ -192,18 +214,22 @@ Implements structured debate among 5 expert agents:
 - Volatility Expert
 - Growth Expert
 
-Each agent evaluates factors independently (Phase 1), then engages in structured debate rounds (Phase 2) with full reproducibility. All expert opinions — scores, reasoning, concerns, strengths, and per-round consensus — are saved to `experiments/{yyyymmdd}/debate/debate_factors_result.json` for post-hoc analysis.
+Each agent evaluates factors independently (Phase 1), then engages in structured debate rounds (Phase 2) with full reproducibility. A Chair Agent (step5b) then performs cross-factor ranking with explicit selection/rejection reasons. All expert opinions — scores, reasoning, concerns, strengths, and per-round consensus — are saved to `experiments/{yyyymmdd}/debate/debate_factors_result.json`.
 
 ### 2. Self-Evolving Factor Generator (`methods/evolve.py`)
 
-Generates factors through iterative evolution:
+Generates factors through iterative evolution with config-driven hyperparameters:
+
 - Generate seed factors (LLM or rule-based fallback) — count controlled by `evolution.n_seed_factors`
 - Backtest and evaluate via `FactorBacktester`
-- Select top-k factors per round — controlled by `evolution.n_best_factors` (maps to `SelfEvolvingGenerator.n_best_factors`)
-- Reflect on failures
-- Generate improvements
-- Repeat until convergence (max rounds: `evolution.max_rounds`)
+- Parse errors (`ValueError`) → factor marked `is_valid=False` with `parse_error` stored, automatically excluded from ranking and JSON output
+- Evolution loop: improve via LLM (`n_improve`) + mutate via rules (`n_mutate`), patience-based early stopping
+- Select top-k factors per round — controlled by `evolution.n_best_factors`
+- Convergence check using `convergence_delta` over `convergence_window`
+- Quality filter on final output: `min_ic`, `min_sharpe`, `max_drawdown`
 - Returns `EvolutionResult` (dataclass with `EvolutionRound` history)
+
+**Key config keys** (all active): `n_seed_factors`, `n_best_factors`, `max_rounds`, `forward_period`, `n_improve`, `n_mutate`, `convergence_delta`, `convergence_window`, `patience`, `min_ic`, `min_sharpe`, `max_drawdown`.
 
 ### 3. State-Aware Factor Memory Bank (`methods/memory.py`)
 
@@ -212,32 +238,52 @@ Stores and retrieves historical high-quality factors:
 - Embed factors (Sentence-BERT)
 - Retrieve similar factors (state-aware, FAISS `IndexFlatIP`)
 - Update quality scores (online learning)
+- Runs after evolution (step4b) so retrieved memory factors participate in debate
 
 ### 4. Factor Fusion & Portfolio Construction (`methods/fusion.py`)
 
-Fuses multiple factors into a composite score:
-- Normalize factors (Z-score/Rank)
-- Weight by ICIR (dynamic)
-- Penalize correlations
-- Construct portfolio via `PortfolioConstructor` (Top-N, returns `list[Portfolio]` dataclass)
-- Apply risk constraints
+Fuses multiple factors into a composite score with a principled multi-stage pipeline:
+
+**Weight Computation** (`_compute_weights`):
+- **ICIR² weighting**: Base weights proportional to `|ICIR|²` (SNR-optimal)
+- **Bayesian SNR shrinkage**: Shrinkage toward equal weight when ICIR estimates are noisy. `δ = 1/(1 + max(0, var(ICIR)·T - 1))`, where T is the number of periods used to estimate IC/ICIR. More principled than the old heuristic `1/(1 + cv·√n)` — properly accounts for estimation precision via sample size.
+- **Debate score blend**: `weights = κ·norm(debate_score) + (1-κ)·base_weights`
+- **Market state tilt**: Weights multiplied by market-regime multipliers (trend/correlation-based)
+
+**Correlation Penalty** (IPR — Inter-factor Penalty for Redundancy):
+- Compute pairwise factor correlation matrix
+- Exposure `E[i] = Σ|corr(i,j)|·w_j / (1-w_i)` = weighted average correlation of factor i with all others
+- Penalty `p[i] = 1/(1 + α·E[i])` — continuous sigmoid-type compression
+- Redundant factors (high correlation with high-weight peers) get down-weighted; diverse factors get relatively boosted
+
+**Two-Pass Normalization**:
+1. First pass: each factor individually → zscore + optional industry neutralization (unifies scale, removes sector bias)
+2. Second pass: weighted sum composite → zscore + industry neutralization (restores std=1 after weight averaging shrinks variance)
+
+**Sign Extraction**: Factor sign determined by `sign(IC)`. When `|IC| ≈ 0` (direction unreliable), defaults to +1 (no flip) — conservative choice since near-zero-IC factors already have near-zero weight.
+
+**Portfolio Construction** (`PortfolioConstructor`):
+- `build()` returns `list[Portfolio]` dataclass with weights only for top-N stocks
+- **Step7 post-processing**: Weights are reindexed to the full stock universe (300 stocks) with zero-fill for unselected stocks, ensuring correct alignment with price data in backtest
+
+### 5. Backtest Engine (`backtest/engine.py`)
+
+- Supports configurable `holding_period` (1=daily, 5=weekly, 20=monthly)
+- Turnover calculation: `Σ|Δw| / 2` — standard single-sided turnover metric (buy + sell both contribute to `Σ|Δw|`, division by 2 recovers the actual capital traded)
+- Multi-period weight carry-forward for `holding_period > 1`
 
 ## Configuration
 
 Edit `config/config.yaml` to customize:
-- Data source and universe
-- LLM models and parameters
-- Evolution hyperparameters (`n_seed_factors`, `top_k`, `max_rounds`, etc.)
-- Memory bank settings
-- Fusion strategy
-- Backtest parameters
-- Experiment settings (cross-validation, baselines, metrics)
 
-Key evolution config keys:
-- `evolution.forward_period`: Forward return horizon in trading days (default: 20)
-- `evolution.n_seed_factors`: Number of seed factors to generate
-- `evolution.n_best_factors`: Number of top factors to select per round (passed as `n_best_factors` to `SelfEvolvingGenerator`)
-- `evolution.max_rounds`: Maximum evolution rounds before convergence
+All config keys are annotated with `[ACTIVE]` (wired to code) or `[UNUSED]` (defined as reference/roadmap, no runtime effect). This makes it clear which knobs actually change behavior.
+
+Key active sections:
+- **data**: Source, universe, train/test split dates, `context_days` (rolling-window lookback)
+- **evolution**: All 12 hyperparameters now wired (was previously partially hardcoded)
+- **memory**: State encoding, retrieval settings
+- **fusion**: Weighting strategy, normalization method, debate blend, IPR alpha, market tilt
+- **backtest**: Holding period, transaction costs, position limits
 
 ## Results
 
@@ -252,20 +298,11 @@ All results are saved under `experiments/`:
 
 **`experiments/{yyyymmdd}/`** — date-stamped per-run outputs:
 - `self_evolve/round_0/generated_factors.json`: Seed factors (LLM Phase 1)
-- `self_evolve/round_1/generated_factors.json` … `round_N/`: Evolved factors per round
-- `debate/debate_factors_result.json`: All expert opinions (scores, reasoning, concerns, strengths) across independent evaluation and debate rounds, plus Chair Agent cross-factor synthesis record
-- `fusion/final_factors.json`: Final fused factors after ICIR-weighted fusion
+- `self_evolve/round_1/generated_factors.json` … `round_N/`: Evolved factors per round (invalid factors with parse errors are excluded)
+- `debate/debate_factors_result.json`: All expert opinions + Chair Agent cross-factor synthesis
+- `fusion/final_factors.json`: Final fused factors with weights, signs, and `n_periods` metadata (invalid factors excluded)
 
 Train/test data persists as CSVs under `data/train/` and `data/test/` with `data/split_info.json` metadata.
-
-## Paper Writing
-
-The paper is structured as follows:
-1. **Introduction**: Motivation and contributions
-2. **Related Work**: LLM for finance, factor selection
-3. **Methodology**: 4 core modules (MASE framework)
-4. **Experiments**: Main results, ablation, baselines
-5. **Conclusion**: Summary and future work
 
 ## Troubleshooting
 
@@ -298,7 +335,15 @@ All source files now include `# -*- coding: utf-8 -*-` declarations and all `ope
 
 ### Issue: "TypeError: Object of type XXX is not JSON serializable"
 
-Evolution history uses `dataclasses.asdict()` for serialization. All dataclass objects (`EvolutionRound`, `CandidateFactor`, `Portfolio`) are now properly handled.
+Evolution history uses `dataclasses.asdict()` for serialization. All dataclass objects are properly handled. NaN/Inf values are sanitized to `null` before JSON serialization.
+
+### Issue: "ValueError: Parse error in expression ..."
+
+Factor expressions with syntax errors are caught during evaluation, marked `is_valid=False`, and automatically excluded from ranking and all JSON output. Check `parse_error` on the factor for the specific syntax issue.
+
+### Issue: "Error: --factor-path not specified and no final_factors.json found"
+
+Run `python main.py --full` first to generate a `final_factors.json`, then use `--test` mode. Or specify the path explicitly with `--factor-path`.
 
 ## Citation
 

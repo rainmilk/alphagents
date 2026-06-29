@@ -12,6 +12,8 @@ Usage:
     python main.py              # Quick demo (no LLM required)
     python main.py --full       # Full end-to-end pipeline
     python main.py --full --start 2023-01-01 --end 2024-12-31
+    python main.py --test --factor-path experiments/YYYYMMDD/results/final_factors.json
+    python main.py --test --factor-path PATH --start 2023-01-01 --end 2024-12-31
 """
 
 import os
@@ -836,9 +838,17 @@ class AAAI2027Pipeline:
         fusion_dir = config_path("experiments", fusion_dir)
         os.makedirs(fusion_dir, exist_ok=True)
 
-        # Build factor info list
+        # Build factor info list — skip factors that failed evaluation (is_valid=False / nan IC)
+        import math as _math
         factor_details = []
         for fi in factor_infos:
+            if not getattr(fi, 'is_valid', True):
+                logger.info("[step6] Skipping invalid factor '%s' from final_factors.json", fi.name)
+                continue
+            ic_val = getattr(fi, 'ic', 0.0)
+            if isinstance(ic_val, float) and _math.isnan(ic_val):
+                logger.info("[step6] Skipping factor '%s' with nan IC from final_factors.json", fi.name)
+                continue
             factor_details.append({
                 "name": fi.name,
                 "expression": fi.expression,
@@ -1571,6 +1581,9 @@ Examples:
   python main.py --full --real --source westock            Real data via westock (WorkBuddy)
   python main.py --full --real --start 2023-01-01 --end 2024-12-31
   python main.py --full --real --force-refresh             Skip cache, re-download
+  python main.py --test --factor-path experiments/20260601/results/final_factors.json
+  python main.py --test --factor-path PATH --real --start 2023-01-01 --end 2024-12-31
+  python main.py --test --factor-path PATH --holding-period 5
         """,
     )
 
@@ -1633,6 +1646,20 @@ Examples:
         help='Output directory (default: experiments/YYYYMMDD/results/)',
     )
     parser.add_argument(
+        '--test', action='store_true',
+        help='Run test pipeline: load saved factors from JSON and run step7+step8 on test data',
+    )
+    parser.add_argument(
+        '--factor-path', type=str, default=None,
+        help='Path to final_factors.json for --test mode '
+             '(default: experiments/YYYYMMDD/results/final_factors.json)',
+    )
+    parser.add_argument(
+        '--context-days', type=int, default=None,
+        help='Context days prepended before test_start_date for rolling-window factors '
+             '(None → auto-detect from data or config)',
+    )
+    parser.add_argument(
         '--config', type=str, default='config/config.yaml',
         help='Path to configuration file (default: config/config.yaml)',
     )
@@ -1664,6 +1691,64 @@ Examples:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
         else:
             print("\nPipeline completed, but no metrics available.")
+
+    elif args.test:
+        # ── Test pipeline: load saved factors → step7 + step8 on test data ──
+        pipeline = AAAI2027Pipeline(config_path=args.config)
+
+        # Resolve factor_path: CLI arg → auto-detect from experiments dir
+        if args.factor_path:
+            factor_path = args.factor_path
+        else:
+            # Auto-detect: look for the most recent experiments/*/results/final_factors.json
+            from pathlib import Path as _Path
+            experiments_dir = _Path('experiments')
+            candidates = sorted(
+                experiments_dir.glob('*/results/final_factors.json'),
+                key=lambda p: p.parent.parent.name,  # sort by date dir name
+                reverse=True,
+            )
+            if candidates:
+                factor_path = str(candidates[0])
+                print(f"Auto-detected factor path: {factor_path}")
+            else:
+                print("Error: --factor-path not specified and no final_factors.json found "
+                      "under experiments/. Run --full first to generate one.")
+                exit(1)
+
+        if not os.path.exists(factor_path):
+            print(f"Error: factor path does not exist: {factor_path}")
+            exit(1)
+
+        # Load data (step1) to get test_data for the test period.
+        # The split (train/test) is controlled by split_train_end / split_test_start
+        # from config, which defaults to the last ~2 years as test.
+        pipeline.step1_load_data(
+            start_date=args.start,
+            end_date=args.end,
+            use_sample=not args.real,
+            data_source=args.source,
+            force_refresh=args.force_refresh,
+        )
+
+        if pipeline.test_data is None:
+            print("Error: step1_load_data did not produce test_data (no data loaded?).")
+            exit(1)
+
+        # Override holding period if specified
+        if args.holding_period is not None:
+            pipeline.config.setdefault('backtest', {}).setdefault('trading', {})['holding_period'] = args.holding_period
+
+        metrics = pipeline.run_test_pipeline(
+            factor_path=factor_path,
+            test_data=pipeline.test_data,
+            holding_period=args.holding_period,
+            context_days=args.context_days,
+        )
+        if metrics:
+            print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+        else:
+            print("\nTest pipeline completed, but no metrics available.")
     else:
         # Quick demo (default)
         metrics = run_demo()
