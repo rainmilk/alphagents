@@ -1652,7 +1652,7 @@ Examples:
     parser.add_argument(
         '--factor-path', type=str, default=None,
         help='Path to final_factors.json for --test mode '
-             '(default: experiments/YYYYMMDD/results/final_factors.json)',
+             '(default: experiments/YYYYMMDD/fusion/final_factors.json)',
     )
     parser.add_argument(
         '--context-days', type=int, default=None,
@@ -1704,7 +1704,7 @@ Examples:
             from pathlib import Path as _Path
             experiments_dir = _Path('experiments')
             candidates = sorted(
-                experiments_dir.glob('*/results/final_factors.json'),
+                experiments_dir.glob('*/fusion/final_factors.json'),
                 key=lambda p: p.parent.parent.name,  # sort by date dir name
                 reverse=True,
             )
