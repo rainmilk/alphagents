@@ -843,11 +843,11 @@ class AAAI2027Pipeline:
         factor_details = []
         for fi in factor_infos:
             if not getattr(fi, 'is_valid', True):
-                logger.info("[step6] Skipping invalid factor '%s' from final_factors.json", fi.name)
+                print(f"[step6] Skipping invalid factor '{fi.name}' from final_factors.json")
                 continue
             ic_val = getattr(fi, 'ic', 0.0)
             if isinstance(ic_val, float) and _math.isnan(ic_val):
-                logger.info("[step6] Skipping factor '%s' with nan IC from final_factors.json", fi.name)
+                print(f"[step6] Skipping factor '{fi.name}' with nan IC from final_factors.json")
                 continue
             factor_details.append({
                 "name": fi.name,
