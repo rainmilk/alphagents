@@ -1713,7 +1713,7 @@ Examples:
             from pathlib import Path as _Path
             experiments_dir = _Path('experiments')
             candidates = sorted(
-                experiments_dir.glob('*/fusion/final_factors.json'),
+                experiments_dir.glob('*/*/fusion/final_factors.json'),
                 key=lambda p: p.parent.parent.name,  # sort by date dir name
                 reverse=True,
             )
