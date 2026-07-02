@@ -195,8 +195,13 @@ experiment:
   baselines:
     - "equal_weight"
     - "ic_weighted"
+    - "mcts_llm_alpha"
+    - "alphafama"
+    - "alphaagent"
+    - "alphaforge"
     - "alpha_grail"
     - "gpt_factor"
+    - "xgboost"
     
   metrics:
     - "annual_return"

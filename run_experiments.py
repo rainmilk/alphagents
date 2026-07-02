@@ -22,6 +22,24 @@ warnings.filterwarnings('ignore')
 # Import pipeline
 from main import AAAI2027Pipeline
 
+# Import AlphaFAMA runner
+from baselines.run_alphafama import run_alphafama_baseline
+
+# Import MCTS-LLM-Alpha runner
+from baselines.run_mcts_llm_alpha import run_mcts_llm_alpha_baseline
+
+# Import AlphaAgent runner
+from baselines.run_alphaagent import run_alphaagent_baseline
+
+# Import AlphaForge runner
+from baselines.run_alphaforge import run_alphaforge_baseline
+
+# Import XGBoost runner
+from baselines.run_xgboost_baseline import run_xgboost_baseline
+
+# Import AlphaGrail runner
+from baselines.run_alphagrail import run_alphagrail_baseline
+
 
 class ExperimentRunner:
     """
@@ -41,6 +59,8 @@ class ExperimentRunner:
         Args:
             config_path: Path to configuration file
         """
+        self.config_path = config_path  # Save for baselines that need to load data
+        
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
@@ -154,8 +174,13 @@ class ExperimentRunner:
         Baselines:
         1. Equal weight (random factors)
         2. IC-weighted (no evolution)
-        3. AlphaGrail (simulated)
-        4. GPT-Factor (simulated)
+        3. MCTS-LLM-Alpha (MCTS + LLM, real DataLoader)
+        4. AlphaFAMA (101 Alpha101 factors, A-share, real DataLoader)
+        5. AlphaAgent (LLM-driven factor mining, real DataLoader)
+        6. AlphaForge (AFF) (GAN-based factor generation, real DataLoader)
+        7. AlphaGrail (LLM-driven alpha selection, real DataLoader)
+        8. GPT-Factor (simulated)
+        9. XGBoost (gradient-boosted trees, real DataLoader)
         
         Returns:
             Dict of baseline results
@@ -176,15 +201,98 @@ class ExperimentRunner:
         metrics = self._run_baseline_ic_weighted()
         baseline_results['ic_weighted'] = metrics
         
-        # Baseline 3: AlphaGrail (simulated)
-        print("\n[ Baseline 3 ] AlphaGrail (simulated)...")
-        metrics = self._run_baseline_alphagrail()
-        baseline_results['alphagrail'] = metrics
+        # Baseline 3: MCTS-LLM-Alpha (real, using main DataLoader)
+        print("\n[ Baseline 3 ] MCTS-LLM-Alpha (MCTS + LLM, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_mcts_llm_alpha()
+            baseline_results['mcts_llm_alpha'] = metrics
+        except Exception as e:
+            print(f"  MCTS-LLM-Alpha baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['mcts_llm_alpha'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
         
-        # Baseline 4: GPT-Factor (simulated)
-        print("\n[ Baseline 4 ] GPT-Factor (simulated)...")
+        # Baseline 4: AlphaFAMA (real, using main DataLoader)
+        print("\n[ Baseline 4 ] AlphaFAMA (101 Alpha factors, A-share)...")
+        try:
+            metrics = self._run_baseline_alphafama()
+            baseline_results['alphafama'] = metrics
+        except Exception as e:
+            print(f"  AlphaFAMA baseline FAILED: {e}")
+            baseline_results['alphafama'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
+        
+        # Baseline 5: AlphaAgent (real, using main DataLoader)
+        print("\n[ Baseline 5 ] AlphaAgent (LLM-driven factor mining, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_alphaagent()
+            baseline_results['alphaagent'] = metrics
+        except Exception as e:
+            print(f"  AlphaAgent baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['alphaagent'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
+
+        # Baseline 6: AlphaForge (AFF) (real, using main DataLoader)
+        print("\n[ Baseline 6 ] AlphaForge (AFF) (GAN-based factor generation, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_alphaforge()
+            baseline_results['alphaforge'] = metrics
+        except Exception as e:
+            print(f"  AlphaForge baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['alphaforge'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
+
+        # Baseline 7: AlphaGrail (real, using main DataLoader)
+        print("\n[ Baseline 7 ] AlphaGrail (LLM-driven alpha selection, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_alphagrail()
+            baseline_results['alphagrail'] = metrics
+        except Exception as e:
+            print(f"  AlphaGrail baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['alphagrail'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
+        
+        # Baseline 8: GPT-Factor (simulated)
+        print("\n[ Baseline 8 ] GPT-Factor (simulated)...")
         metrics = self._run_baseline_gptfactor()
         baseline_results['gpt_factor'] = metrics
+
+        # Baseline 9: XGBoost (real, using main DataLoader)
+        print("\n[ Baseline 9 ] XGBoost (gradient-boosted trees, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_xgboost()
+            baseline_results['xgboost'] = metrics
+        except Exception as e:
+            print(f"  XGBoost baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['xgboost'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
         
         # Save results
         self._save_results(baseline_results, "baseline_comparisons")
@@ -444,12 +552,47 @@ class ExperimentRunner:
         }
     
     def _run_baseline_alphagrail(self) -> Dict:
-        """Run AlphaGrail baseline (simulated)."""
+        """
+        Run AlphaGrail baseline using main DataLoader.
+
+        Generates 37 seed alpha factors (from Seed Alpha.xlsx), evaluates them
+        via IC/ICIR/factor-Sharpe on training data, runs tournament selection
+        (quantitative fallback), and builds a top-N portfolio from the winning
+        factor, backtested via the unified BacktestEngine.
+
+        Returns:
+            Dict with performance metrics.
+        """
+        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
+        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        universe = self.config['data']['universe'].get('index', 'hs300')
+        train_end = self.config['data'].get('train_end_date', '2023-12-31')
+        test_start = self.config['data'].get('test_start_date', '2024-01-01')
+
+        output_dir = f"{self.output_dir}/alphagrail"
+
+        results = run_alphagrail_baseline(
+            config_path=self.config_path,
+            start_date=start_date,
+            end_date=end_date,
+            universe=universe,
+            train_end_date=train_end,
+            test_start_date=test_start,
+            top_n_stocks=50,
+            holding_period=1,
+            use_llm_tournament=False,
+            output_dir=output_dir,
+        )
+
         return {
-            'annual_return': 0.14,
-            'sharpe_ratio': 1.25,
-            'max_drawdown': -0.16,
-            'information_ratio': 0.88,
+            'annual_return': results.get('annual_return', 0.0),
+            'sharpe_ratio': results.get('sharpe_ratio', 0.0),
+            'max_drawdown': results.get('max_drawdown', 0.0),
+            'information_ratio': results.get('information_ratio', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
+            'icir': results.get('icir', 0.0),
+            'winning_factor': results.get('winning_factor', 'N/A'),
+            'n_factors': results.get('n_factors', 0),
         }
     
     def _run_baseline_gptfactor(self) -> Dict:
@@ -461,6 +604,215 @@ class ExperimentRunner:
             'information_ratio': 0.65,
         }
     
+    def _run_baseline_mcts_llm_alpha(self) -> Dict:
+        """
+        Run MCTS-LLM-Alpha baseline using main DataLoader.
+
+        Uses MCTS + LLM to search for alpha factors, with evaluation
+        performed via pandas-based Qlib expression parser on A-share data.
+
+        Falls back to synthetic formula generation if no API key.
+
+        Returns:
+            Dict with performance metrics.
+        """
+        output_dir = f"{self.output_dir}/mcts_llm_alpha"
+
+        results = run_mcts_llm_alpha_baseline(
+            config_path="config/config.yaml",
+            output_dir=output_dir,
+            iterations=20,
+            use_llm=False,  # No LLM by default for reproducible baseline
+        )
+
+        metrics = results.get('metrics', {})
+        return {
+            'annual_return': metrics.get('annual_return', 0.0),
+            'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
+            'max_drawdown': metrics.get('max_drawdown', 0.0),
+            'information_ratio': metrics.get('information_ratio', 0.0),
+            'mean_ic': metrics.get('mean_ic', 0.0),
+            'n_alphas': metrics.get('n_alphas', 0),
+        }
+
+    def _run_baseline_alphafama(self) -> Dict:
+        """
+        Run AlphaFAMA baseline using main DataLoader on A-share data.
+        
+        Generates 101 Alpha101 factors, computes Rank-IC, and simulates
+        an IC-weighted portfolio on the test set.
+        
+        Returns:
+            Dict with performance metrics.
+        """
+        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
+        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        universe = self.config['data']['universe'].get('index', 'hs300')
+        train_end = self.config['data'].get('train_end_date', '2023-12-31')
+        test_start = self.config['data'].get('test_start_date', '2024-01-01')
+        context_days = self.config['data'].get('context_days', 30)
+        
+        output_dir = f"{self.output_dir}/alphafama"
+        
+        results = run_alphafama_baseline(
+            config_path="config/config.yaml",
+            start_date=start_date,
+            end_date=end_date,
+            universe=universe,
+            train_end_date=train_end,
+            test_start_date=test_start,
+            context_days=context_days,
+            output_dir=output_dir,
+        )
+        
+        # Extract only the metrics expected by the baseline comparison table
+        return {
+            'annual_return': results.get('annual_return', 0.0),
+            'sharpe_ratio': results.get('sharpe_ratio', 0.0),
+            'max_drawdown': results.get('max_drawdown', 0.0),
+            'information_ratio': results.get('information_ratio', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
+            'icir': results.get('icir', 0.0),
+            'n_factors': results.get('n_factors', 0),
+        }
+    
+    def _run_baseline_alphaagent(self) -> Dict:
+        """
+        Run AlphaAgent baseline using main DataLoader.
+
+        Generates simulated factor formulas using AlphaAgent's function library
+        notation, computes factor values in pandas, and evaluates via IC-ranked
+        portfolio backtest on A-share data.
+
+        Returns:
+            Dict with performance metrics.
+        """
+        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
+        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        train_end = self.config['data'].get('train_end_date', '2023-12-31')
+        test_start = self.config['data'].get('test_start_date', '2024-01-01')
+
+        output_dir = f"{self.output_dir}/alphaagent"
+
+        results = run_alphaagent_baseline(
+            config_path="config/config.yaml",
+            output_dir=output_dir,
+            n_formulas=50,
+            seed=42,
+            start_date=start_date,
+            end_date=end_date,
+            train_end_date=train_end,
+            test_start_date=test_start,
+        )
+
+        return {
+            'annual_return': results.get('annual_return', 0.0),
+            'sharpe_ratio': results.get('sharpe_ratio', 0.0),
+            'max_drawdown': results.get('max_drawdown', 0.0),
+            'information_ratio': results.get('information_ratio', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
+            'icir': results.get('icir', 0.0),
+            'n_factors': results.get('n_factors', 0),
+        }
+    
+    def _run_baseline_alphaforge(self) -> Dict:
+        """
+        Run AlphaForge (AFF) baseline using config path.
+        
+        This follows the same pattern as other baselines (AlphaAgent, AlphaFAMA).
+        The DataLoader is created inside run_alphaforge_baseline() from config.
+        
+        Returns:
+            Dict with performance metrics.
+        """
+        print(f"\n[Baseline] AlphaForge (AFF) - Using config: {self.config_path}")
+        
+        try:
+            # Call run_alphaforge_baseline with config_path
+            # The function will create DataLoader internally
+            results = run_alphaforge_baseline(
+                config_path=self.config_path,
+                start_date=self.config['data']['universe'].get('start_date', '2019-01-01'),
+                end_date=self.config['data']['universe'].get('end_date', '2025-12-31'),
+                instruments=self.config['data']['universe'].get('name', 'csi300'),
+                top_n_stocks=self.config.get('backtest', {}).get('top_n_stocks', 50),
+                n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
+                output_dir=f"{self.output_dir}/alphaforge",
+                verbose=True,
+            )
+            
+            return {
+                'annual_return': results['metrics']['annual_return'],
+                'sharpe_ratio': results['metrics']['sharpe_ratio'],
+                'max_drawdown': results['metrics']['max_drawdown'],
+                'information_ratio': results['metrics']['information_ratio'],
+                'n_factors': results.get('n_factors', 0),
+            }
+            
+        except Exception as e:
+            print(f"  ❌ AlphaForge baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return default values
+            return {
+                'annual_return': 0.0,
+                'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'information_ratio': 0.0,
+                'ic_mean': 0.0,
+                'rank_ic_mean': 0.0,
+                'n_factors': 0,
+                'error': str(e),
+            }
+    
+    def _run_baseline_xgboost(self) -> Dict:
+        """
+        Run XGBoost baseline using main DataLoader.
+
+        Constructs 20+ technical features from OHLCV data, trains a
+        gradient-boosted-tree model (XGBoost or sklearn fallback) to predict
+        next-day cross-sectional return ranks, and builds a long-only
+        top-N portfolio backtested via the unified BacktestEngine.
+
+        Returns:
+            Dict with performance metrics.
+        """
+        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
+        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        universe = self.config['data']['universe'].get('index', 'hs300')
+        train_end = self.config['data'].get('train_end_date', '2023-12-31')
+        test_start = self.config['data'].get('test_start_date', '2024-01-01')
+
+        output_dir = f"{self.output_dir}/xgboost"
+
+        results = run_xgboost_baseline(
+            config_path=self.config_path,
+            start_date=start_date,
+            end_date=end_date,
+            universe=universe,
+            train_end_date=train_end,
+            test_start_date=test_start,
+            top_n_stocks=50,
+            train_window=250,
+            retrain_freq=5,
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            holding_period=1,
+            output_dir=output_dir,
+        )
+
+        return {
+            'annual_return': results.get('annual_return', 0.0),
+            'sharpe_ratio': results.get('sharpe_ratio', 0.0),
+            'max_drawdown': results.get('max_drawdown', 0.0),
+            'information_ratio': results.get('information_ratio', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic', 0.0),
+            'icir': results.get('icir', 0.0),
+            'n_features': results.get('n_features', 0),
+        }
+
     def _run_pipeline_with_regime(self, regime: str) -> Dict:
         """Run pipeline with specific market regime."""
         # Simplified implementation
