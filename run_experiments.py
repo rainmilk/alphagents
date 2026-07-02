@@ -40,6 +40,9 @@ from baselines.run_xgboost_baseline import run_xgboost_baseline
 # Import AlphaGrail runner
 from baselines.run_alphagrail import run_alphagrail_baseline
 
+# Import AlphaGen runner
+from baselines.run_alphagen import run_alphagen_baseline
+
 
 class ExperimentRunner:
     """
@@ -289,6 +292,21 @@ class ExperimentRunner:
             import traceback
             traceback.print_exc()
             baseline_results['xgboost'] = {
+                'annual_return': 0.0, 'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0, 'information_ratio': 0.0,
+                'error': str(e),
+            }
+        
+        # Baseline 10: AlphaGen (RL-inspired token-based factor generation)
+        print("\n[ Baseline 10 ] AlphaGen (RL-inspired token-based factor generation, real DataLoader)...")
+        try:
+            metrics = self._run_baseline_alphagen()
+            baseline_results['alphagen'] = metrics
+        except Exception as e:
+            print(f"  AlphaGen baseline FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            baseline_results['alphagen'] = {
                 'annual_return': 0.0, 'sharpe_ratio': 0.0,
                 'max_drawdown': 0.0, 'information_ratio': 0.0,
                 'error': str(e),
@@ -811,6 +829,52 @@ class ExperimentRunner:
             'mean_rank_ic': results.get('mean_rank_ic', 0.0),
             'icir': results.get('icir', 0.0),
             'n_features': results.get('n_features', 0),
+        }
+
+    def _run_baseline_alphagen(self) -> Dict:
+        """
+        Run AlphaGen baseline using main DataLoader.
+
+        AlphaGen implements RL-inspired token-based factor generation:
+        random sampling of valid expression trees (51-token vocabulary
+        with grammar rules), factor evaluation via Rank IC on training
+        data, AlphaPool with mutual-IC dedup and ensemble optimization,
+        top-N portfolio construction, and backtest via unified engine.
+
+        Returns:
+            Dict with performance metrics.
+        """
+        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
+        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        universe = self.config['data']['universe'].get('index', 'hs300')
+        train_end = self.config['data'].get('train_end_date', '2023-12-31')
+        test_start = self.config['data'].get('test_start_date', '2024-01-01')
+
+        output_dir = f"{self.output_dir}/alphagen"
+
+        results = run_alphagen_baseline(
+            config_path=self.config_path,
+            start_date=start_date,
+            end_date=end_date,
+            universe=universe,
+            train_end_date=train_end,
+            test_start_date=test_start,
+            n_generate=300,
+            pool_capacity=20,
+            top_n_stocks=50,
+            holding_period=1,
+            seed=42,
+            output_dir=output_dir,
+        )
+
+        return {
+            'annual_return': results.get('annual_return', 0.0),
+            'sharpe_ratio': results.get('sharpe_ratio', 0.0),
+            'max_drawdown': results.get('max_drawdown', 0.0),
+            'information_ratio': results.get('information_ratio', 0.0),
+            'test_icir': results.get('test_icir', 0.0),
+            'pool_size': results.get('pool_size', 0),
+            'n_factors': results.get('n_factors', 0),
         }
 
     def _run_pipeline_with_regime(self, regime: str) -> Dict:
