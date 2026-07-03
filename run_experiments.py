@@ -220,7 +220,7 @@ class ExperimentRunner:
             }
         
         # Baseline 4: AlphaFAMA (real, using main DataLoader)
-        print("\n[ Baseline 4 ] AlphaFAMA (101 Alpha factors, A-share)...")
+        print("\n[ Baseline 4 ] AlphaFAMA (101 Alpha + LLM mining, A-share)...")
         try:
             metrics = self._run_baseline_alphafama()
             baseline_results['alphafama'] = metrics
@@ -657,8 +657,10 @@ class ExperimentRunner:
         """
         Run AlphaFAMA baseline using main DataLoader on A-share data.
         
-        Generates 101 Alpha101 factors, computes Rank-IC, and simulates
-        an IC-weighted portfolio on the test set.
+        Generates 101 Alpha101 factors, computes Rank-IC, clusters factors
+        by IC profiles, then runs FAMA LLM alpha-mining to iteratively
+        generate new factors via LLM fusion of top performers.
+        Simulates an IC-weighted portfolio on the test set.
         
         Returns:
             Dict with performance metrics.
@@ -692,15 +694,23 @@ class ExperimentRunner:
             'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
             'icir': results.get('icir', 0.0),
             'n_factors': results.get('n_factors', 0),
+            'used_llm': results.get('used_llm', False),
+            'llm_model': results.get('llm_model', None),
+            'n_llm_factors': results.get('n_llm_factors', 0),
         }
     
     def _run_baseline_alphaagent(self) -> Dict:
         """
         Run AlphaAgent baseline using main DataLoader.
 
-        Generates simulated factor formulas using AlphaAgent's function library
-        notation, computes factor values in pandas, and evaluates via IC-ranked
-        portfolio backtest on A-share data.
+        Uses LLM (configured in config.yaml llm.generator section) to generate
+        factor formulas via a two-stage pipeline:
+          Stage 1: LLM generates market hypotheses
+          Stage 2: LLM converts hypotheses to factor expressions
+        Falls back to random generation when LLM is unavailable.
+
+        Computes factor values using AlphaAgent's function library, evaluates
+        via IC-ranked portfolio backtest on A-share data.
 
         Returns:
             Dict with performance metrics.
@@ -731,6 +741,8 @@ class ExperimentRunner:
             'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
             'icir': results.get('icir', 0.0),
             'n_factors': results.get('n_factors', 0),
+            'used_llm': results.get('used_llm', False),
+            'llm_model': results.get('llm_model', None),
         }
     
     def _run_baseline_alphaforge(self) -> Dict:
