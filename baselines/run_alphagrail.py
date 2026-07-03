@@ -6,10 +6,20 @@ AlphaGrail Baseline Runner - Integrated with Main DataLoader & BacktestEngine
 AlphaGrail: "Automate-Strategy-Finding-with-LLM-in-Quant-investment"
 
 Core methodology (from baselines/AlphaGrail/):
-  1. Seed Alpha Generation: 37 alpha factor formulas (from Seed Alpha.xlsx)
-  2. Factor Evaluation: compute IC, Rank-IC, ICIR, factor-mimicking portfolio metrics
-  3. LLM Tournament Selection: pairwise comparison via LLM (GPT-4o) or
-     quantitative fallback (composite ICIR/Sharpe score)
+  1. Seed Alpha Generation: 35 alpha factor formulas (from Seed Alpha.xlsx)
+     - Uses real fundamentals (EPS, PB, GPM) when available
+     - Falls back to clearly-marked price-based proxies otherwise
+     - Duplicates from original Excel removed (PriceReturn14d_v2, SMA20_minus_Close)
+  2. Factor Evaluation: comprehensive metrics matching original AlphaGrail's
+     FactorAnalysisEngine output:
+     - IC summary (mean_ic, ic_std, icir, ic_positive_ratio)
+     - Quantile returns (monotonicity score, long-short spread)
+     - Quantile turnover
+     - Factor returns (Sharpe, volatility)
+     - Max drawdown
+     - Optional: industry + size neutralization
+  3. LLM Tournament Selection: linear king-of-the-hill (sequential comparison)
+     via LLM (GPT-4o) with full metric set, or quantitative fallback
   4. Portfolio Construction: top-N stocks by winning factor score, equal-weight
   5. Backtest: unified BacktestEngine (commission=0.0003, slippage=0.001)
 
@@ -21,8 +31,8 @@ References:
   - baselines/AlphaGrail/AutoGPT/main.py   (LLM tournament selection)
   - baselines/AlphaGrail/data/Seed Alpha.xlsx (37 seed formulas)
 
-Author: Code Review Expert (火眼眼)
-Date: 2026-07-02
+Author: Code Review Expert
+Date: 2026-07-02 (updated 2026-07-03)
 """
 
 import sys
@@ -60,6 +70,9 @@ class AlphaGrailConfig:
     train_window: int = 250         # Training window (trading days)
     retrain_freq: int = 20          # Re-evaluate factors every N days
     min_stocks_per_day: int = 10    # Minimum stocks with valid factor values
+    forward_period: int = 10        # Forward return period (must match MASE forward_period)
+    n_quantiles: int = 5            # Number of quantile groups for group return analysis
+    use_neutralization: bool = False # Apply industry+size neutralization (needs industry_data)
     # LLM config (read from config.yaml llm.generator section)
     llm_api_key: str = ""           # API key for LLM service
     llm_base_url: str = ""          # Base URL for LLM service
@@ -134,16 +147,25 @@ def _compute_rsi(close: pd.DataFrame, n: int = 10) -> pd.DataFrame:
 # returns a DataFrame (date × stock) of factor values.
 # All 37 factors from Seed Alpha.xlsx are implemented.
 
-def _build_factor_library(price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+def _build_factor_library(price_data: Dict[str, pd.DataFrame],
+                          fundamental_data: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, pd.DataFrame]:
     """
-    Build all 37 seed alpha factors from Seed Alpha.xlsx.
+    Build all seed alpha factors from Seed Alpha.xlsx.
+
+    Original AlphaGrail uses rqfactor with real fundamentals (EPS, PB, gross_profit_margin).
+    When fundamental_data is provided, real fundamentals are used.
+    Otherwise, price-based proxies are used and clearly marked with _proxy suffix.
+
+    Duplicates from the original Seed Alpha.xlsx (e.g. PriceReturn14d == PriceReturn14d_v2,
+    MeanReversion == SMA20_minus_Close) are removed to avoid biasing the tournament.
 
     Args:
         price_data: dict with keys 'open', 'high', 'low', 'close', 'volume', 'amount'
-                    Each value is a DataFrame (date × stock).
+        fundamental_data: optional dict with keys like 'eps', 'pb_ratio_ttm',
+                          'gross_profit_margin_ttm', etc.
 
     Returns:
-        Dict mapping factor name → DataFrame (date × stock) of factor values.
+        Dict mapping factor name to DataFrame (date x stock) of factor values.
     """
     close = price_data['close']
     high = price_data.get('high', close)
@@ -154,9 +176,10 @@ def _build_factor_library(price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
     # Precompute common indicators
     atr = _compute_atr(high, low, close, 14)
     rsi = _compute_rsi(close, 10)
-    vwap = amount / (volume + 1e-10)
 
     factors = {}
+
+    # ── Momentum factors ──────────────────────────────────────────────
 
     # 1. PriceMomentum = CLOSE - DELAY(CLOSE, 14)
     factors['PriceMomentum'] = close - _delay(close, 14)
@@ -167,13 +190,11 @@ def _build_factor_library(price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
     # 3. RSIMomentum = RSI - DELAY(RSI, 14)
     factors['RSIMomentum'] = rsi - _delay(rsi, 14)
 
-    # 4. ((CLOSE / DELAY(CLOSE, 14)) - 1)
+    # 4. PriceReturn14d = (CLOSE / DELAY(CLOSE, 14)) - 1
+    #    NOTE: Original Seed Alpha has a duplicate (#5) with identical formula — removed.
     factors['PriceReturn14d'] = (close / _delay(close, 14)) - 1
 
-    # 5. ((CLOSE - DELAY(CLOSE, 14)) / DELAY(CLOSE, 14))  — same as #4, keep for fidelity
-    factors['PriceReturn14d_v2'] = (close - _delay(close, 14)) / (_delay(close, 14) + 1e-10)
-
-    # 6. RSI-like: (SUM(gain, 14) - SUM(loss, 14)) / (SUM(gain, 14) + SUM(loss, 14)) * 100
+    # 5. RSI_manual = (SUM(gain,14) - SUM(loss,14)) / (SUM(gain,14) + SUM(loss,14)) * 100
     delta = close.diff()
     gain = delta.where(delta > 0, 0)
     loss = (-delta).where(delta < 0, 0)
@@ -181,113 +202,227 @@ def _build_factor_library(price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
     sum_loss = _rolling_sum(loss, 14)
     factors['RSI_manual'] = ((sum_gain - sum_loss) / (sum_gain + sum_loss + 1e-10)) * 100
 
-    # 7. Stochastic %K: ((CLOSE - MIN(LOW, 14)) - (MAX(HIGH, 14) - CLOSE)) / (MAX(HIGH, 14) - MIN(LOW, 14))
+    # 6. Stochastic_K = ((CLOSE - MIN(LOW,14)) - (MAX(HIGH,14) - CLOSE)) / (MAX(HIGH,14) - MIN(LOW,14))
     min_low_14 = _rolling_min(low, 14)
     max_high_14 = _rolling_max(high, 14)
     factors['Stochastic_K'] = ((close - min_low_14) - (max_high_14 - close)) / (max_high_14 - min_low_14 + 1e-10)
 
-    # 8. (ATR - DELAY(ATR, 14))
+    # 7. ATRMomentum = ATR - DELAY(ATR, 14)
     factors['ATRMomentum'] = atr - _delay(atr, 14)
 
-    # 9. (CLOSE - DELAY(SMA(CLOSE, 14), 7))
+    # 8. Price_vs_SMA14_delay7 = CLOSE - DELAY(SMA(CLOSE,14), 7)
     factors['Price_vs_SMA14_delay7'] = close - _delay(_sma(close, 14), 7)
 
-    # 10. MeanReversion = MA(CLOSE, 20) - CLOSE
+    # ── Mean reversion factors ────────────────────────────────────────
+
+    # 9. MeanReversion = MA(CLOSE,20) - CLOSE
+    #    NOTE: Original Seed Alpha has a duplicate (#13 SMA20_minus_Close) — removed.
     factors['MeanReversion'] = _sma(close, 20) - close
 
-    # 11. ZScoreMeanReversion = (CLOSE - MA(CLOSE, 20)) / STD(CLOSE, 20)
+    # 10. ZScoreMeanReversion = (CLOSE - MA(CLOSE,20)) / STD(CLOSE,20)
     factors['ZScoreMeanReversion'] = (close - _sma(close, 20)) / (_std(close, 20) + 1e-10)
 
-    # 12. BollingerBands = (CLOSE - MA(CLOSE, 20)) / (2 * STD(CLOSE, 20))
+    # 11. BollingerBands = (CLOSE - MA(CLOSE,20)) / (2 * STD(CLOSE,20))
     factors['BollingerBands'] = (close - _sma(close, 20)) / (2 * _std(close, 20) + 1e-10)
 
-    # 13. (SMA(CLOSE, 20) - CLOSE)  — same as MeanReversion, keep for fidelity
-    factors['SMA20_minus_Close'] = _sma(close, 20) - close
-
-    # 14. (EMA(CLOSE, 20) - CLOSE)
+    # 12. EMA20_minus_Close = EMA(CLOSE,20) - CLOSE
     factors['EMA20_minus_Close'] = _ema(close, 20) - close
 
-    # 15. (MAX(HIGH, 20) - CLOSE)
+    # 13. MaxHigh20_minus_Close = MAX(HIGH,20) - CLOSE
     factors['MaxHigh20_minus_Close'] = _rolling_max(high, 20) - close
 
-    # 16. (CLOSE - MIN(LOW, 20))
+    # 14. Close_minus_MinLow20 = CLOSE - MIN(LOW,20)
     factors['Close_minus_MinLow20'] = close - _rolling_min(low, 20)
 
-    # 17. (100 - RSI)
+    # 15. InverseRSI = 100 - RSI
     factors['InverseRSI'] = 100 - rsi
 
-    # 18. StandardDeviation = STD(CLOSE, 20)
+    # ── Volatility factors ────────────────────────────────────────────
+
+    # 16. StandardDeviation = STD(CLOSE,20)
     factors['StandardDeviation'] = _std(close, 20)
 
-    # 19. ATR
+    # 17. ATR
     factors['ATR'] = atr
 
-    # 20. BollingerBandWidth = (BOLL_UP - BOLL_DOWN) / SMA(CLOSE, 20)
-    #     BOLL_UP = MA(CLOSE, 20) + 2*STD(CLOSE, 20), BOLL_DOWN = MA(CLOSE, 20) - 2*STD(CLOSE, 20)
+    # 18. BollingerBandWidth = (BOLL_UP - BOLL_DOWN) / SMA(CLOSE,20)
     boll_up = _sma(close, 20) + 2 * _std(close, 20)
     boll_down = _sma(close, 20) - 2 * _std(close, 20)
     factors['BollingerBandWidth'] = (boll_up - boll_down) / (_sma(close, 20) + 1e-10)
 
-    # 21. STD(CLOSE, 10) / STD(CLOSE, 50)
+    # 19. VolRatio_10_50 = STD(CLOSE,10) / STD(CLOSE,50)
     factors['VolRatio_10_50'] = _std(close, 10) / (_std(close, 50) + 1e-10)
 
-    # 22. (EMA(HIGH - LOW, 10) / DELAY(EMA(HIGH - LOW, 10), 10)) - 1
+    # 20. HL_EMA_ratio = (EMA(HIGH-LOW,10) / DELAY(EMA(HIGH-LOW,10),10)) - 1
     hl_ema = _ema(high - low, 10)
     factors['HL_EMA_ratio'] = (hl_ema / (_delay(hl_ema, 10) + 1e-10)) - 1
 
-    # 23. PE = CLOSE / EPS — fundamental, use inverse of price as proxy if no fundamentals
-    #     We use 1/close as a price-based proxy (cheaper stocks score higher)
-    factors['PE_proxy'] = 1.0 / (close + 1e-10)
+    # ── Fundamental factors (use real data if available, else proxy) ──
 
-    # 24. PB — fundamental, use book-to-market proxy (1/close)
-    factors['PB_proxy'] = 1.0 / (close + 1e-10)
+    if fundamental_data and 'eps' in fundamental_data:
+        # 21. PE = CLOSE / EPS (real)
+        factors['PE'] = close / (fundamental_data['eps'].reindex(index=close.index, columns=close.columns) + 1e-10)
+    else:
+        # 21. PE_proxy — price-based proxy (1/close). NOT equivalent to real PE.
+        factors['PE_proxy'] = 1.0 / (close + 1e-10)
 
-    # 25. VOLUME
+    if fundamental_data and 'pb_ratio_ttm' in fundamental_data:
+        # 22. PB (real)
+        factors['PB'] = fundamental_data['pb_ratio_ttm'].reindex(index=close.index, columns=close.columns)
+    else:
+        # 22. PB_proxy — price-based proxy. NOT equivalent to real PB.
+        factors['PB_proxy'] = 1.0 / (close + 1e-10)
+
+    if fundamental_data and 'gross_profit_margin_ttm' in fundamental_data:
+        # 23. GrossProfitMargin (real)
+        factors['GrossProfitMargin'] = fundamental_data['gross_profit_margin_ttm'].reindex(index=close.index, columns=close.columns)
+    else:
+        # 23. GrossProfitMargin_proxy — 60d return as proxy. NOT equivalent to real GPM.
+        factors['GrossProfitMargin_proxy'] = (close / _delay(close, 60) - 1)
+
+    if fundamental_data and 'profit_from_operation_to_revenue_ttm' in fundamental_data:
+        # 24. OperatingProfitMargin (real)
+        factors['OperatingProfitMargin'] = fundamental_data['profit_from_operation_to_revenue_ttm'].reindex(index=close.index, columns=close.columns)
+    else:
+        # 24. OperatingProfitMargin_proxy — 20d return as proxy. NOT equivalent.
+        factors['OperatingProfitMargin_proxy'] = (close / _delay(close, 20) - 1)
+
+    if fundamental_data and 'peg_ratio_ttm' in fundamental_data:
+        # 25. EarningsGrowthRate (real, via PEG)
+        factors['EarningsGrowthRate'] = fundamental_data['peg_ratio_ttm'].reindex(index=close.index, columns=close.columns)
+    else:
+        # 25. EarningsGrowthRate_proxy — 90d return as proxy. NOT equivalent.
+        factors['EarningsGrowthRate_proxy'] = (close / _delay(close, 90) - 1)
+
+    # 26. EBITDAGrowthRate = EBITDA / DELAY(EBITDA,1) - 1
+    if fundamental_data and 'ebitda_ttm' in fundamental_data:
+        ebitda = fundamental_data['ebitda_ttm'].reindex(index=close.index, columns=close.columns)
+        factors['EBITDAGrowthRate'] = ebitda / (_delay(ebitda, 1) + 1e-10) - 1
+    else:
+        # 26. EBITDAGrowthRate_proxy — dollar volume growth as proxy. NOT equivalent.
+        dollar_vol = volume * close
+        factors['EBITDAGrowthRate_proxy'] = dollar_vol / (_delay(dollar_vol, 1) + 1e-10) - 1
+
+    # ── Volume / liquidity factors ────────────────────────────────────
+
+    # 27. Volume
     factors['Volume'] = volume
 
-    # 26. (VOLUME - DELAY(VOLUME, 14)) / DELAY(VOLUME, 14)
+    # 28. VolumeReturn14d = (VOLUME - DELAY(VOLUME,14)) / DELAY(VOLUME,14)
     factors['VolumeReturn14d'] = (volume - _delay(volume, 14)) / (_delay(volume, 14) + 1e-10)
 
-    # 27. VOLUME / MARKET_CAP — use volume / (close * shares_outstanding) ≈ volume / amount * close
-    #     Since we don't have shares_outstanding, use turnover proxy: volume / close
+    # 29. Turnover_proxy = VOLUME / CLOSE (proxy for turnover since no shares_outstanding)
     factors['Turnover_proxy'] = volume / (close + 1e-10)
 
-    # 28. AverageTradingVolume = MA(VOLUME, 20)
+    # 30. AverageTradingVolume = MA(VOLUME,20)
     factors['AverageTradingVolume'] = _sma(volume, 20)
 
-    # 29. (HIGH - LOW) / CLOSE
+    # 31. DailyRange = (HIGH - LOW) / CLOSE
     factors['DailyRange'] = (high - low) / (close + 1e-10)
 
-    # 30. VOLUME * CLOSE (dollar volume)
+    # 32. DollarVolume = VOLUME * CLOSE
     factors['DollarVolume'] = volume * close
 
-    # 31. GrossProfitMargin — fundamental, not available; use price momentum as proxy
-    factors['GrossProfitMargin_proxy'] = (close / _delay(close, 60) - 1)
+    # ── Moving average factors ────────────────────────────────────────
 
-    # 32. OperatingProfitMargin — fundamental, not available; use 20d return as proxy
-    factors['OperatingProfitMargin_proxy'] = (close / _delay(close, 20) - 1)
-
-    # 33. EarningsGrowthRate — fundamental, not available; use 90d return as proxy
-    factors['EarningsGrowthRate_proxy'] = (close / _delay(close, 90) - 1)
-
-    # 34. EBITDAGrowthRate = EBITDA / DELAY(EBITDA, 1) - 1
-    #     Use dollar volume as EBITDA proxy
-    factors['EBITDAGrowthRate_proxy'] = factors['DollarVolume'] / (_delay(factors['DollarVolume'], 1) + 1e-10) - 1
-
-    # 35. ExponentialMovingAverage = EMA(CLOSE, 20)
+    # 33. ExponentialMovingAverage = EMA(CLOSE,20)
     factors['ExponentialMovingAverage'] = _ema(close, 20)
 
-    # 36. ((CLOSE - MIN(LOW, 14)) / (MAX(HIGH, 14) - MIN(LOW, 14))) * 100  (Stochastic %K)
+    # 34. Stochastic_pct_K = ((CLOSE - MIN(LOW,14)) / (MAX(HIGH,14) - MIN(LOW,14))) * 100
     factors['Stochastic_pct_K'] = ((close - min_low_14) / (max_high_14 - min_low_14 + 1e-10)) * 100
 
-    # 37. ((MAX(HIGH, 14) - CLOSE) / (MAX(HIGH, 14) - MIN(LOW, 14))) * -100  (Stochastic %D inverted)
+    # 35. Stochastic_pct_D_inv = ((MAX(HIGH,14) - CLOSE) / (MAX(HIGH,14) - MIN(LOW,14))) * -100
     factors['Stochastic_pct_D_inv'] = ((max_high_14 - close) / (max_high_14 - min_low_14 + 1e-10)) * -100
 
     return factors
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Factor Evaluation
+#  Factor Neutralization (mirrors original AlphaGrail's Neutralization pipeline)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _neutralize_factor(
+    factor_values: pd.DataFrame,
+    industry_data: Optional[pd.DataFrame] = None,
+    size_data: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    Apply industry and size neutralization to factor values.
+
+    Mirrors the original AlphaGrail's Neutralization(industry='citics_2019',
+    style_factors=['size', 'beta', ...]) pipeline. This implementation does
+    a simplified cross-sectional regression: factor ~ industry_dummies + log(size).
+
+    Args:
+        factor_values: Factor values (date x stock)
+        industry_data: Industry membership (date x stock), values are industry codes
+        size_data: Market cap or size proxy (date x stock)
+
+    Returns:
+        Neutralized factor values (residuals after regression)
+    """
+    result = factor_values.copy()
+
+    for date in result.index:
+        row = result.loc[date].dropna()
+        if len(row) < 20:
+            continue
+
+        # Build regression matrix
+        regressors = []
+
+        # Industry dummies
+        if industry_data is not None and date in industry_data.index:
+            ind = industry_data.loc[date].reindex(row.index)
+            dummies = pd.get_dummies(ind, drop_first=True)
+            if dummies.shape[1] > 0:
+                regressors.append(dummies.values.astype(float))
+
+        # Size factor (log market cap)
+        if size_data is not None and date in size_data.index:
+            sz = size_data.loc[date].reindex(row.index)
+            log_sz = np.log(sz.clip(lower=1e-10))
+            if log_sz.notna().all():
+                regressors.append(log_sz.values.reshape(-1, 1))
+
+        if not regressors:
+            continue
+
+        X = np.column_stack(regressors) if len(regressors) > 1 else regressors[0]
+        X = np.column_stack([np.ones(len(row)), X])  # intercept
+
+        y = row.values.astype(float)
+
+        try:
+            # OLS: beta = (X'X)^-1 X'y
+            beta = np.linalg.lstsq(X, y, rcond=None)[0]
+            residuals = y - X @ beta
+            result.loc[date, row.index] = residuals
+        except np.linalg.LinAlgError:
+            continue
+
+    return result
+
+
+def _neutralize_factor_library(
+    factor_library: Dict[str, pd.DataFrame],
+    industry_data: Optional[pd.DataFrame] = None,
+    size_data: Optional[pd.DataFrame] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Apply neutralization to all factors in the library."""
+    if industry_data is None and size_data is None:
+        return factor_library
+
+    neutralized = {}
+    for name, values in factor_library.items():
+        neutralized[name] = _neutralize_factor(values, industry_data, size_data)
+    return neutralized
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Factor Evaluation — computes the full metric set that the original
+#  AlphaGrail feeds to GPT-4o (IC summary, quantile returns, turnover,
+#  factor returns, max drawdown, volatility)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _compute_forward_returns(close: pd.DataFrame, periods: List[int] = [1]) -> Dict[int, pd.DataFrame]:
@@ -392,8 +527,8 @@ def _compute_factor_sharpe(factor_values: pd.DataFrame, forward_returns: pd.Data
     Long top-N stocks, short bottom-N stocks, daily rebalance.
 
     Args:
-        factor_values: Factor values (date × stock)
-        forward_returns: Forward returns (date × stock)
+        factor_values: Factor values (date x stock)
+        forward_returns: Forward returns (date x stock)
         top_n: Number of stocks for long/short
 
     Returns:
@@ -435,46 +570,266 @@ def _compute_factor_sharpe(factor_values: pd.DataFrame, forward_returns: pd.Data
     return float(np.sqrt(252) * mean_ret / std_ret)
 
 
+def _compute_quantile_returns(
+    factor_values: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    n_quantiles: int = 5,
+) -> Tuple[pd.Series, float]:
+    """
+    Compute quantile portfolio returns and monotonicity score.
+
+    Mirrors original AlphaGrail's QuantileReturnAnalysis(quantile=5).
+    A good factor should show monotonic returns across quantiles.
+
+    Args:
+        factor_values: Factor values (date x stock)
+        forward_returns: Forward returns (date x stock)
+        n_quantiles: Number of quantile groups
+
+    Returns:
+        (mean_returns_by_quantile, monotonicity_score)
+        monotonicity_score: 1.0 = perfectly monotonic, 0.0 = random
+    """
+    quantile_daily_returns = {q: [] for q in range(n_quantiles)}
+    common_dates = factor_values.index.intersection(forward_returns.index)
+
+    for date in common_dates:
+        f = factor_values.loc[date].dropna()
+        r = forward_returns.loc[date].dropna()
+        common = f.index.intersection(r.index)
+
+        if len(common) < n_quantiles * 2:
+            continue
+
+        f_aligned = f[common]
+        r_aligned = r[common]
+
+        # Assign quantile labels (0 = lowest factor value, n-1 = highest)
+        try:
+            labels = pd.qcut(f_aligned, n_quantiles, labels=False, duplicates='drop')
+        except ValueError:
+            continue
+
+        for q in range(n_quantiles):
+            mask = labels == q
+            if mask.sum() > 0:
+                quantile_daily_returns[q].append(r_aligned[mask].mean())
+
+    # Average returns per quantile
+    mean_returns = []
+    for q in range(n_quantiles):
+        if quantile_daily_returns[q]:
+            mean_returns.append(np.mean(quantile_daily_returns[q]))
+        else:
+            mean_returns.append(0.0)
+
+    mean_returns = pd.Series(mean_returns, index=range(n_quantiles))
+
+    # Monotonicity: fraction of adjacent pairs that are correctly ordered
+    if len(mean_returns) < 2:
+        return mean_returns, 0.0
+
+    diffs = np.diff(mean_returns.values)
+    n_positive = (diffs > 0).sum()
+    n_negative = (diffs < 0).sum()
+    monotonicity = max(n_positive, n_negative) / len(diffs)
+
+    return mean_returns, float(monotonicity)
+
+
+def _compute_quantile_turnover(
+    factor_values: pd.DataFrame,
+    n_quantiles: int = 5,
+) -> float:
+    """
+    Compute average quantile portfolio turnover.
+
+    Mirrors original AlphaGrail's quantile_turnover metric.
+    Lower turnover = more stable factor.
+
+    Args:
+        factor_values: Factor values (date x stock)
+        n_quantiles: Number of quantile groups
+
+    Returns:
+        Average daily turnover (0-1 scale)
+    """
+    turnovers = []
+    dates = factor_values.index.tolist()
+
+    for i in range(1, len(dates)):
+        prev = factor_values.loc[dates[i-1]].dropna()
+        curr = factor_values.loc[dates[i]].dropna()
+        common = prev.index.intersection(curr.index)
+
+        if len(common) < n_quantiles * 2:
+            continue
+
+        try:
+            prev_labels = pd.qcut(prev[common], n_quantiles, labels=False, duplicates='drop')
+            curr_labels = pd.qcut(curr[common], n_quantiles, labels=False, duplicates='drop')
+        except ValueError:
+            continue
+
+        # Turnover for top quantile (most relevant for trading)
+        prev_top = set(prev_labels[prev_labels == n_quantiles - 1].index)
+        curr_top = set(curr_labels[curr_labels == n_quantiles - 1].index)
+
+        if prev_top or curr_top:
+            overlap = len(prev_top & curr_top)
+            total = len(prev_top | curr_top)
+            turnover = 1.0 - (overlap / total) if total > 0 else 0.0
+            turnovers.append(turnover)
+
+    return float(np.mean(turnovers)) if turnovers else 0.0
+
+
+def _compute_max_drawdown(factor_values: pd.DataFrame, forward_returns: pd.DataFrame, top_n: int = 50) -> float:
+    """
+    Compute max drawdown of the factor-mimicking long-short portfolio.
+
+    Mirrors original AlphaGrail's max_drawdown() metric.
+
+    Args:
+        factor_values: Factor values (date x stock)
+        forward_returns: Forward returns (date x stock)
+        top_n: Number of stocks for long/short
+
+    Returns:
+        Maximum drawdown (positive number, e.g. 0.15 = 15% drawdown)
+    """
+    daily_returns = []
+    common_dates = factor_values.index.intersection(forward_returns.index)
+
+    for date in common_dates:
+        f = factor_values.loc[date].dropna()
+        r = forward_returns.loc[date].dropna()
+        common = f.index.intersection(r.index)
+
+        if len(common) < 2 * top_n:
+            continue
+
+        f_aligned = f[common]
+        r_aligned = r[common]
+
+        long_stocks = f_aligned.nlargest(top_n).index
+        short_stocks = f_aligned.nsmallest(top_n).index
+
+        daily_returns.append(r_aligned[long_stocks].mean() - r_aligned[short_stocks].mean())
+
+    if len(daily_returns) < 20:
+        return 0.0
+
+    cumret = np.cumprod(1 + np.array(daily_returns))
+    running_max = np.maximum.accumulate(cumret)
+    drawdowns = (cumret - running_max) / running_max
+    return float(abs(np.min(drawdowns)))
+
+
+def _compute_factor_volatility(factor_values: pd.DataFrame, forward_returns: pd.DataFrame, top_n: int = 50) -> float:
+    """
+    Compute annualized volatility of the factor-mimicking long-short portfolio.
+
+    Mirrors original AlphaGrail's std() metric.
+
+    Args:
+        factor_values: Factor values (date x stock)
+        forward_returns: Forward returns (date x stock)
+        top_n: Number of stocks for long/short
+
+    Returns:
+        Annualized volatility
+    """
+    daily_returns = []
+    common_dates = factor_values.index.intersection(forward_returns.index)
+
+    for date in common_dates:
+        f = factor_values.loc[date].dropna()
+        r = forward_returns.loc[date].dropna()
+        common = f.index.intersection(r.index)
+
+        if len(common) < 2 * top_n:
+            continue
+
+        f_aligned = f[common]
+        r_aligned = r[common]
+
+        long_stocks = f_aligned.nlargest(top_n).index
+        short_stocks = f_aligned.nsmallest(top_n).index
+
+        daily_returns.append(r_aligned[long_stocks].mean() - r_aligned[short_stocks].mean())
+
+    if len(daily_returns) < 20:
+        return 0.0
+
+    return float(np.std(daily_returns, ddof=1) * np.sqrt(252))
+
+
 def evaluate_factors(
     factor_library: Dict[str, pd.DataFrame],
     forward_returns: pd.DataFrame,
     top_n: int = 50,
+    n_quantiles: int = 5,
 ) -> pd.DataFrame:
     """
-    Evaluate all factors and return a summary DataFrame.
+    Evaluate all factors and return a comprehensive summary DataFrame.
+
+    Computes the full metric set that the original AlphaGrail feeds to GPT-4o:
+    - IC summary: mean_ic, ic_std, icir, ic_positive_ratio
+    - Quantile returns: monotonicity score
+    - Quantile turnover: average top-quantile turnover
+    - Factor returns: factor Sharpe
+    - Max drawdown of factor-mimicking portfolio
+    - Factor return volatility (annualized)
 
     Args:
-        factor_library: Dict mapping factor name → values DataFrame
-        forward_returns: Forward 1-day returns (date × stock)
+        factor_library: Dict mapping factor name to values DataFrame
+        forward_returns: Forward returns (date x stock)
         top_n: Number of stocks for factor-mimicking portfolio
+        n_quantiles: Number of quantile groups
 
     Returns:
-        DataFrame with columns: factor_name, mean_ic, ic_std, icir,
-            factor_sharpe, ic_positive_ratio
+        DataFrame with comprehensive evaluation metrics per factor.
     """
     records = []
 
     for name, values in factor_library.items():
-        # Mean Rank IC
+        # IC summary
         mean_ic = _compute_rank_ic(values, forward_returns)
 
-        # IC time series for ICIR
         ic_series = _compute_rank_ic_series(values, forward_returns)
         ic_clean = ic_series.dropna()
         ic_std = float(ic_clean.std()) if len(ic_clean) > 1 else 0.0
         icir = float(ic_clean.mean() / ic_std) if ic_std > 0 else 0.0
         ic_pos_ratio = float((ic_clean > 0).mean()) if len(ic_clean) > 0 else 0.0
 
-        # Factor-mimicking portfolio Sharpe
+        # Factor-mimicking portfolio metrics
         factor_sharpe = _compute_factor_sharpe(values, forward_returns, top_n)
+        max_drawdown = _compute_max_drawdown(values, forward_returns, top_n)
+        factor_volatility = _compute_factor_volatility(values, forward_returns, top_n)
+
+        # Quantile analysis
+        quantile_returns, monotonicity = _compute_quantile_returns(values, forward_returns, n_quantiles)
+        quantile_turnover = _compute_quantile_turnover(values, n_quantiles)
+
+        # Long-short spread (Q_top - Q_bottom)
+        if len(quantile_returns) >= 2:
+            ls_spread = float(quantile_returns.iloc[-1] - quantile_returns.iloc[0])
+        else:
+            ls_spread = 0.0
 
         records.append({
             'factor_name': name,
             'mean_ic': mean_ic,
             'ic_std': ic_std,
             'icir': icir,
-            'factor_sharpe': factor_sharpe,
             'ic_positive_ratio': ic_pos_ratio,
+            'factor_sharpe': factor_sharpe,
+            'factor_volatility': factor_volatility,
+            'max_drawdown': max_drawdown,
+            'monotonicity': monotonicity,
+            'quantile_turnover': quantile_turnover,
+            'ls_spread': ls_spread,
             'abs_ic': abs(mean_ic),
             'abs_icir': abs(icir),
         })
@@ -496,12 +851,17 @@ def _llm_compare_factors(
     """
     Use LLM to compare two alpha factors and select the better one.
 
-    This mirrors the AutoGPT tournament in baselines/AlphaGrail/AutoGPT/main.py,
-    where GPT-4o with Code Interpreter compares alpha performance data.
+    Mirrors the AutoGPT tournament in baselines/AlphaGrail/AutoGPT/main.py,
+    where GPT-4o receives a comprehensive factor analysis Excel with:
+      - IC summary, quantile returns, quantile turnover,
+        factor returns, max drawdown, volatility
+
+    This implementation passes the same metric set as a structured prompt
+    (since we don't have Code Interpreter / Assistant API access here).
 
     Args:
         factor_a_name: Name of factor A
-        factor_a_metrics: Dict with mean_ic, icir, factor_sharpe, ic_positive_ratio
+        factor_a_metrics: Dict with full evaluation metrics
         factor_b_name: Name of factor B
         factor_b_metrics: Same structure
         api_key: API key for LLM service (falls back to env OPENAI_API_KEY)
@@ -514,7 +874,6 @@ def _llm_compare_factors(
     try:
         from openai import OpenAI
 
-        # Resolve credentials: explicit params → env vars
         resolved_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         resolved_url = base_url or os.environ.get("OPENAI_BASE_URL", None)
 
@@ -523,22 +882,37 @@ def _llm_compare_factors(
 
         client = OpenAI(api_key=resolved_key, base_url=resolved_url) if resolved_url else OpenAI(api_key=resolved_key)
 
+        def _fmt(m, prefix=""):
+            """Format all metrics for the prompt."""
+            return f"""{prefix}Mean Rank IC:        {m.get('mean_ic', 0):+.4f}
+{prefix}ICIR:                 {m.get('icir', 0):+.4f}
+{prefix}IC Std:               {m.get('ic_std', 0):.4f}
+{prefix}IC Positive Ratio:    {m.get('ic_positive_ratio', 0):.2%}
+{prefix}Factor Sharpe:        {m.get('factor_sharpe', 0):+.4f}
+{prefix}Factor Volatility:    {m.get('factor_volatility', 0):.4f}
+{prefix}Max Drawdown:         {m.get('max_drawdown', 0):.4f}
+{prefix}Monotonicity Score:   {m.get('monotonicity', 0):.2%}
+{prefix}Quantile Turnover:    {m.get('quantile_turnover', 0):.4f}
+{prefix}Long-Short Spread:    {m.get('ls_spread', 0):+.6f}"""
+
         prompt = f"""You are a quantitative finance expert. Compare two alpha factors and select the better one.
 
-Factor A: {factor_a_name}
-  - Mean Rank IC: {factor_a_metrics['mean_ic']:.4f}
-  - ICIR (IC Information Ratio): {factor_a_metrics['icir']:.4f}
-  - Factor-mimicking portfolio Sharpe: {factor_a_metrics['factor_sharpe']:.4f}
-  - IC positive ratio: {factor_a_metrics['ic_positive_ratio']:.2%}
+Consider ALL of the following dimensions:
+1. IC magnitude and stability (ICIR = mean_ic / ic_std)
+2. Factor-mimicking portfolio risk-adjusted return (Sharpe)
+3. IC consistency (ic_positive_ratio — what fraction of days IC is positive)
+4. Quantile monotonicity (higher = more monotonic returns across groups = better factor)
+5. Drawdown and volatility (lower = more stable)
+6. Turnover (lower = lower transaction costs)
+7. Long-short spread (larger absolute = stronger signal)
 
-Factor B: {factor_b_name}
-  - Mean Rank IC: {factor_b_metrics['mean_ic']:.4f}
-  - ICIR (IC Information Ratio): {factor_b_metrics['icir']:.4f}
-  - Factor-mimicking portfolio Sharpe: {factor_b_metrics['factor_sharpe']:.4f}
-  - IC positive ratio: {factor_b_metrics['ic_positive_ratio']:.2%}
+=== Factor A: {factor_a_name} ===
+{_fmt(factor_a_metrics, "  ")}
 
-Consider: IC magnitude and stability (ICIR), factor Sharpe, and consistency (IC positive ratio).
-Reply with ONLY "A" or "B"."""
+=== Factor B: {factor_b_name} ===
+{_fmt(factor_b_metrics, "  ")}
+
+Based on your expertise, which factor is better overall? Reply with ONLY "A" or "B"."""
 
         response = client.chat.completions.create(
             model=model,
@@ -561,7 +935,9 @@ def _quantitative_compare(
 ) -> str:
     """
     Quantitative fallback for factor comparison.
-    Uses a composite score: weighted |ICIR| + |Sharpe| + IC consistency.
+    Uses a composite score incorporating all available metrics:
+    IC stability (ICIR), risk-adjusted return (Sharpe), monotonicity,
+    drawdown penalty, and turnover penalty.
 
     Args:
         metrics_a: Factor A metrics dict
@@ -571,11 +947,26 @@ def _quantitative_compare(
         "A" or "B"
     """
     def composite_score(m):
+        icir = abs(m.get('icir', 0))
+        sharpe = abs(m.get('factor_sharpe', 0))
+        ic = abs(m.get('mean_ic', 0))
+        ic_pos = m.get('ic_positive_ratio', 0.5)
+        mono = m.get('monotonicity', 0.5)
+        mdd = m.get('max_drawdown', 0.0)
+        turnover = m.get('quantile_turnover', 0.5)
+        ls_spread = abs(m.get('ls_spread', 0))
+
+        # Higher is better: icir, sharpe, ic, ic_pos, mono, ls_spread
+        # Lower is better: mdd, turnover
         return (
-            0.4 * abs(m.get('icir', 0)) +
-            0.3 * abs(m.get('factor_sharpe', 0)) +
-            0.2 * abs(m.get('mean_ic', 0)) +
-            0.1 * m.get('ic_positive_ratio', 0.5)
+            0.25 * icir +
+            0.20 * sharpe +
+            0.10 * ic +
+            0.10 * ic_pos +
+            0.10 * mono +
+            0.10 * ls_spread * 100 +  # scale up since ls_spread is tiny
+            0.10 * (1 - min(mdd, 1.0)) +  # drawdown penalty
+            0.05 * (1 - min(turnover, 1.0))  # turnover penalty
         )
 
     score_a = composite_score(metrics_a)
@@ -594,11 +985,16 @@ def tournament_selection(
     """
     Run tournament selection to find the best factor.
 
-    Implements a single-elimination tournament bracket:
-    - Pairs up all factors
-    - Each pair is compared (LLM or quantitative)
-    - Winners advance to next round
-    - Continues until one winner remains
+    Implements the original AlphaGrail's linear king-of-the-hill tournament
+    (AutoGPT/main.py L186-200):
+      - Start with the first factor as the current champion
+      - Each subsequent factor challenges the champion
+      - If the challenger wins, it becomes the new champion
+      - After all challenges, the final champion is the winner
+
+    This is NOT a bracket elimination tournament. The comparison order
+    matters (first factor has a slight advantage as it only needs to defend,
+    not attack), matching the original implementation's behavior.
 
     Args:
         factor_eval: Evaluation DataFrame from evaluate_factors()
@@ -614,61 +1010,56 @@ def tournament_selection(
     n = len(factors)
 
     print(f"\n  Tournament: {n} factors, {'LLM' if use_llm else 'quantitative'} mode")
+    print(f"    Mode: linear king-of-the-hill (sequential comparison)")
     if use_llm and llm_model:
         print(f"    LLM: {llm_model} @ {llm_base_url or 'default'}")
 
-    # Shuffle for fair bracket (deterministic seed)
-    rng = np.random.RandomState(42)
-    rng.shuffle(factors)
+    # Sort by abs_icir descending so stronger factors are compared later
+    # (gives a more meaningful tournament — weak factors are eliminated early)
+    factors_sorted = factor_eval['abs_icir'].sort_values(ascending=True).index.tolist()
 
-    current_round = factors
-    round_num = 0
+    champion = factors_sorted[0]
+    champion_metrics = factor_eval.loc[champion].to_dict()
+    n_defenses = 0
 
-    while len(current_round) > 1:
-        round_num += 1
-        next_round = []
+    print(f"    Round 1: Initial champion = {champion}")
 
-        # Pair up
-        for i in range(0, len(current_round), 2):
-            if i + 1 >= len(current_round):
-                # Odd number: auto-advance
-                next_round.append(current_round[i])
-                continue
+    for i in range(1, len(factors_sorted)):
+        challenger = factors_sorted[i]
+        challenger_metrics = factor_eval.loc[challenger].to_dict()
 
-            factor_a = current_round[i]
-            factor_b = current_round[i + 1]
+        if use_llm:
+            winner = _llm_compare_factors(
+                champion, champion_metrics, challenger, challenger_metrics,
+                api_key=llm_api_key,
+                base_url=llm_base_url,
+                model=llm_model,
+            )
+        else:
+            winner = _quantitative_compare(champion_metrics, challenger_metrics)
 
-            metrics_a = factor_eval.loc[factor_a].to_dict()
-            metrics_b = factor_eval.loc[factor_b].to_dict()
+        if winner == "B":
+            # Challenger wins — new champion
+            print(f"    Round {i+1}: {champion} vs {challenger} → {challenger} (NEW champion, defended {n_defenses}x)")
+            champion = challenger
+            champion_metrics = challenger_metrics
+            n_defenses = 0
+        else:
+            # Champion defends
+            n_defenses += 1
+            if i <= 5 or i >= len(factors_sorted) - 3:
+                # Print early and final rounds
+                print(f"    Round {i+1}: {champion} vs {challenger} → {champion} (defended {n_defenses}x)")
 
-            if use_llm:
-                winner = _llm_compare_factors(
-                    factor_a, metrics_a, factor_b, metrics_b,
-                    api_key=llm_api_key,
-                    base_url=llm_base_url,
-                    model=llm_model,
-                )
-            else:
-                winner = _quantitative_compare(metrics_a, metrics_b)
+    print(f"\n  Tournament Winner: {champion} (survived {n_defenses} final defenses)")
+    print(f"    Mean IC:        {champion_metrics['mean_ic']:.4f}")
+    print(f"    ICIR:           {champion_metrics['icir']:.4f}")
+    print(f"    Sharpe:         {champion_metrics['factor_sharpe']:.4f}")
+    print(f"    Monotonicity:   {champion_metrics.get('monotonicity', 0):.2%}")
+    print(f"    Max Drawdown:   {champion_metrics.get('max_drawdown', 0):.4f}")
+    print(f"    Turnover:       {champion_metrics.get('quantile_turnover', 0):.4f}")
 
-            winner_name = factor_a if winner == "A" else factor_b
-            next_round.append(winner_name)
-
-            if round_num <= 3 or len(current_round) <= 8:
-                # Print early rounds and final rounds
-                print(f"    Round {round_num}: {factor_a} vs {factor_b} → {winner_name}")
-
-        current_round = next_round
-
-    winner = current_round[0]
-    winner_metrics = factor_eval.loc[winner].to_dict()
-
-    print(f"\n  Tournament Winner: {winner}")
-    print(f"    Mean IC:  {winner_metrics['mean_ic']:.4f}")
-    print(f"    ICIR:     {winner_metrics['icir']:.4f}")
-    print(f"    Sharpe:   {winner_metrics['factor_sharpe']:.4f}")
-
-    return winner, winner_metrics
+    return champion, champion_metrics
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -795,6 +1186,9 @@ def run_alphagrail_baseline(
     top_n_stocks: int = 50,
     holding_period: int = 1,
     use_llm_tournament: bool = False,
+    forward_period: int = 10,
+    n_quantiles: int = 5,
+    use_neutralization: bool = False,
     output_dir: Optional[str] = None,
 ) -> Dict:
     """
@@ -802,9 +1196,12 @@ def run_alphagrail_baseline(
 
     Pipeline:
       1. Load A-share data via main DataLoader
-      2. Build 37 seed alpha factors (from Seed Alpha.xlsx)
-      3. Evaluate factors: IC, ICIR, factor Sharpe on training data
-      4. Tournament selection (LLM or quantitative)
+      2. Build seed alpha factors (from Seed Alpha.xlsx)
+         - Uses real fundamentals if available, else price-based proxies
+         - Optional: industry + size neutralization
+      3. Evaluate factors with comprehensive metrics:
+         IC, ICIR, Sharpe, quantile returns, turnover, drawdown, volatility
+      4. Tournament selection (LLM or quantitative) — linear king-of-the-hill
       5. Build portfolios from winning factor on test data
       6. Backtest with unified BacktestEngine
 
@@ -818,13 +1215,13 @@ def run_alphagrail_baseline(
         top_n_stocks: Number of stocks in portfolio.
         holding_period: Rebalance frequency (1=daily, 5=weekly, 20=monthly).
         use_llm_tournament: If True, use LLM for tournament (needs OpenAI API key).
+        forward_period: Forward return period in days (should match MASE forward_period).
+        n_quantiles: Number of quantile groups for group return analysis.
+        use_neutralization: If True, apply industry + size neutralization.
         output_dir: Directory for saving results.
 
     Returns:
-        Dict of performance metrics:
-            annual_return, sharpe_ratio, max_drawdown, information_ratio,
-            calmar_ratio, win_rate, avg_turnover, mean_rank_ic, icir,
-            winning_factor, n_factors
+        Dict of performance metrics.
     """
     from dataloader.loader import DataLoader
     from backtest.engine import BacktestEngine
@@ -832,6 +1229,7 @@ def run_alphagrail_baseline(
     print("=" * 60)
     print("  AlphaGrail Baseline — LLM-Driven Alpha Selection (via Main DataLoader)")
     print("=" * 60)
+    print(f"  Forward period: {forward_period}d | Quantiles: {n_quantiles} | Neutralize: {use_neutralization}")
 
     # ── Step 1: Load data via main DataLoader ──────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
@@ -846,6 +1244,10 @@ def run_alphagrail_baseline(
     n_dates = len(close.index)
     n_stocks = len(close.columns)
     print(f"  Loaded: {n_dates} trading days x {n_stocks} stocks")
+    if fundamental_data:
+        print(f"  Fundamental data available: {list(fundamental_data.keys())[:5]}...")
+    else:
+        print(f"  No fundamental data — will use price-based proxies for PE/PB/GPM/etc.")
 
     # ── Step 2: Determine train/test split ─────────────────────────────
     train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
@@ -855,35 +1257,56 @@ def run_alphagrail_baseline(
     train_end_ts = pd.Timestamp(train_end)
     test_start_ts = pd.Timestamp(test_start)
 
-    # ── Step 3: Build 37 seed alpha factors ────────────────────────────
-    print("\n[Step 2] Building 37 seed alpha factors...")
-    factor_library = _build_factor_library(price_data)
-    print(f"  Built {len(factor_library)} factors: {list(factor_library.keys())[:5]}...")
+    # ── Step 3: Build seed alpha factors ───────────────────────────────
+    print("\n[Step 2] Building seed alpha factors...")
+    factor_library = _build_factor_library(price_data, fundamental_data)
+    n_proxy = sum(1 for k in factor_library if '_proxy' in k)
+    print(f"  Built {len(factor_library)} factors ({n_proxy} using price-based proxies)")
+
+    # ── Step 3b: Optional neutralization ───────────────────────────────
+    if use_neutralization:
+        print("\n[Step 2b] Applying industry + size neutralization...")
+        # Use close * volume as size proxy if no market_cap available
+        size_data = None
+        if fundamental_data and 'market_cap' in fundamental_data:
+            size_data = fundamental_data['market_cap']
+        else:
+            size_data = close * price_data.get('volume', pd.DataFrame(1, index=close.index, columns=close.columns))
+
+        ind_data = None
+        if industry_data is not None:
+            ind_data = industry_data if isinstance(industry_data, pd.DataFrame) else industry_data.get('industry')
+
+        if ind_data is not None or size_data is not None:
+            factor_library = _neutralize_factor_library(factor_library, ind_data, size_data)
+            print(f"  Neutralized {len(factor_library)} factors")
+        else:
+            print("  Warning: No industry or size data available, skipping neutralization")
 
     # ── Step 4: Compute forward returns ────────────────────────────────
-    print("\n[Step 3] Computing forward returns...")
-    forward_returns = _compute_forward_returns(close, periods=[1])[1]
+    print(f"\n[Step 3] Computing {forward_period}d forward returns...")
+    forward_returns = _compute_forward_returns(close, periods=[forward_period])[forward_period]
 
     # ── Step 5: Evaluate factors on training data ──────────────────────
-    print("\n[Step 4] Evaluating factors on training data...")
+    print("\n[Step 4] Evaluating factors on training data (comprehensive metrics)...")
     train_mask = forward_returns.index < test_start_ts
     train_returns = forward_returns.loc[train_mask]
 
-    # Also need train period factor values
     train_factors = {
         name: vals.loc[train_mask] for name, vals in factor_library.items()
     }
 
-    factor_eval = evaluate_factors(train_factors, train_returns, top_n=top_n_stocks)
+    factor_eval = evaluate_factors(train_factors, train_returns, top_n=top_n_stocks, n_quantiles=n_quantiles)
     print(f"\n  Factor evaluation (top 10 by |ICIR|):")
     top_eval = factor_eval.reindex(factor_eval['abs_icir'].nlargest(10).index)
     for name, row in top_eval.iterrows():
-        print(f"    {name:35s}  IC={row['mean_ic']:+.4f}  ICIR={row['icir']:+.4f}  Sharpe={row['factor_sharpe']:+.4f}")
+        print(f"    {name:35s}  IC={row['mean_ic']:+.4f}  ICIR={row['icir']:+.4f}  "
+              f"Sharpe={row['factor_sharpe']:+.4f}  Mono={row['monotonicity']:.0%}  "
+              f"MDD={row['max_drawdown']:.4f}")
 
     # ── Step 6: Tournament selection ───────────────────────────────────
     print("\n[Step 5] Tournament selection...")
 
-    # Read LLM config from config.yaml (llm.generator section)
     llm_api_key = ""
     llm_base_url = ""
     llm_model = "gpt-4o"
@@ -896,13 +1319,11 @@ def run_alphagrail_baseline(
         llm_model = llm_cfg.get('model', 'gpt-4o')
     except Exception:
         pass
-    # Fall back to env vars
     if not llm_api_key:
         llm_api_key = os.environ.get("OPENAI_API_KEY", "")
     if not llm_base_url:
         llm_base_url = os.environ.get("OPENAI_BASE_URL", "")
 
-    # Auto-enable LLM if we have a key and user requested it
     if use_llm_tournament and not llm_api_key:
         print("  Warning: use_llm_tournament=True but no API key found, falling back to quantitative")
         use_llm_tournament = False
@@ -941,6 +1362,7 @@ def run_alphagrail_baseline(
             'avg_turnover': 0.0,
             'train_end': train_end,
             'test_start': test_start,
+            'forward_period': forward_period,
         }
 
     print(f"  Portfolios: {portfolios.shape[0]} days x {portfolios.shape[1]} stocks")
@@ -948,7 +1370,6 @@ def run_alphagrail_baseline(
     # ── Step 8: Backtest with unified BacktestEngine ───────────────────
     print("\n[Step 7] Running backtest (unified BacktestEngine)...")
 
-    # Align prices to portfolio dates and columns
     prices_aligned = close.reindex(portfolios.index)
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
@@ -971,6 +1392,9 @@ def run_alphagrail_baseline(
         'method': 'AlphaGrail',
         'winning_factor': winner,
         'n_factors': len(factor_library),
+        'n_proxy_factors': n_proxy,
+        'forward_period': forward_period,
+        'use_neutralization': use_neutralization,
         'mean_rank_ic_train': float(winner_metrics.get('mean_ic', 0)),
         'icir': float(winner_metrics.get('icir', 0)),
         'factor_sharpe_train': float(winner_metrics.get('factor_sharpe', 0)),
@@ -992,6 +1416,9 @@ def run_alphagrail_baseline(
             'icir': float(winner_metrics.get('icir', 0)),
             'factor_sharpe': float(winner_metrics.get('factor_sharpe', 0)),
             'ic_positive_ratio': float(winner_metrics.get('ic_positive_ratio', 0)),
+            'monotonicity': float(winner_metrics.get('monotonicity', 0)),
+            'max_drawdown': float(winner_metrics.get('max_drawdown', 0)),
+            'quantile_turnover': float(winner_metrics.get('quantile_turnover', 0)),
         },
     }
 
@@ -1000,6 +1427,7 @@ def run_alphagrail_baseline(
     print("  AlphaGrail Baseline Complete")
     print("=" * 60)
     print(f"  Winning Factor:   {winner}")
+    print(f"  Forward Period:   {forward_period}d")
     print(f"  Mean Rank-IC (train): {results['mean_rank_ic_train']:.4f}")
     print(f"  ICIR:             {results['icir']:.4f}")
     print(f"  Mean Rank-IC (test):  {results['mean_rank_ic_test']:.4f}")
@@ -1014,13 +1442,11 @@ def run_alphagrail_baseline(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save metrics JSON
         result_path = os.path.join(output_dir, 'alphagrail_results.json')
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         print(f"\n  Results saved to {result_path}")
 
-        # Save factor evaluation
         eval_path = os.path.join(output_dir, 'factor_evaluation.csv')
         factor_eval.to_csv(eval_path)
         print(f"  Factor evaluation saved to {eval_path}")
@@ -1054,6 +1480,12 @@ if __name__ == '__main__':
                         help='Rebalance frequency (1=daily, 5=weekly)')
     parser.add_argument('--use-llm', action='store_true',
                         help='Use LLM for tournament (needs OpenAI API key)')
+    parser.add_argument('--forward-period', type=int, default=10,
+                        help='Forward return period in days (should match MASE forward_period)')
+    parser.add_argument('--n-quantiles', type=int, default=5,
+                        help='Number of quantile groups for group return analysis')
+    parser.add_argument('--neutralize', action='store_true',
+                        help='Apply industry + size neutralization to factors')
     parser.add_argument('--output-dir', default='experiments/alphagrail',
                         help='Output directory')
 
@@ -1069,6 +1501,9 @@ if __name__ == '__main__':
         top_n_stocks=args.top_n,
         holding_period=args.holding_period,
         use_llm_tournament=args.use_llm,
+        forward_period=args.forward_period,
+        n_quantiles=args.n_quantiles,
+        use_neutralization=args.neutralize,
         output_dir=args.output_dir,
     )
 
@@ -1080,5 +1515,6 @@ if __name__ == '__main__':
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")
     print(f"  Information Ratio:{results['information_ratio']:.4f}")
     print(f"  Winning Factor:   {results['winning_factor']}")
+    print(f"  Forward Period:   {results['forward_period']}d")
     print(f"  Mean Rank-IC:     {results['mean_rank_ic_train']:.4f}")
     print(f"  ICIR:             {results['icir']:.4f}")

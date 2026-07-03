@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-AlphaGen Baseline Runner — RL-Inspired Token-Based Factor Generation
+AlphaGen Baseline Runner — RL-Based Token-Based Factor Generation
 ====================================================================
 
-AlphaGen is a new contrast method that implements RL-inspired automatic
-alpha factor generation via token-based expression trees, inspired by the
-AlphaForge RL pipeline (train_RL.py / exp_RL_calc_result.ipynb).
+AlphaGen implements automatic alpha factor generation via token-based
+expression trees with three generation strategies:
+
+  1. 'random'    — Random sampling with grammar constraints (no dependencies)
+  2. 'reinforce' — REINFORCE + MLP policy (Option B, default, needs torch)
+  3. 'ppo'       — MaskablePPO + LSTM policy (Option C, needs torch + sb3-contrib)
 
 Core methodology:
-  1. Token vocabulary — 51 discrete actions: Feature(6) + Operator(~22)
-     + Constant(14) + DeltaTime(7) + SEP(1) + NULL(1)
+  1. Token vocabulary — 63 discrete actions: Feature(6) + Operator(31)
+     + Constant(15) + DeltaTime(10) + SEP(1)
   2. Expression Builder — Inverse Polish Notation (postfix) expression
      tree with grammar-rules-driven action masking
-  3. Factor Generation — Random sampling of valid token sequences
-     (simplified from the original SB3 PPO RL training)
+  3. Factor Generation —
+     [random]    Random sampling of valid token sequences
+     [reinforce] REINFORCE policy gradient with MLP (embedding→MLP→logits)
+     [ppo]       MaskablePPO with LSTMSharedNet (embedding→LSTM→mean pool)
   4. Factor Evaluation — Cross-sectional Rank IC / ICIR on training data
   5. AlphaPool — Factor pool with mutual-IC dedup (>0.99 threshold),
      ensemble weight optimization via gradient descent (L1-regularized
@@ -22,6 +27,10 @@ Core methodology:
      equal-weight long-only
   7. Backtest — Unified BacktestEngine (commission=0.0003, slippage=0.001)
 
+For RL methods, the AlphaPool is populated during training: the RL agent
+generates expressions, each is evaluated and potentially added to the pool,
+and the ensemble IC serves as the reward signal.
+
 References:
   - baselines/AlphaForge/train_RL.py               (PPO training loop)
   - baselines/AlphaForge/exp_RL_calc_result.ipynb    (result evaluation)
@@ -29,9 +38,11 @@ References:
   - baselines/AlphaForge/alphagen/data/tree.py       (ExpressionBuilder)
   - baselines/AlphaForge/alphagen/models/alpha_pool.py (AlphaPool)
   - baselines/AlphaForge/alphagen/rl/env/core.py     (AlphaEnvCore)
+  - baselines/AlphaForge/alphagen/rl/policy.py       (LSTMSharedNet)
+  - baselines/rl_alphagen.py                         (RL training modules)
 
 Author: Code Review Expert (火眼眼)
-Date: 2026-07-02
+Date: 2026-07-03
 """
 
 import sys
@@ -1243,17 +1254,38 @@ def run_alphagen_baseline(
     holding_period: int = 1,
     seed: int = 42,
     output_dir: Optional[str] = None,
+    # ── RL method selection ──
+    rl_method: str = 'reinforce',
+    # REINFORCE params (Option B)
+    n_episodes: int = 2000,
+    reinforce_lr: float = 1e-3,
+    reinforce_d_model: int = 64,
+    # PPO params (Option C)
+    n_timesteps: int = 100_000,
+    ppo_d_model: int = 128,
+    ppo_n_layers: int = 2,
+    # Common RL params
+    gamma: float = 1.0,
+    ent_coef: float = 0.01,
+    device: str = 'cpu',
 ) -> Dict:
     """
-    Run AlphaGen baseline — RL-inspired token-based factor generation.
+    Run AlphaGen baseline — RL-based token factor generation.
+
+    Supports three factor generation methods:
+      - 'random'    : Random sampling with grammar constraints (no RL, no torch)
+      - 'reinforce' : REINFORCE + MLP policy (Option B, default, needs torch)
+      - 'ppo'       : MaskablePPO + LSTM policy (Option C, needs torch + sb3-contrib)
 
     Pipeline:
       1. Load A-share data via main DataLoader
-      2. Generate random factor expressions (token-based, grammar-validated)
-      3. Evaluate each factor on training data (Rank IC / ICIR)
-      4. AlphaPool: deduplicate and optimize ensemble weights
-      5. Build portfolios from ensemble factor on test data
-      6. Backtest with unified BacktestEngine
+      2. [random] Generate random factor expressions
+         [reinforce] Train REINFORCE policy to generate factors
+         [ppo] Train MaskablePPO + LSTM policy to generate factors
+      3. AlphaPool: deduplicate and optimize ensemble weights
+         (populated during RL training for reinforce/ppo)
+      4. Build portfolios from ensemble factor on test data
+      5. Backtest with unified BacktestEngine
 
     Args:
         config_path: Path to main project config
@@ -1262,12 +1294,22 @@ def run_alphagen_baseline(
         universe: Stock universe
         train_end_date: Training end date
         test_start_date: Test start date
-        n_generate: Number of random factors to generate
+        n_generate: Number of random factors (only used when rl_method='random')
         pool_capacity: AlphaPool capacity
         top_n_stocks: Number of stocks in portfolio
         holding_period: Rebalance frequency
         seed: Random seed
         output_dir: Directory for saving results
+        rl_method: Factor generation method ('random', 'reinforce', 'ppo')
+        n_episodes: REINFORCE training episodes (Option B)
+        reinforce_lr: REINFORCE learning rate
+        reinforce_d_model: REINFORCE embedding dimension
+        n_timesteps: PPO training timesteps (Option C)
+        ppo_d_model: PPO LSTM dimension
+        ppo_n_layers: PPO LSTM layers
+        gamma: Discount factor (1.0 = no discount, same as original AlphaGen)
+        ent_coef: Entropy coefficient for exploration
+        device: 'cpu' or 'cuda' for RL training
 
     Returns:
         Dict with performance metrics and factor info
@@ -1276,7 +1318,8 @@ def run_alphagen_baseline(
     from backtest.engine import BacktestEngine
 
     print("=" * 60)
-    print("  AlphaGen Baseline — RL-Inspired Token-Based Factor Generation")
+    print("  AlphaGen Baseline — RL-Based Token Factor Generation")
+    print(f"  Method: {rl_method.upper()}")
     print("=" * 60)
 
     # ── Step 1: Load data ──────────────────────────────────────────────
@@ -1328,65 +1371,106 @@ def run_alphagen_baseline(
     n_train_dates = train_fwd_ret.shape[0]
     print(f"  Train: {n_train_dates} dates, Test: {test_fwd_ret.shape[0]} dates")
 
-    # ── Step 4: Generate random factors ─────────────────────────────────
-    print(f"\n[Step 3] Generating {n_generate} random factor expressions...")
-    t0 = time.time()
-    factors = generate_factor_batch(n_generate, seed=seed, verbose=True)
-    elapsed = time.time() - t0
-    print(f"  Generated {len(factors)} valid factors in {elapsed:.1f}s")
+    # ── Step 3: Factor generation & AlphaPool ──────────────────────────
+    #   random    : generate batch → evaluate → add to pool
+    #   reinforce : REINFORCE + MLP policy trains and populates pool
+    #   ppo       : MaskablePPO + LSTM policy trains and populates pool
+    
+    rl_training_stats = {}
+    
+    if rl_method == 'random':
+        # ── Random factor generation (original approach) ──
+        print(f"\n[Step 3] Generating {n_generate} random factor expressions...")
+        t0 = time.time()
+        factors = generate_factor_batch(n_generate, seed=seed, verbose=True)
+        elapsed = time.time() - t0
+        print(f"  Generated {len(factors)} valid factors in {elapsed:.1f}s")
 
-    if len(factors) == 0:
-        print("  ERROR: No valid factors generated!")
-        return {'error': 'no_factors_generated'}
+        if len(factors) == 0:
+            print("  ERROR: No valid factors generated!")
+            return {'error': 'no_factors_generated'}
 
-    # ── Step 5: Evaluate factors on training data ──────────────────────
-    print(f"\n[Step 4] Evaluating factors on training data...")
-    eval_results = []
-    for i, expr in enumerate(factors):
-        try:
-            raw_value = expr.evaluate(train_data)
-            normalized = _normalize_cross_section(raw_value)
-            metrics = evaluate_factor(normalized, train_fwd_ret)
-            metrics['expr_idx'] = i
-            metrics['expr_repr'] = repr(expr)
-            eval_results.append((expr, raw_value, normalized, metrics))
-        except Exception as e:
-            if i < 5:  # Only log first few errors
-                print(f"    Factor {i} eval error: {e}")
-            continue
+        # ── Evaluate factors on training data ──
+        print(f"\n[Step 4] Evaluating factors on training data...")
+        eval_results = []
+        for i, expr in enumerate(factors):
+            try:
+                raw_value = expr.evaluate(train_data)
+                normalized = _normalize_cross_section(raw_value)
+                metrics = evaluate_factor(normalized, train_fwd_ret)
+                metrics['expr_idx'] = i
+                metrics['expr_repr'] = repr(expr)
+                eval_results.append((expr, raw_value, normalized, metrics))
+            except Exception as e:
+                if i < 5:
+                    print(f"    Factor {i} eval error: {e}")
+                continue
 
-    if not eval_results:
-        print("  ERROR: All factors failed evaluation!")
-        return {'error': 'all_factors_failed'}
+        if not eval_results:
+            print("  ERROR: All factors failed evaluation!")
+            return {'error': 'all_factors_failed'}
 
-    # Sort by |ICIR|
-    eval_results.sort(key=lambda x: abs(x[3]['icir']), reverse=True)
+        eval_results.sort(key=lambda x: abs(x[3]['icir']), reverse=True)
 
-    print(f"  Evaluated {len(eval_results)} factors successfully")
-    print(f"\n  Top 10 factors by |ICIR|:")
-    for rank_i, (expr, raw_val, norm_val, metrics) in enumerate(eval_results[:10]):
-        print(f"    {rank_i+1:2d}. {repr(expr):60s}  IC={metrics['mean_ic']:+.4f}  ICIR={metrics['icir']:+.4f}")
+        print(f"  Evaluated {len(eval_results)} factors successfully")
+        print(f"\n  Top 10 factors by |ICIR|:")
+        for rank_i, (expr, raw_val, norm_val, metrics) in enumerate(eval_results[:10]):
+            print(f"    {rank_i+1:2d}. {repr(expr):60s}  IC={metrics['mean_ic']:+.4f}  ICIR={metrics['icir']:+.4f}")
 
-    # ── Step 6: AlphaPool — dedup & ensemble ───────────────────────────
-    print(f"\n[Step 5] Building AlphaPool (capacity={pool_capacity})...")
-    pool = AlphaPool(capacity=pool_capacity)
+        # ── Build AlphaPool ──
+        print(f"\n[Step 5] Building AlphaPool (capacity={pool_capacity})...")
+        pool = AlphaPool(capacity=pool_capacity)
 
-    n_accepted = 0
-    for expr, raw_val, norm_val, metrics in eval_results:
-        # Convert norm_val to numpy
-        if isinstance(norm_val, np.ndarray):
-            val = norm_val.astype(np.float64)
-        else:
-            val = norm_val.values.astype(np.float64)
+        n_accepted = 0
+        for expr, raw_val, norm_val, metrics in eval_results:
+            if isinstance(norm_val, np.ndarray):
+                val = norm_val.astype(np.float64)
+            else:
+                val = norm_val.values.astype(np.float64)
 
-        accepted, ensemble_ic = pool.try_add_factor(expr, val, metrics)
-        if accepted:
-            n_accepted += 1
-            if n_accepted % 5 == 0:
-                print(f"    Pool: {pool.size}/{pool_capacity} accepted, "
-                      f"best_ic={pool.best_ic_ret:.4f}")
+            accepted, ensemble_ic = pool.try_add_factor(expr, val, metrics)
+            if accepted:
+                n_accepted += 1
+                if n_accepted % 5 == 0:
+                    print(f"    Pool: {pool.size}/{pool_capacity} accepted, "
+                          f"best_ic={pool.best_ic_ret:.4f}")
 
-    print(f"  Final pool: {pool.size} factors, best ensemble IC={pool.best_ic_ret:.4f}")
+        print(f"  Final pool: {pool.size} factors, best ensemble IC={pool.best_ic_ret:.4f}")
+
+    elif rl_method in ('reinforce', 'ppo'):
+        # ── RL-based factor generation ──
+        from rl_alphagen import train_rl_factors
+        
+        print(f"\n[Step 3] Training RL policy ({rl_method}) to generate factors...")
+        print(f"  Pool capacity: {pool_capacity}")
+        pool = AlphaPool(capacity=pool_capacity)
+        
+        pool, rl_training_stats = train_rl_factors(
+            method=rl_method,
+            train_data=train_data,
+            train_fwd_ret=train_fwd_ret,
+            pool=pool,
+            min_tokens=3,
+            n_episodes=n_episodes,
+            reinforce_lr=reinforce_lr,
+            reinforce_d_model=reinforce_d_model,
+            n_timesteps=n_timesteps,
+            ppo_d_model=ppo_d_model,
+            ppo_n_layers=ppo_n_layers,
+            gamma=gamma,
+            ent_coef=ent_coef,
+            device=device,
+            verbose=True,
+        )
+        
+        print(f"\n  Final pool: {pool.size} factors, best ensemble IC={pool.best_ic_ret:.4f}")
+        
+        # For compatibility with downstream code
+        factors = pool.exprs if pool.size > 0 else []
+    
+    else:
+        print(f"  ERROR: Unknown rl_method '{rl_method}'. Use 'random', 'reinforce', or 'ppo'.")
+        return {'error': 'invalid_method'}
 
     if pool.size == 0:
         print("  ERROR: No factors accepted into pool!")
@@ -1444,6 +1528,7 @@ def run_alphagen_baseline(
     print("\n" + "=" * 60)
     print("  AlphaGen Baseline Complete")
     print("=" * 60)
+    print(f"  Method:            {rl_method}")
     print(f"  Factors generated:  {len(factors)}")
     print(f"  Pool size:          {pool.size}/{pool_capacity}")
     print(f"  Best ensemble IC:   {pool.best_ic_ret:.4f}")
@@ -1454,6 +1539,7 @@ def run_alphagen_baseline(
     print(f"  Max Drawdown:       {backtest_metrics.get('max_drawdown', 0):.4f}")
 
     results = {
+        'rl_method': rl_method,
         'annual_return': backtest_metrics.get('annual_return', 0.0),
         'sharpe_ratio': backtest_metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': backtest_metrics.get('max_drawdown', 0.0),
@@ -1472,6 +1558,20 @@ def run_alphagen_baseline(
         'pool_weights': pool.weights.tolist() if pool.size > 0 else [],
         'pool_exprs': [repr(e) for e in pool.exprs],
     }
+    
+    # Include RL training stats if available
+    if rl_training_stats:
+        results['rl_training'] = {
+            'method': rl_training_stats.get('method', rl_method),
+            'final_pool_size': rl_training_stats.get('final_pool_size', 0),
+            'best_ic': rl_training_stats.get('best_ic', 0.0),
+            'n_factors_added': rl_training_stats.get('n_factors_added', 0),
+            'training_time': rl_training_stats.get('training_time', 0.0),
+        }
+        if 'n_episodes' in rl_training_stats:
+            results['rl_training']['n_episodes'] = rl_training_stats['n_episodes']
+        if 'n_timesteps' in rl_training_stats:
+            results['rl_training']['n_timesteps'] = rl_training_stats['n_timesteps']
 
     # ── Save results ───────────────────────────────────────────────────
     if output_dir:
@@ -1501,7 +1601,7 @@ def run_alphagen_baseline(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Run AlphaGen baseline — RL-inspired token-based factor generation'
+        description='Run AlphaGen baseline — RL-based token factor generation'
     )
     parser.add_argument('--config', default='config/config.yaml', help='Path to main config')
     parser.add_argument('--start', default=None, help='Data start date')
@@ -1509,11 +1609,41 @@ if __name__ == '__main__':
     parser.add_argument('--universe', default=None, help='Stock universe')
     parser.add_argument('--train-end', default=None, help='Train end date')
     parser.add_argument('--test-start', default=None, help='Test start date')
-    parser.add_argument('--n-generate', type=int, default=300, help='Factors to generate')
+    parser.add_argument('--n-generate', type=int, default=300, help='Factors to generate (random only)')
     parser.add_argument('--pool-capacity', type=int, default=20, help='Pool capacity')
     parser.add_argument('--top-n', type=int, default=50, help='Portfolio size')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output-dir', default='experiments/alphagen', help='Output directory')
+    
+    # ── RL method selection ──
+    parser.add_argument('--rl-method', default='reinforce',
+                        choices=['random', 'reinforce', 'ppo'],
+                        help='Factor generation method (default: reinforce)')
+    
+    # REINFORCE params (Option B)
+    parser.add_argument('--n-episodes', type=int, default=2000,
+                        help='REINFORCE training episodes (Option B)')
+    parser.add_argument('--reinforce-lr', type=float, default=1e-3,
+                        help='REINFORCE learning rate')
+    parser.add_argument('--reinforce-d-model', type=int, default=64,
+                        help='REINFORCE embedding dimension')
+    
+    # PPO params (Option C)
+    parser.add_argument('--n-timesteps', type=int, default=100000,
+                        help='PPO training timesteps (Option C)')
+    parser.add_argument('--ppo-d-model', type=int, default=128,
+                        help='PPO LSTM dimension')
+    parser.add_argument('--ppo-n-layers', type=int, default=2,
+                        help='PPO LSTM layers')
+    
+    # Common RL params
+    parser.add_argument('--gamma', type=float, default=1.0,
+                        help='Discount factor (1.0 = no discount)')
+    parser.add_argument('--ent-coef', type=float, default=0.01,
+                        help='Entropy coefficient')
+    parser.add_argument('--device', default='cpu',
+                        choices=['cpu', 'cuda', 'auto'],
+                        help='Device for RL training')
 
     args = parser.parse_args()
 
@@ -1530,9 +1660,23 @@ if __name__ == '__main__':
         holding_period=1,
         seed=args.seed,
         output_dir=args.output_dir,
+        rl_method=args.rl_method,
+        n_episodes=args.n_episodes,
+        reinforce_lr=args.reinforce_lr,
+        reinforce_d_model=args.reinforce_d_model,
+        n_timesteps=args.n_timesteps,
+        ppo_d_model=args.ppo_d_model,
+        ppo_n_layers=args.ppo_n_layers,
+        gamma=args.gamma,
+        ent_coef=args.ent_coef,
+        device=args.device,
     )
 
     print("\nFinal results:")
     for k, v in results.items():
-        if k not in ('pool_weights', 'pool_exprs'):
+        if k not in ('pool_weights', 'pool_exprs', 'rl_training'):
             print(f"  {k}: {v}")
+        elif k == 'rl_training' and v:
+            print(f"  rl_training:")
+            for rk, rv in v.items():
+                print(f"    {rk}: {rv}")
