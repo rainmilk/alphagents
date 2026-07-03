@@ -538,6 +538,11 @@ def run_alphafama_baseline(
 
     print(f"  Mean Rank-IC (train): {avg_ic:.4f}, ICIR: {icir:.4f}")
 
+    # Also compute test_ic for evaluation in Step 7
+    test_ic = compute_ic_matrix(test_exposures, test_returns)
+    avg_test_ic_early = test_ic.mean().mean()
+    print(f"  Mean Rank-IC (test, Alpha101): {avg_test_ic_early:.4f}")
+
     # ── Step 5b: LLM Alpha-Mining ──────────────────────────────────────
     used_llm = False
     llm_model = None

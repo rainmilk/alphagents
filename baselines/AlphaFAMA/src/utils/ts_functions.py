@@ -1,9 +1,6 @@
 import numpy as np, pandas as pd
 from scipy.stats import rankdata
 
-def ts_sum(df: pd.Series, window: int = 10) -> pd.Series:
-    return df.rolling(window).sum()
-
 def ts_rank(df: pd.Series, window: int = 10) -> pd.Series:
     return df.rolling(window)\
              .apply(lambda arr: rankdata(arr, method="min")[-1], raw=True)

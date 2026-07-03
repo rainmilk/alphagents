@@ -96,6 +96,7 @@ class AlphaFactory:
                 out[name] = fn(df)
         return out
 
+    @staticmethod
     def alpha006(df: pd.DataFrame) -> pd.Series:
         """
         Alpha#6: -1 * correlation(open, volume, 10)
@@ -173,6 +174,7 @@ class AlphaFactory:
         """
         return sign(delta(df["volume"], 1)) * (-1 * delta(df["close"], 1))
 
+    @staticmethod
     def alpha013(df: pd.DataFrame) -> pd.Series:
         """
         Alpha#13: -1 * rank(covariance(rank(close), rank(volume), 5))

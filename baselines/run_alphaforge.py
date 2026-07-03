@@ -90,58 +90,607 @@ def compute_returns(prices_multindex: pd.DataFrame) -> pd.DataFrame:
     return returns
 
 
-def generate_template_factors(prices: pd.DataFrame, n_factors: int = 50) -> List[str]:
+# ═══════════════════════════════════════════════════════════════════════
+# GAN-based Factor Mining (mirrors original AlphaForge train_AFF.py)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Original Architecture:
+#   NetG (DCGAN) → token logits → NetM (mask) → NetP (CNN quality scorer)
+#   Adversarial training: NetG learns to produce factors with high NetP scores
+#
+# Our Simplified Architecture (same spirit, no alphagen dependency):
+#   NetG (MLP) → discrete token sequence → ExpressionDecoder → factor expr
+#   NetP (MLP) → token one-hot → predicted Rank IC
+#   Training: NetP learns from real IC, NetG learns from NetP prediction
+
+# ── Token Vocabulary ──────────────────────────────────────────────────────
+# Each factor is encoded as an 8-token sequence:
+#   [OP1, FEAT1, WIN1, OP2, FEAT2, WIN2, COMBINE, WRAP]
+#
+# Decoding produces expressions like:
+#   ts_mean(close, 20) / ts_std(close, 10)
+#   abs(close - ts_mean(close, 60))
+#   cs_rank(ts_delta(volume, 10))
+
+# Operation 1 & 2: what transform on the feature
+_TOK_OPS = {
+    0: 'identity', 1: 'ts_mean', 2: 'ts_std', 3: 'ts_min',
+    4: 'ts_max', 5: 'ts_delta', 6: 'ts_pct', 7: 'ts_sum',
+}
+N_OPS = len(_TOK_OPS)
+
+# Features: which price/volume field
+_TOK_FEATURES = {
+    0: 'close', 1: 'open', 2: 'high', 3: 'low',
+    4: 'volume', 5: 'vwap', 6: 'amount', 7: 'return',
+}
+N_FEATURES = len(_TOK_FEATURES)
+
+# Window sizes
+_TOK_WINDOWS = {0: 5, 1: 10, 2: 20, 3: 30, 4: 60, 5: 120}
+N_WINDOWS = len(_TOK_WINDOWS)
+
+# Combine ops: how to merge NODE1 and NODE2
+_TOK_COMBINE = {0: 'none', 1: 'add', 2: 'sub', 3: 'mul', 4: 'div'}
+N_COMBINE = len(_TOK_COMBINE)
+
+# Wrap ops: final transformation on combined expression
+_TOK_WRAP = {0: 'none', 1: 'abs', 2: 'log', 3: 'neg', 4: 'cs_rank'}
+N_WRAP = len(_TOK_WRAP)
+
+# Total tokens = sum of all category sizes (each position has its own vocabulary)
+# Positions 0,3 → N_OPS (8)
+# Positions 1,4 → N_FEATURES (8)
+# Positions 2,5 → N_WINDOWS (6)
+# Position 6   → N_COMBINE (5)
+# Position 7   → N_WRAP (5)
+SEQ_LEN = 8
+TOKEN_DIMS = [N_OPS, N_FEATURES, N_WINDOWS, N_OPS, N_FEATURES, N_WINDOWS, N_COMBINE, N_WRAP]
+
+
+def _decode_expression(tokens: List[int]) -> str:
     """
-    Generate template alpha factor expressions.
-    
-    These are simplified versions of common alpha factors.
-    In real AlphaForge, these would be mined by GAN.
-    
+    Decode an 8-token sequence into a Python factor expression string.
+
+    Examples:
+        [1,0,3, 0,0,0, 0,0] → "close.rolling(20).mean()"
+        [0,0,0, 1,0,3, 4,0] → "close / close.rolling(20).mean()"
+        [0,0,0, 1,0,4, 2,1] → "abs(close - close.rolling(60).mean())"
+
     Args:
-        prices: Price data
+        tokens: List of 8 token IDs
+
+    Returns:
+        str: Evaluable Python expression string
+    """
+    assert len(tokens) >= SEQ_LEN, f"Need {SEQ_LEN} tokens, got {len(tokens)}"
+
+    def _mk_node(op_tok, feat_tok, win_tok):
+        """Build a single feature/op node expression."""
+        op_name = _TOK_OPS.get(op_tok, 'identity')
+        feat_name = _TOK_FEATURES.get(feat_tok, 'close')
+        win = _TOK_WINDOWS.get(win_tok, 20)
+
+        if op_name == 'identity':
+            return feat_name
+        elif op_name == 'ts_mean':
+            return f"{feat_name}.rolling({win}).mean()"
+        elif op_name == 'ts_std':
+            return f"{feat_name}.rolling({win}).std()"
+        elif op_name == 'ts_min':
+            return f"{feat_name}.rolling({win}).min()"
+        elif op_name == 'ts_max':
+            return f"{feat_name}.rolling({win}).max()"
+        elif op_name == 'ts_delta':
+            return f"({feat_name} - {feat_name}.shift({win}))"
+        elif op_name == 'ts_pct':
+            return f"({feat_name} / {feat_name}.shift({win}) - 1)"
+        elif op_name == 'ts_sum':
+            return f"{feat_name}.rolling({win}).sum()"
+        return feat_name
+
+    node1 = _mk_node(tokens[0], tokens[1], tokens[2])
+    combine = _TOK_COMBINE.get(tokens[6], 'none')
+
+    if combine == 'none':
+        expr = node1
+    else:
+        node2 = _mk_node(tokens[3], tokens[4], tokens[5])
+        if combine == 'add':
+            expr = f"({node1} + {node2})"
+        elif combine == 'sub':
+            expr = f"({node1} - {node2})"
+        elif combine == 'mul':
+            expr = f"({node1} * {node2})"
+        elif combine == 'div':
+            expr = f"({node1} / ({node2} + 1e-8))"
+
+    wrap = _TOK_WRAP.get(tokens[7], 'none')
+    if wrap == 'abs':
+        expr = f"abs({expr})"
+    elif wrap == 'log':
+        expr = f"np.log(abs({expr}) + 1e-8)"
+    elif wrap == 'neg':
+        expr = f"-({expr})"
+    elif wrap == 'cs_rank':
+        expr = f"({expr}).rank(axis=1, pct=True)"
+
+    return expr
+
+
+# ── GAN Networks ───────────────────────────────────────────────────────────
+
+def _torch_available():
+    """Check if PyTorch is available."""
+    try:
+        import torch
+        return True, torch
+    except ImportError:
+        return False, None
+
+
+class _FactorGenerator:
+    """
+    NetG: Generates discrete token sequences from noise vectors.
+
+    Mirrors AlphaForge's NetG_DCGAN:
+    - Input: latent noise z ~ N(0,1), shape (batch, latent_dim)
+    - Output: token logits, shape (batch, seq_len, vocab_per_pos)
+
+    Uses MLP with positional heads for simplicity (vs original DCGAN).
+    Each position has its own output head with softmax over its vocabulary.
+    """
+
+    def __init__(self, latent_dim: int = 64, hidden_dim: int = 256):
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+
+        self._build_network()
+
+    def _build_network(self):
+        import torch
+        import torch.nn as nn
+
+        self._net = nn.Sequential(
+            nn.Linear(self.latent_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+        )
+        # One output head per position
+        self._heads = nn.ModuleList([
+            nn.Linear(self.hidden_dim, dim) for dim in TOKEN_DIMS
+        ])
+
+    def generate(self, batch_size: int, device: str = 'cpu') -> "np.ndarray":
+        """
+        Generate factor token sequences.
+
+        Args:
+            batch_size: Number of factors to generate
+            device: 'cpu' or 'cuda:[0]'
+
+        Returns:
+            np.ndarray of shape (batch_size, SEQ_LEN) with token IDs
+        """
+        import torch
+        z = torch.randn(batch_size, self.latent_dim).to(device)
+        with torch.no_grad():
+            hidden = self._net(z)
+            tokens = []
+            for head in self._heads:
+                logits = head(hidden)
+                probs = torch.softmax(logits, dim=-1)
+                sampled = torch.multinomial(probs, 1).squeeze(-1)
+                tokens.append(sampled.cpu().numpy())
+        return np.stack(tokens, axis=1)
+
+    def forward(self, z: "torch.Tensor") -> "List[torch.Tensor]":
+        """Forward pass, returns logits per position (for training)."""
+        hidden = self._net(z)
+        return [head(hidden) for head in self._heads]
+
+
+class _FactorPredictor:
+    """
+    NetP: Predicts factor quality (Rank IC) from token sequences.
+
+    Mirrors AlphaForge's NetP (CNN):
+    - Input: one-hot token sequence, shape (batch, seq_len, total_vocab)
+    - Output: predicted score, shape (batch, 1)
+
+    Uses MLP for simplicity.
+    """
+
+    def __init__(self, hidden_dim: int = 128):
+        self.hidden_dim = hidden_dim
+        self.total_vocab = sum(TOKEN_DIMS)
+        self._build_network()
+
+    def _build_network(self):
+        import torch
+        import torch.nn as nn
+
+        self._net = nn.Sequential(
+            nn.Linear(self.total_vocab, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim // 2, 1),
+        )
+
+    def _tokens_to_onehot(self, tokens: "np.ndarray") -> "np.ndarray":
+        """Convert token sequences to one-hot vectors."""
+        batch_size = tokens.shape[0]
+        onehot = np.zeros((batch_size, self.total_vocab), dtype=np.float32)
+        offset = 0
+        for pos in range(SEQ_LEN):
+            for i in range(batch_size):
+                tok = int(tokens[i, pos])
+                if tok < TOKEN_DIMS[pos]:
+                    onehot[i, offset + tok] = 1.0
+            offset += TOKEN_DIMS[pos]
+        return onehot
+
+    def predict(self, tokens: "np.ndarray") -> "np.ndarray":
+        """
+        Predict factor quality scores.
+
+        Args:
+            tokens: (batch_size, SEQ_LEN) token IDs
+
+        Returns:
+            np.ndarray of shape (batch_size,) with predicted scores
+        """
+        import torch
+        onehot = self._tokens_to_onehot(tokens)
+        x = torch.from_numpy(onehot)
+        with torch.no_grad():
+            scores = self._net(x).squeeze(-1).numpy()
+        return scores
+
+    def forward(self, onehot: "torch.Tensor") -> "torch.Tensor":
+        """Forward pass for training."""
+        return self._net(onehot)
+
+
+# ── GAN Training ───────────────────────────────────────────────────────────
+
+def _train_gan_step(
+    generator: _FactorGenerator,
+    predictor: _FactorPredictor,
+    all_tokens: np.ndarray,
+    all_scores: np.ndarray,
+    batch_size: int = 128,
+    n_gen_steps: int = 5,
+    learning_rate: float = 1e-3,
+    device: str = 'cpu',
+) -> Dict:
+    """
+    One round of GAN training.
+
+    Mirrors the training loop in train_AFF.py:
+    1. Train Predictor on real (token, score) pairs
+    2. Train Generator to maximize Predictor's predicted scores
+    3. Generate new factors from trained Generator for next round
+
+    Args:
+        generator: NetG instance
+        predictor: NetP instance
+        all_tokens: All real token sequences seen so far (N, SEQ_LEN)
+        all_scores: Corresponding real IC scores (N,)
+        batch_size: Batch size for training
+        n_gen_steps: Generator training steps per round
+        learning_rate: Learning rate
+        device: Torch device
+
+    Returns:
+        Dict with training metrics
+    """
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+
+    n_real = len(all_scores)
+    if n_real < batch_size // 2:
+        return {'pred_loss': 0, 'gen_score': 0, 'n_real': n_real, 'n_generated': 0}
+
+    # ── Train Predictor on real data ──
+    predictor._net.train()
+    opt_p = optim.Adam(predictor._net.parameters(), lr=learning_rate)
+    loss_fn = nn.MSELoss()
+
+    real_onehot = torch.from_numpy(
+        predictor._tokens_to_onehot(all_tokens)
+    ).to(device)
+    real_scores_t = torch.from_numpy(
+        np.array(all_scores, dtype=np.float32)
+    ).to(device)
+
+    n_epochs_p = max(10, min(50, n_real // batch_size // 2))
+    pred_losses = []
+    for _ in range(n_epochs_p):
+        idx = np.random.choice(n_real, min(batch_size, n_real), replace=False)
+        xb = real_onehot[idx]
+        yb = real_scores_t[idx]
+        opt_p.zero_grad()
+        pred = predictor.forward(xb).squeeze(-1)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        opt_p.step()
+        pred_losses.append(loss.item())
+    pred_loss = float(np.mean(pred_losses[-10:]))
+
+    predictor._net.eval()
+
+    # ── Train Generator ──
+    opt_g = optim.Adam(generator._net.parameters(), lr=learning_rate * 0.5)
+    gen_scores = []
+    for _ in range(n_gen_steps):
+        z = torch.randn(batch_size, generator.latent_dim).to(device)
+        logits_list = generator.forward(z)
+
+        # Use temperature-softmax for differentiable path:
+        # Each position's logits → softmax → soft token probabilities
+        soft_tokens = []
+        for logits in logits_list:
+            soft = torch.softmax(logits / 0.5, dim=-1)  # temperature=0.5
+            soft_tokens.append(soft)
+
+        # Concatenate to form (batch, total_vocab) soft representation
+        soft_concat = torch.cat(soft_tokens, dim=-1)
+
+        # Feed through predictor (MLP handles both one-hot and soft inputs)
+        score_pred = predictor.forward(soft_concat).squeeze(-1)
+        score_mean = score_pred.mean()
+
+        # Loss: maximize predicted score + diversity bonus
+        gen_loss = -score_mean + 0.01 * (score_pred.std())
+
+        opt_g.zero_grad()
+        gen_loss.backward()
+        opt_g.step()
+
+        gen_scores.append(score_mean.item())
+
+    gen_score = float(np.mean(gen_scores))
+
+    return {
+        'pred_loss': pred_loss,
+        'gen_score': gen_score,
+        'n_real': n_real,
+    }
+
+
+def gan_mine_factors(
+    prices_multindex: pd.DataFrame,
+    returns: pd.DataFrame,
+    n_factors: int = 50,
+    n_rounds: int = 5,
+    batch_size: int = 64,
+    latent_dim: int = 32,
+    device: str = 'cpu',
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[List[str], List[float], Dict]:
+    """
+    Mine alpha factors using GAN (mirrors AlphaForge Stage 1).
+
+    Training flow (matching train_AFF.py):
+    1. Initialize NetG (Generator) + NetP (Predictor)
+    2. Pre-populate with random factors → evaluate → (tokens, IC) pairs
+    3. For each round:
+       a. Train Predictor on real (tokens, IC) pairs
+       b. Train Generator to maximize Predictor's score
+       c. Generate new factors → evaluate on data → add to pool
+       d. Filter by IC + decorrelation
+    4. Return top-N factors by |IC|
+
+    Args:
+        prices_multindex: MultiIndex OHLCV data
+        returns: Daily returns DataFrame
+        n_factors: Target number of factors to mine
+        n_rounds: Training rounds
+        batch_size: GAN batch size
+        latent_dim: Generator latent dimension
+        device: Torch device
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        Tuple of (factor_expressions, factor_ranks_ic, gan_stats)
+    """
+    import torch
+    np.random.seed(seed)
+    if torch.cuda.is_available() and 'cuda' in device:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+    # ── Helper: evaluate a factor expression → Rank IC ──
+    def _eval_expr(expr: str) -> float:
+        factor_vals = evaluate_factor_expression(expr, prices_multindex)
+        if factor_vals.isna().all().all():
+            return 0.0
+        ric = calculate_rank_ic(factor_vals, returns)
+        return float(ric)
+
+    # ── Initialize Networks ──
+    generator = _FactorGenerator(latent_dim=latent_dim)
+    predictor = _FactorPredictor()
+
+    # ── Pre-population: generate random factors ──
+    if verbose:
+        print(f"  [GAN] Initializing with {batch_size * 2} random factors...")
+
+    init_tokens = generator.generate(batch_size * 2, device)
+    seen_exprs = set()
+    all_tokens_list = []
+    all_scores_list = []
+
+    for i in range(len(init_tokens)):
+        expr = _decode_expression(init_tokens[i].tolist())
+        if expr in seen_exprs:
+            continue
+        seen_exprs.add(expr)
+        score = _eval_expr(expr)
+        if abs(score) > 0.001:
+            all_tokens_list.append(init_tokens[i])
+            all_scores_list.append(score)
+
+    if verbose:
+        print(f"  [GAN] Initial pool: {len(all_scores_list)} valid factors, "
+              f"max |IC|: {max(abs(np.array(all_scores_list))) if all_scores_list else 0:.4f}")
+
+    # ── GAN Training Rounds ──
+    stats_history = []
+    for round_idx in range(n_rounds):
+        if len(all_scores_list) < 10:
+            if verbose:
+                print(f"  [GAN] Round {round_idx+1}/{n_rounds}: insufficient data, generating more random factors...")
+            new_tokens = generator.generate(batch_size, device)
+            for i in range(len(new_tokens)):
+                expr = _decode_expression(new_tokens[i].tolist())
+                if expr in seen_exprs:
+                    continue
+                seen_exprs.add(expr)
+                score = _eval_expr(expr)
+                if abs(score) > 0.001:
+                    all_tokens_list.append(new_tokens[i])
+                    all_scores_list.append(score)
+            continue
+
+        all_tokens_arr = np.array(all_tokens_list)
+        all_scores_arr = np.array(all_scores_list, dtype=np.float32)
+
+        # Normalize scores for stable Predictor training
+        score_mean = all_scores_arr.mean()
+        score_std = all_scores_arr.std() + 1e-8
+        scores_norm = (all_scores_arr - score_mean) / score_std
+
+        stats = _train_gan_step(
+            generator, predictor,
+            all_tokens_arr, scores_norm,
+            batch_size=batch_size,
+            n_gen_steps=3,
+            learning_rate=5e-4,
+            device=device,
+        )
+        stats['round'] = round_idx
+        stats['pool_size'] = len(all_scores_list)
+
+        if verbose:
+            print(f"  [GAN] Round {round_idx+1}/{n_rounds}: "
+                  f"pred_loss={stats['pred_loss']:.4f}, "
+                  f"gen_score={stats['gen_score']:.4f}, "
+                  f"pool={stats['pool_size']}")
+
+        # Generate new factors from updated Generator
+        new_tokens = generator.generate(batch_size * 2, device)
+        n_added = 0
+        new_scores = []
+        for i in range(len(new_tokens)):
+            expr = _decode_expression(new_tokens[i].tolist())
+            if expr in seen_exprs:
+                continue
+            seen_exprs.add(expr)
+            score = _eval_expr(expr)
+            if abs(score) > 0.001:
+                all_tokens_list.append(new_tokens[i])
+                all_scores_list.append(score)
+                n_added += 1
+                new_scores.append(score)
+
+        stats['n_added'] = n_added
+        stats['max_new_ic'] = max(abs(np.array(new_scores))) if new_scores else 0
+        stats_history.append(stats)
+
+        if verbose:
+            print(f"    Added {n_added} new factors, "
+                  f"max |IC|: {stats['max_new_ic']:.4f}")
+
+        # Early exit if pool is large enough
+        if len(all_scores_list) >= n_factors * 3:
+            break
+
+    # ── Decode and rank all factors ──
+    if not all_scores_list:
+        if verbose:
+            print("  [GAN] No valid factors mined, falling back to templates")
+        return generate_template_factors(prices_multindex, n_factors, returns), [], {}
+
+    all_tokens_arr = np.array(all_tokens_list)
+    all_scores_arr = np.array(all_scores_list)
+
+    # Decode all factors
+    expressions = []
+    for i in range(len(all_tokens_arr)):
+        try:
+            expressions.append(_decode_expression(all_tokens_arr[i].tolist()))
+        except Exception:
+            expressions.append("close")
+
+    # Sort by |IC| descending
+    sorted_idx = np.argsort(np.abs(all_scores_arr))[::-1]
+    top_exprs = [expressions[i] for i in sorted_idx[:n_factors]]
+    top_scores = [float(all_scores_arr[i]) for i in sorted_idx[:n_factors]]
+
+    if verbose:
+        print(f"  [GAN] Final pool: {len(all_scores_list)} factors, "
+              f"top |IC|: {max(abs(np.array(top_scores))) if top_scores else 0:.4f}")
+        for j, (expr, sc) in enumerate(zip(top_exprs[:5], top_scores[:5])):
+            print(f"    #{j+1}: IC={sc:.4f}  expr={expr}")
+
+    return top_exprs, top_scores, {'stats_history': stats_history, 'pool_size': len(all_scores_list)}
+
+
+def generate_template_factors(
+    prices_multindex: pd.DataFrame = None,
+    n_factors: int = 50,
+    returns: pd.DataFrame = None,
+) -> List[str]:
+    """
+    Generate template alpha factor expressions (fallback when GAN unavailable).
+
+    Used when PyTorch is not available or when use_gan=False.
+
+    Args:
+        prices_multindex: MultiIndex price data (unused, kept for API compatibility)
         n_factors: Number of factors to generate
-        
+        returns: Unused, kept for API compatibility
+
     Returns:
         List[str]: Factor expressions (as strings for evaluation)
     """
-    # Basic factor templates
     templates = [
-        # Momentum factors
-        "close / close.shift(20) - 1",  # 20-day momentum
-        "close / close.shift(5) - 1",   # 5-day momentum
-        "(close - close.shift(1)) / close.shift(1)",  # 1-day return
-        
-        # Mean reversion
-        "(close - close.rolling(20).mean()) / close.rolling(20).std()",  # Bollinger Band position
-        "volume / volume.rolling(20).mean()",  # Volume ratio
-        
-        # Volatility
-        "close.rolling(20).std() / close",  # Historical volatility
-        "(high - low) / close",  # Daily volatility
-        
-        # Volume-price
-        "(close - close.shift(1)) * volume",  # Volume-weighted return
-        "volume / volume.rolling(5).mean()",  # Short-term volume trend
-        
-        # Technical indicators
-        "close.rolling(12).mean() - close.rolling(26).mean()",  # MACD line
-        "((close - close.shift(1)) / close.shift(1)).rolling(14).mean()",  # Momentum MA
+        ("close / close.shift(20) - 1", [3, 5, 10, 15, 30]),
+        ("close / close.shift(5) - 1", [1, 3, 10, 20]),
+        ("(close - close.shift(1)) / close.shift(1)", []),
+        ("(close - close.rolling(20).mean()) / close.rolling(20).std()", [5, 10, 30, 60]),
+        ("volume / volume.rolling(20).mean()", [3, 5, 10, 30]),
+        ("close.rolling(20).std() / close", [5, 10, 30, 60]),
+        ("(high - low) / close", []),
+        ("(close - close.shift(1)) * volume", []),
+        ("volume / volume.rolling(5).mean()", [3, 10, 20, 30]),
+        ("close.rolling(12).mean() - close.rolling(26).mean()", []),
+        ("((close - close.shift(1)) / close.shift(1)).rolling(14).mean()", [5, 7, 10, 20]),
     ]
-    
-    # Generate variations by changing parameters
+
     extended = []
-    for template in templates:
-        extended.append(template)
-        # Create variations with different windows
-        for window in [3, 10, 15, 30]:
-            if 'rolling(20)' in template:
-                extended.append(template.replace('rolling(20)', f'rolling({window})'))
-            if 'shift(20)' in template:
-                extended.append(template.replace('shift(20)', f'shift({window})'))
-            if 'shift(5)' in template:
-                extended.append(template.replace('shift(5)', f'shift({window})'))
-    
-    # Return unique factors up to n_factors
+    for tmpl, windows in templates:
+        extended.append(tmpl)
+        for w in windows:
+            for old_w in [20, 5]:
+                if f'({old_w})' in tmpl:
+                    extended.append(tmpl.replace(f'({old_w})', f'({w})'))
+                if f'.shift({old_w})' in tmpl:
+                    extended.append(tmpl.replace(f'.shift({old_w})', f'.shift({w})'))
+                if f'.rolling({old_w})' in tmpl:
+                    extended.append(tmpl.replace(f'.rolling({old_w})', f'.rolling({w})'))
+
     unique_factors = list(dict.fromkeys(extended))
     return unique_factors[:n_factors]
 
@@ -266,85 +815,119 @@ def stage1_mine_factors(
     prices: pd.DataFrame,
     config: AlphaForgeConfig,
     output_dir: str,
+    use_gan: bool = True,
 ) -> Dict:
     """
-    Stage 1: Mine alpha factors.
-    
-    In original AlphaForge, this uses GAN to mine factors.
-    Here we use template expressions as a simplified version.
-    
+    Stage 1: Mine alpha factors using GAN (or template fallback).
+
+    Follows the original AlphaForge GAN-based factor mining approach:
+    - Generator produces factor token sequences
+    - Predictor learns to estimate factor quality
+    - Adversarial training improves factor quality over rounds
+
     Args:
         prices: Price data from main DataLoader
         config: AlphaForge configuration
         output_dir: Directory to save results
-        
+        use_gan: Use GAN-based mining (True) or template fallback (False)
+
     Returns:
-        Dict: Mined factors and their evaluations
+        Dict: Mined factors and their evaluations, plus GAN stats
     """
     print("\n" + "="*60)
-    print("[Stage 1] Mining alpha factors...")
+    mode_name = "GAN-based" if use_gan else "Template-based"
+    print(f"[Stage 1] Mining alpha factors ({mode_name})...")
     print("="*60)
-    
+
     # Convert to MultiIndex format
     prices_multindex = convert_to_multindex(prices)
     returns = compute_returns(prices_multindex)
-    
-    # Generate template factors
-    print(f"  Generating {config.zoo_size} template factors...")
-    factor_exprs = generate_template_factors(prices, config.zoo_size)
-    
-    # Evaluate all factors
+
+    gan_stats = {}
+
+    # ── Factor Generation ──
+    if use_gan:
+        has_torch, _ = _torch_available()
+        if not has_torch:
+            print("  ⚠️  PyTorch not available, falling back to template factors")
+            use_gan = False
+
+    if use_gan:
+        # Use GAN-based mining
+        device = 'cuda:0' if False else 'cpu'  # Always CPU for safety
+        factor_exprs, factor_rankics, gan_stats = gan_mine_factors(
+            prices_multindex=prices_multindex,
+            returns=returns,
+            n_factors=config.zoo_size,
+            n_rounds=5,
+            batch_size=64,
+            latent_dim=32,
+            device=device,
+            seed=config.seeds[0] if config.seeds else 42,
+            verbose=True,
+        )
+    else:
+        # Template fallback
+        print(f"  Generating {config.zoo_size} template factors...")
+        factor_exprs = generate_template_factors(prices_multindex, config.zoo_size)
+        factor_rankics = []
+
+    # ── Evaluate all factors ──
     print("  Evaluating factors...")
     factor_scores_dict = {}
     factor_metrics = {}
-    
+
     for i, expr in enumerate(factor_exprs):
-        if i % 10 == 0:
+        if i % 20 == 0:
             print(f"    Progress: {i}/{len(factor_exprs)}")
-        
-        # Evaluate factor
+
         factor_values = evaluate_factor_expression(expr, prices_multindex)
-        
-        # Calculate IC and Rank IC
         ic = calculate_ic(factor_values, returns)
         rank_ic = calculate_rank_ic(factor_values, returns)
-        
+
         factor_scores_dict[expr] = factor_values
         factor_metrics[expr] = {
             'ic': ic,
             'rank_ic': rank_ic,
             'expr': expr,
         }
-    
+
     # Sort by Rank IC and select top factors
     sorted_factors = sorted(
         factor_metrics.items(),
         key=lambda x: abs(x[1]['rank_ic']),
         reverse=True
     )
-    
+
     top_factors = [x[0] for x in sorted_factors[:config.zoo_size]]
-    
+
     print(f"  Top factor Rank IC: {factor_metrics[top_factors[0]]['rank_ic']:.4f}")
     print(f"  Saved {len(top_factors)} factors to zoo")
-    
+
     # Save results
     os.makedirs(output_dir, exist_ok=True)
     zoo_path = os.path.join(output_dir, "zoo_factors.json")
-    
+
+    zoo_data = {
+        'factor_exprs': top_factors,
+        'metrics': {expr: factor_metrics[expr] for expr in top_factors},
+    }
+    if gan_stats:
+        zoo_data['gan_pool_size'] = gan_stats.get('pool_size', 0)
+        zoo_data['method'] = 'gan'
+
     with open(zoo_path, 'w') as f:
-        json.dump({
-            'factor_exprs': top_factors,
-            'metrics': {expr: factor_metrics[expr] for expr in top_factors},
-        }, f, indent=2)
-    
+        json.dump(zoo_data, f, indent=2)
+
     print(f"  Zoo saved to: {zoo_path}")
-    
+
     return {
         'factor_exprs': top_factors,
         'factor_scores_dict': factor_scores_dict,
         'metrics': factor_metrics,
         'zoo_path': zoo_path,
+        'used_gan': use_gan,
+        'gan_stats': gan_stats,
     }
 
 
@@ -658,15 +1241,16 @@ def run_alphaforge_baseline(
     seeds: List[int] = None,
     output_dir: str = "results/alphaforge",
     verbose: bool = False,
+    use_gan: bool = True,
 ) -> Dict:
     """
     Run complete AlphaForge baseline (all 3 stages).
-    
+
     Data loading priority:
     1. If prices is provided, use it directly
     2. If dataloader is provided, call dataloader.get_prices()
     3. If config_path is provided (and dataloader/prices are None), load from config
-    
+
     Args:
         config_path: Path to config YAML (used if dataloader/prices not provided)
         dataloader: Main project DataLoader (optional)
@@ -680,9 +1264,10 @@ def run_alphaforge_baseline(
         seeds: Random seeds
         output_dir: Output directory
         verbose: Verbose output
-        
+        use_gan: Use GAN-based factor mining (True) or template fallback (False)
+
     Returns:
-        Dict: Results with metrics
+        Dict: Results with metrics, used_gan, gan_pool_size
     """
     # Load config if needed (for defaults)
     if config_path and (start_date is None or end_date is None or instruments is None or top_n_stocks is None):
@@ -756,7 +1341,7 @@ def run_alphaforge_baseline(
     os.makedirs(output_dir, exist_ok=True)
     
     # Stage 1: Mine factors
-    stage1_results = stage1_mine_factors(prices, config, output_dir)
+    stage1_results = stage1_mine_factors(prices, config, output_dir, use_gan=use_gan)
     
     # Stage 2: Combine factors
     stage2_results = stage2_combine_factors(prices, stage1_results, config, output_dir)
@@ -769,6 +1354,8 @@ def run_alphaforge_baseline(
         'portfolio_returns': stage3_results['portfolio_returns'],
         'stage1_results': stage1_results,
         'stage2_results': stage2_results,
+        'used_gan': stage1_results.get('used_gan', False),
+        'gan_pool_size': stage1_results.get('gan_stats', {}).get('pool_size', 0),
     }
 
 
@@ -785,9 +1372,11 @@ if __name__ == "__main__":
     parser.add_argument("--zoo-size", type=int, default=50, help="Number of factors to mine")
     parser.add_argument("--output-dir", type=str, default="results/alphaforge", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
-    
+    parser.add_argument("--use-gan", action="store_true", default=True, help="Use GAN-based factor mining")
+    parser.add_argument("--no-gan", action="store_false", dest="use_gan", help="Use template-based factor generation")
+
     args = parser.parse_args()
-    
+
     results = run_alphaforge_baseline(
         config_path=args.config_path,
         start_date=args.start,
@@ -798,6 +1387,7 @@ if __name__ == "__main__":
         zoo_size=args.zoo_size,
         output_dir=args.output_dir,
         verbose=args.verbose,
+        use_gan=args.use_gan,
     )
     
     print("\n" + "="*60)

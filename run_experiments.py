@@ -748,18 +748,18 @@ class ExperimentRunner:
     def _run_baseline_alphaforge(self) -> Dict:
         """
         Run AlphaForge (AFF) baseline using config path.
-        
+
         This follows the same pattern as other baselines (AlphaAgent, AlphaFAMA).
-        The DataLoader is created inside run_alphaforge_baseline() from config.
-        
+        Stage 1 mines factors using GAN (mirrors original AlphaForge train_AFF.py).
+        Stage 2 combines factors via rolling window + linear regression.
+        Stage 3 evaluates via unified BacktestEngine.
+
         Returns:
             Dict with performance metrics.
         """
         print(f"\n[Baseline] AlphaForge (AFF) - Using config: {self.config_path}")
-        
+
         try:
-            # Call run_alphaforge_baseline with config_path
-            # The function will create DataLoader internally
             results = run_alphaforge_baseline(
                 config_path=self.config_path,
                 start_date=self.config['data']['universe'].get('start_date', '2019-01-01'),
@@ -769,22 +769,24 @@ class ExperimentRunner:
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
                 output_dir=f"{self.output_dir}/alphaforge",
                 verbose=True,
+                use_gan=True,
             )
-            
+
             return {
                 'annual_return': results['metrics']['annual_return'],
                 'sharpe_ratio': results['metrics']['sharpe_ratio'],
                 'max_drawdown': results['metrics']['max_drawdown'],
                 'information_ratio': results['metrics']['information_ratio'],
                 'n_factors': results.get('n_factors', 0),
+                'used_gan': results.get('used_gan', False),
+                'gan_pool_size': results.get('gan_pool_size', 0),
             }
-            
+
         except Exception as e:
             print(f"  ❌ AlphaForge baseline FAILED: {e}")
             import traceback
             traceback.print_exc()
-            
-            # Return default values
+
             return {
                 'annual_return': 0.0,
                 'sharpe_ratio': 0.0,
@@ -793,6 +795,8 @@ class ExperimentRunner:
                 'ic_mean': 0.0,
                 'rank_ic_mean': 0.0,
                 'n_factors': 0,
+                'used_gan': False,
+                'gan_pool_size': 0,
                 'error': str(e),
             }
     
