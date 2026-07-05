@@ -6,8 +6,8 @@ This runner:
 1. Loads A-share data via the main project's DataLoader
 2. Constructs technical features from OHLCV + fundamental data
 3. Trains a gradient-boosted-tree model (XGBoost or sklearn fallback)
-    to predict next-day cross-sectional return ranks
-4. Uses rolling-window retraining on the test period
+    to predict forward-period cross-sectional return ranks
+4. Trains once on the training period (one-shot, consistent with other baselines)
 5. Builds long-only top-N portfolios and backtests via BacktestEngine
 
 Usage:
@@ -205,9 +205,9 @@ def _build_features(price_data: Dict[str, pd.DataFrame],
     return panel
 
 
-def _build_targets(close: pd.DataFrame) -> pd.DataFrame:
+def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFrame:
     """
-    Build next-day cross-sectional rank of returns as the prediction target.
+    Build forward-period cross-sectional rank of returns as the prediction target.
 
     Using rank (0 to N-1, normalized to [0, 1]) instead of raw returns makes
     the model more robust to outliers and focuses on cross-sectional
@@ -215,13 +215,15 @@ def _build_targets(close: pd.DataFrame) -> pd.DataFrame:
 
     Args:
         close: Close price DataFrame (date x stock)
+        forward_period: Number of days ahead for return calculation (default 10).
+            Must match the forward_period used by other baselines for fair comparison.
 
     Returns:
         DataFrame, MultiIndex (date, stock), column 'target_rank'
     """
-    next_ret = close.shift(-1) / close - 1
+    forward_ret = close.shift(-forward_period) / close - 1
     # Cross-sectional rank, normalized to [0, 1]
-    target_rank = next_ret.rank(axis=1, pct=True)
+    target_rank = forward_ret.rank(axis=1, pct=True)
     panel = target_rank.stack().to_frame('target_rank')
     panel.index.names = ['date', 'stock']
     return panel
@@ -259,34 +261,30 @@ def _create_model(n_estimators: int = 200,
         )
 
 
-def _train_predict_rolling(
+def _train_predict_oneshot(
     features: pd.DataFrame,
     targets: pd.DataFrame,
     test_start_date: str,
-    train_window: int = 250,
-    retrain_freq: int = 5,
     n_estimators: int = 200,
     max_depth: int = 5,
     learning_rate: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Train models with rolling windows and predict on the test period.
+    Train a single model on all training data and predict on the test period.
+
+    This one-shot approach is consistent with other baselines (AlphaAgent,
+    AlphaGrail, AlphaFAMA, MCTS-LLM-Alpha) which also train/select factors
+    once on the training period and use them throughout the test period.
 
     Strategy:
-    - Start from test_start_date
-    - For each batch of `retrain_freq` days:
-        a) Gather training data from the last `train_window` days before the batch
-        b) Drop rows with NaN features or targets
-        c) Train a model to predict target_rank
-        d) Predict scores for each day in the batch
-    - Return a DataFrame of predicted scores (date x stock)
+    - Split features/targets at test_start_date
+    - Train one model on all pre-test data
+    - Predict scores for every day in the test period
 
     Args:
         features: MultiIndex (date, stock) feature panel
         targets: MultiIndex (date, stock) target panel
         test_start_date: First test date (YYYY-MM-DD)
-        train_window: Number of trading days to use for training (default 250 ~ 1 year)
-        retrain_freq: Retrain every N days (default 5 = weekly)
         n_estimators, max_depth, learning_rate: Model hyperparameters
 
     Returns:
@@ -296,81 +294,58 @@ def _train_predict_rolling(
     test_start_ts = pd.Timestamp(test_start_date)
     all_dates = features.index.get_level_values('date').unique().sort_values()
     test_dates = all_dates[all_dates >= test_start_ts]
+    train_dates = all_dates[all_dates < test_start_ts]
 
     if len(test_dates) == 0:
         raise ValueError(f"No test dates found after {test_start_date}")
+    if len(train_dates) == 0:
+        raise ValueError(f"No train dates found before {test_start_date}")
 
-    print(f"  Test period: {test_dates[0].date()} to {test_dates[-1].date()} "
+    print(f"  Train period: {train_dates[0].date()} to {train_dates[-1].date()} "
+          f"({len(train_dates)} days)")
+    print(f"  Test period:  {test_dates[0].date()} to {test_dates[-1].date()} "
           f"({len(test_dates)} days)")
-    print(f"  Train window: {train_window} days, retrain every {retrain_freq} days")
 
     # Merge features and targets
     merged = features.join(targets, how='inner')
-
-    # Pre-split: feature columns vs target
     feature_cols = [c for c in merged.columns if c != 'target_rank']
 
-    # Result container
-    predictions_list = []
-    n_retrains = 0
+    # --- Train on all pre-test data ---
+    train_mask = merged.index.get_level_values('date') < test_start_ts
+    train_df = merged[train_mask].dropna(subset=['target_rank'])
 
-    for batch_start in range(0, len(test_dates), retrain_freq):
-        batch_end = min(batch_start + retrain_freq, len(test_dates))
-        batch_dates = test_dates[batch_start:batch_end]
+    train_feature_vals = train_df[feature_cols].fillna(0.0)
+    train_targets = train_df['target_rank'].values
 
-        # Training window: [batch_start - train_window, batch_start)
-        train_end_idx = batch_start  # index into test_dates
-        # Map to position in all_dates
-        test_start_idx_in_all = all_dates.get_loc(test_dates[0])
-        train_end_idx_in_all = test_start_idx_in_all + train_end_idx
-        train_start_idx_in_all = max(0, train_end_idx_in_all - train_window)
-
-        train_dates_window = all_dates[train_start_idx_in_all:train_end_idx_in_all]
-
-        if len(train_dates_window) < 20:
-            # Not enough training data; skip this batch (use equal weights)
-            print(f"    Batch {batch_start}: insufficient train data "
-                  f"({len(train_dates_window)} days), skipping")
-            continue
-
-        # Extract training data
-        train_mask = merged.index.get_level_values('date').isin(train_dates_window)
-        train_df = merged[train_mask].dropna(subset=['target_rank'])
-
-        # Drop rows with too many NaN features
-        train_feature_vals = train_df[feature_cols]
-        # Fill remaining NaN with 0 (after z-score, 0 = mean)
-        train_feature_vals = train_feature_vals.fillna(0.0)
-        train_targets = train_df['target_rank'].values
-
-        if len(train_df) < 100:
-            print(f"    Batch {batch_start}: too few valid train rows "
-                  f"({len(train_df)}), skipping")
-            continue
-
-        # Train model
-        model = _create_model(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
+    if len(train_df) < 100:
+        raise ValueError(
+            f"Too few valid training rows ({len(train_df)}). "
+            f"Check data availability before {test_start_date}."
         )
-        model.fit(train_feature_vals.values, train_targets)
-        n_retrains += 1
 
-        # Predict for each day in batch
-        for d in batch_dates:
-            try:
-                day_features = features.xs(d, level='date')
-            except KeyError:
-                continue
-            day_features = day_features.fillna(0.0)
-            if len(day_features) == 0:
-                continue
-            preds = model.predict(day_features[feature_cols].values)
-            pred_series = pd.Series(preds, index=day_features.index, name=d)
-            predictions_list.append(pred_series)
+    print(f"  Training samples: {len(train_df)} rows, {len(feature_cols)} features")
 
-    print(f"  Retrained model {n_retrains} times")
+    model = _create_model(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+    )
+    model.fit(train_feature_vals.values, train_targets)
+    print(f"  Model trained (one-shot on {len(train_dates)} days)")
+
+    # --- Predict on test period ---
+    predictions_list = []
+    for d in test_dates:
+        try:
+            day_features = features.xs(d, level='date')
+        except KeyError:
+            continue
+        day_features = day_features.fillna(0.0)
+        if len(day_features) == 0:
+            continue
+        preds = model.predict(day_features[feature_cols].values)
+        pred_series = pd.Series(preds, index=day_features.index, name=d)
+        predictions_list.append(pred_series)
 
     if not predictions_list:
         raise ValueError("No predictions generated. Check data availability.")
@@ -460,12 +435,11 @@ def run_xgboost_baseline(
     test_start_date: Optional[str] = None,
     context_days: int = 30,
     top_n_stocks: int = 50,
-    train_window: int = 250,
-    retrain_freq: int = 5,
     n_estimators: int = 200,
     max_depth: int = 5,
     learning_rate: float = 0.05,
     holding_period: int = 1,
+    forward_period: int = 10,
     output_dir: Optional[str] = None,
 ) -> Dict:
     """
@@ -474,9 +448,9 @@ def run_xgboost_baseline(
     Pipeline:
     1. Load OHLCV + fundamental data via DataLoader
     2. Build 20+ technical features per (date, stock)
-    3. Build target = next-day cross-sectional return rank
-    4. Rolling-window training: retrain every `retrain_freq` days using
-       the last `train_window` days of data
+    3. Build target = forward-period cross-sectional return rank
+    4. Train one model on the entire training period (one-shot, consistent
+       with other baselines)
     5. Predict scores on test period, select top-N stocks
     6. Backtest with unified BacktestEngine
 
@@ -489,12 +463,12 @@ def run_xgboost_baseline(
         test_start_date: First test date (YYYY-MM-DD).
         context_days: Ignored (kept for API compatibility with other baselines).
         top_n_stocks: Number of stocks in long portfolio (default 50).
-        train_window: Training lookback in trading days (default 250 ~ 1 year).
-        retrain_freq: Retrain every N days (default 5 = weekly).
         n_estimators: Number of boosting rounds.
         max_depth: Max tree depth.
         learning_rate: Boosting learning rate.
         holding_period: Rebalance frequency for backtest (1=daily).
+        forward_period: Forward return period in days (default 10). Must align
+            with other baselines for fair comparison.
         output_dir: Directory for saving results.
 
     Returns:
@@ -534,18 +508,16 @@ def run_xgboost_baseline(
     print(f"  Feature panel: {len(features)} rows (date, stock)")
 
     # -- Step 4: Build targets --
-    print("\n[Step 4] Building prediction targets (next-day return rank)...")
-    targets = _build_targets(close)
+    print(f"\n[Step 4] Building prediction targets ({forward_period}d forward return rank)...")
+    targets = _build_targets(close, forward_period=forward_period)
     print(f"  Target panel: {len(targets)} rows")
 
-    # -- Step 5: Rolling-window training and prediction --
-    print("\n[Step 5] Rolling-window training and prediction...")
-    predictions = _train_predict_rolling(
+    # -- Step 5: One-shot training and prediction --
+    print("\n[Step 5] Training model (one-shot on train period)...")
+    predictions = _train_predict_oneshot(
         features=features,
         targets=targets,
         test_start_date=test_start,
-        train_window=train_window,
-        retrain_freq=retrain_freq,
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
@@ -587,7 +559,7 @@ def run_xgboost_baseline(
     pred_stacked.index.names = ['date', 'stock']
 
     # Compute daily Rank-IC (Spearman correlation between predicted score
-    # and actual next-day return rank)
+    # and actual forward-period return rank)
     daily_ics = []
     for d in predictions.index:
         if d in test_targets.index.get_level_values('date'):
@@ -622,8 +594,6 @@ def run_xgboost_baseline(
         'feature_names': list(features.columns),
         'n_stocks_universe': len(close.columns),
         'top_n_stocks': top_n_stocks,
-        'train_window': train_window,
-        'retrain_freq': retrain_freq,
         'mean_rank_ic': mean_ic,
         'icir': icir,
         'annual_return': bt_metrics.get('annual_return', 0.0),
@@ -638,6 +608,7 @@ def run_xgboost_baseline(
         'n_trading_days': bt_metrics.get('n_trading_days', 0),
         'train_end': train_end,
         'test_start': test_start,
+        'forward_period': forward_period,
     }
 
     # -- Step 10: Save results --
@@ -676,10 +647,6 @@ if __name__ == '__main__':
                         help='Test start date (YYYY-MM-DD)')
     parser.add_argument('--top-n', type=int, default=50,
                         help='Number of stocks in portfolio')
-    parser.add_argument('--train-window', type=int, default=250,
-                        help='Training lookback (trading days)')
-    parser.add_argument('--retrain-freq', type=int, default=5,
-                        help='Retrain frequency (days)')
     parser.add_argument('--n-estimators', type=int, default=200,
                         help='Number of boosting rounds')
     parser.add_argument('--max-depth', type=int, default=5,
@@ -688,6 +655,8 @@ if __name__ == '__main__':
                         help='Learning rate')
     parser.add_argument('--holding-period', type=int, default=1,
                         help='Holding period (1=daily, 5=weekly)')
+    parser.add_argument('--forward-period', type=int, default=10,
+                        help='Forward return period in days (must align with other baselines)')
     parser.add_argument('--output-dir', default='experiments/xgboost',
                         help='Output directory')
 
@@ -701,12 +670,11 @@ if __name__ == '__main__':
         train_end_date=args.train_end,
         test_start_date=args.test_start,
         top_n_stocks=args.top_n,
-        train_window=args.train_window,
-        retrain_freq=args.retrain_freq,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         learning_rate=args.learning_rate,
         holding_period=args.holding_period,
+        forward_period=args.forward_period,
         output_dir=args.output_dir,
     )
 

@@ -82,6 +82,8 @@ class MCTSSearch:
         self.iteration = 0
         self.root: Optional[MCTSNode] = None
         self.best_formula: Optional[str] = None
+        self.best_selected_params: Optional[Dict[str, Any]] = None  # 最佳节点对应的具体参数
+        self.best_formula_info: Optional[Dict[str, Any]] = None      # 最佳节点的完整 formula_info
         self.best_score = -1.0
         self.max_score_overall = 0.0  # 跟踪用于动态预算的最大分数
         self.alpha_repository: List[Dict[str, Any]] = []
@@ -660,9 +662,14 @@ class MCTSSearch:
             if value > self.best_score:
                 self.best_score = value
                 self.best_formula = selected_node.formula
+                # 保存最佳节点对应的具体参数，供后续公式计算使用
+                self.best_selected_params = getattr(selected_node, 'selected_params', None)
+                self.best_formula_info = getattr(selected_node, 'formula_info', None)
                 self.no_improve_count = 0
                 print(f"\n[{i:03d}] 发现新最佳! 分数={value:.3f}")
                 print(f"公式: {self.best_formula}")
+                if self.best_selected_params:
+                    print(f"参数: {self.best_selected_params}")
                 if selected_node.scores:
                     print(f"评分: {selected_node.scores}")
                 

@@ -27,6 +27,30 @@ from .performance_aware import (
 )
 
 
+def _compute_composite_score(raw_scores: Dict[str, float]) -> float:
+    """
+    从原始指标值计算综合评分 (0-10 范围)。
+    
+    使用真实 IC/ICIR/Turnover/Diversity/Overfitting 值，
+    各维度归一化到 [0, 1] 后取平均，再缩放到 0-10。
+    
+    - IC (effectiveness): abs(IC)/0.05, 越大越好 (0.05 为优秀阈值)
+    - IR (stability/ICIR): abs(IR)/0.5, 越大越好 (0.5 为优秀阈值)
+    - Diversity: 原值 0-1, 越大越好
+    - Overfitting: 原值 0-1+, 越大越好 (接近1表示不过拟合)
+    - Turnover: 1-Turnover, 越低越好
+    """
+    if not raw_scores:
+        return 0.0
+    ic_norm = min(abs(raw_scores.get("IC", 0)) / 0.05, 1.0)
+    ir_norm = min(abs(raw_scores.get("IR", 0)) / 0.5, 1.0)
+    div_norm = min(max(raw_scores.get("Diversity", 0), 0), 1.0)
+    oof_norm = min(max(raw_scores.get("Overfitting", 0), 0), 1.0)
+    turn_norm = max(1.0 - raw_scores.get("Turnover", 0.5), 0.0)
+    composite = (ic_norm + ir_norm + div_norm + oof_norm + turn_norm) / 5.0
+    return composite * 10.0
+
+
 class LLMClient:
     """
     Wrapper for OpenAI API with domain-specific methods for alpha generation.
@@ -365,6 +389,7 @@ class LLMClient:
                 best_score = -1
                 best_params = None
                 best_scores = None
+                best_raw_scores = None
                 
                 if evaluator:
                     print("\n【第3步】评估候选参数组...")
@@ -386,21 +411,31 @@ class LLMClient:
                         
                         try:
                             result = evaluator(concrete_formula, [], None)
+                            raw_scores = None
                             if len(result) == 3:
-                                scores, _, _ = result  # 忽略raw_scores
+                                scores, _, raw_scores = result
                             else:
                                 scores, _ = result
                             if scores:
-                                avg_score = sum(scores.values()) / len(scores)
-                                print(f"  评分详情:")
-                                for dim, score in scores.items():
-                                    print(f"    - {dim}: {score:.2f}")
-                                print(f"  平均分: {avg_score:.2f}")
+                                # 优先使用 raw_scores (真实 IC/ICIR 等) 进行参数选择
+                                if raw_scores:
+                                    avg_score = _compute_composite_score(raw_scores)
+                                    print(f"  原始指标:")
+                                    for dim, val in raw_scores.items():
+                                        print(f"    - {dim}: {val:.4f}")
+                                    print(f"  综合评分: {avg_score:.2f}")
+                                else:
+                                    avg_score = sum(scores.values()) / len(scores)
+                                    print(f"  排名评分:")
+                                    for dim, score in scores.items():
+                                        print(f"    - {dim}: {score:.2f}")
+                                    print(f"  平均分: {avg_score:.2f}")
                                 
                                 if avg_score > best_score:
                                     best_score = avg_score
                                     best_params = params
                                     best_scores = scores
+                                    best_raw_scores = raw_scores
                         except Exception as e:
                             print(f"  评估失败: {e}")
                 else:
@@ -414,6 +449,7 @@ class LLMClient:
                     # 更新formula_info以记录选择的参数和评分
                     formula_info['selected_params'] = best_params
                     formula_info['best_scores'] = best_scores
+                    formula_info['best_raw_scores'] = best_raw_scores
                     formula_info['symbolic_formula'] = formula_info['formula']
                     
                     # 返回符号公式而非具体公式
@@ -539,6 +575,7 @@ class LLMClient:
                 best_score = -1
                 best_params = None
                 best_scores = None
+                best_raw_scores = None
                 
                 if evaluator:
                     # 评估每组候选参数
@@ -549,18 +586,27 @@ class LLMClient:
                         
                         try:
                             result = evaluator(concrete_formula, [], node)
+                            raw_scores = None
                             if len(result) == 3:
-                                scores, _, _ = result  # 忽略raw_scores
+                                scores, _, raw_scores = result
                             else:
                                 scores, _ = result
                             if scores:
-                                avg_score = sum(scores.values()) / len(scores)
-                                print(f"参数组{i+1}评分: {avg_score:.2f}")
+                                # 优先使用 raw_scores (真实 IC/ICIR 等) 进行参数选择
+                                if raw_scores:
+                                    avg_score = _compute_composite_score(raw_scores)
+                                    print(f"参数组{i+1} 综合评分: {avg_score:.2f}")
+                                    for dim, val in raw_scores.items():
+                                        print(f"  - {dim}: {val:.4f}")
+                                else:
+                                    avg_score = sum(scores.values()) / len(scores)
+                                    print(f"参数组{i+1}评分: {avg_score:.2f}")
                                 
                                 if avg_score > best_score:
                                     best_score = avg_score
                                     best_params = params
                                     best_scores = scores
+                                    best_raw_scores = raw_scores
                         except Exception:
                             pass
                 else:
@@ -571,6 +617,7 @@ class LLMClient:
                     # 更新formula_info
                     formula_info['selected_params'] = best_params
                     formula_info['best_scores'] = best_scores
+                    formula_info['best_raw_scores'] = best_raw_scores
                     formula_info['symbolic_formula'] = formula_info['formula']
                     
                     # 提取细化描述

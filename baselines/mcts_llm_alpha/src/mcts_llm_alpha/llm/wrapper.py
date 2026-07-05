@@ -25,14 +25,9 @@ def create_formula_generator(llm_client: LLMClient, evaluator: Optional[Any] = N
     evaluator_func = None
     if evaluator is not None:
         def evaluator_func(formula, repo_factors, node):
-            # 处理evaluate_formula可能返回2个或3个值的情况
-            result = evaluator.evaluate_formula(formula, repo_factors, node)
-            if len(result) == 3:
-                # 新版本返回 (scores, factor_df, raw_scores)
-                return result[0], result[1]  # 只返回前两个值
-            else:
-                # 旧版本返回 (scores, factor_df)
-                return result
+            # 直接透传完整结果 (scores, factor_df, raw_scores)
+            # 不再截断为 2 元组，让 client.py 能访问原始 IC/ICIR 等值
+            return evaluator.evaluate_formula(formula, repo_factors, node)
     
     def generate_formula() -> Tuple[str, str]:
         """生成初始公式和画像。"""
@@ -63,14 +58,8 @@ def create_formula_refiner(llm_client: LLMClient, evaluator: Optional[Any] = Non
     evaluator_func = None
     if evaluator is not None:
         def evaluator_func(formula, repo_factors, node):
-            # 处理evaluate_formula可能返回2个或3个值的情况
-            result = evaluator.evaluate_formula(formula, repo_factors, node)
-            if len(result) == 3:
-                # 新版本返回 (scores, factor_df, raw_scores)
-                return result[0], result[1]  # 只返回前两个值
-            else:
-                # 旧版本返回 (scores, factor_df)
-                return result
+            # 直接透传完整结果 (scores, factor_df, raw_scores)
+            return evaluator.evaluate_formula(formula, repo_factors, node)
     
     def refine_formula(node: Any, dimension: str, avoid_patterns: Optional[List[str]] = None,
                       repo_examples: Optional[List[Dict]] = None,

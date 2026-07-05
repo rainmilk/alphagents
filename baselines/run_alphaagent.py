@@ -830,13 +830,16 @@ def simulate_factor_portfolio(
         return pd.DataFrame()
 
     # Compute composite score: equal-weight average of z-scored top factors
-    # Z-score normalization per date (cross-sectional)
-    composite = pd.DataFrame(0.0, index=factor_test.index, columns=factor_test.columns)
+    # Cross-sectional z-score normalization: for each date, normalize across stocks
+    # factor_test[f] returns a DataFrame (date x stock) for factor f
+    sample = factor_test[available[0]]
+    composite = pd.DataFrame(0.0, index=factor_test.index, columns=sample.columns)
     for f in available:
-        vals = factor_test[f]
-        # Group by date and normalize
-        norm = vals.groupby(vals.index) if vals.index.nlevels == 1 else vals.groupby(level=0)
-        norm = norm.transform(lambda x: (x - x.mean()) / (x.std() + 1e-10))
+        vals = factor_test[f]  # DataFrame: date x stock
+        # Z-score across stocks (axis=1) for each date (row)
+        row_mean = vals.mean(axis=1)
+        row_std = vals.std(axis=1)
+        norm = vals.sub(row_mean, axis=0).div(row_std + 1e-10, axis=0)
         composite = composite.add(norm, fill_value=0.0)
     composite = composite.div(len(available))
 

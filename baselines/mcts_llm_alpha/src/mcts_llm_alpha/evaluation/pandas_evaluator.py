@@ -370,16 +370,25 @@ def convert_to_multindex(
 
 
 def compute_future_returns(
-    price_data_midx: Dict[str, pd.Series]
+    price_data_midx: Dict[str, pd.Series],
+    forward_period: int = 1,
 ) -> pd.Series:
     """
-    Compute future 1-day returns: Ref($close, -1) / $close - 1
+    Compute future N-day forward returns.
 
-    This matches Qlib's "Ref($close, -1) / $close - 1" expression.
+    For forward_period=1: Ref($close, -1) / $close - 1 (1-day return)
+    For forward_period=N: close[t+N] / close[t] - 1 (N-day return)
+
+    Args:
+        price_data_midx: MultiIndex price data dict
+        forward_period: Number of trading days to look ahead (default: 1)
+
+    Returns:
+        Series of forward returns, aligned to current date.
     """
     close = price_data_midx['close']
-    next_close = close.groupby(level='instrument').shift(-1)
-    returns = next_close / close - 1
+    future_close = close.groupby(level='instrument').shift(-forward_period)
+    returns = future_close / close - 1
     returns.name = 'return'
     return returns
 

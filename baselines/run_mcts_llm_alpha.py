@@ -51,6 +51,7 @@ def run_mcts_llm_alpha_baseline(
     use_llm: bool = True,
     start_date: str = "2020-01-01",
     end_date: str = "2023-12-31",
+    forward_period: int = 10,
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -81,11 +82,12 @@ def run_mcts_llm_alpha_baseline(
 
     # Convert to MultiIndex format for the pandas evaluator
     price_midx = convert_to_multindex(price_data)
-    return_series = compute_future_returns(price_midx)
+    return_series = compute_future_returns(price_midx, forward_period=forward_period)
 
     n_dates = len(price_midx['close'].index.get_level_values('datetime').unique())
     n_stocks = len(price_midx['close'].index.get_level_values('instrument').unique())
     print(f"  Loaded: {n_dates} dates × {n_stocks} stocks")
+    print(f"  Forward period: {forward_period}d")
 
     # Determine split date (70/30)
     all_dates = sorted(price_midx['close'].index.get_level_values('datetime').unique())
@@ -93,6 +95,29 @@ def run_mcts_llm_alpha_baseline(
     split_date = str(all_dates[split_idx])
     print(f"  Date range: {start_date} → {end_date}")
     print(f"  IS/OOS split: {split_date}")
+
+    # ── 1b. Create train-only data for MCTS search & LLM ──────────
+    # MCTS search and LLM formula generation/refinement must only see
+    # training (IS) data. Using full data (including OOS) during search
+    # causes data leakage — the search optimizes on future information.
+    train_dates = [d for d in all_dates if str(d) <= split_date]
+    print(f"  Train period: {train_dates[0]} → {train_dates[-1]} ({len(train_dates)} dates)")
+
+    train_price_midx = {}
+    for key, series in price_midx.items():
+        if isinstance(series, pd.Series) and isinstance(series.index, pd.MultiIndex):
+            train_mask = series.index.get_level_values('datetime').isin(train_dates)
+            train_price_midx[key] = series[train_mask]
+        else:
+            train_price_midx[key] = series
+
+    if isinstance(return_series, pd.Series) and isinstance(return_series.index, pd.MultiIndex):
+        train_mask = return_series.index.get_level_values('datetime').isin(train_dates)
+        train_return_series = return_series[train_mask]
+    else:
+        train_return_series = return_series
+
+    print(f"  Train data: {len(train_dates)} dates (MCTS/LLM will only see this)")
 
     # ── 2. Create pandas-based evaluator ───────────────────────────
     print("\n[2/6] Creating pandas-based evaluator...")
@@ -119,9 +144,9 @@ def run_mcts_llm_alpha_baseline(
                     print(f"[Eval] Param substitution: {formula[:60]}... → {concrete_formula[:60]}...")
 
         raw_scores, factor_df = evaluate_formula_pandas(
-            concrete_formula, price_midx, return_series, repo_factors,
-            start_date=start_date, end_date=end_date,
-            split_date=split_date,
+            concrete_formula, train_price_midx, train_return_series, repo_factors,
+            start_date=start_date, end_date=split_date,
+            split_date=None,  # Auto-split within train data for Overfitting metric
             ic_method=mcts_config.evaluation.ic_method,
         )
         if raw_scores is None:
@@ -251,13 +276,60 @@ def run_mcts_llm_alpha_baseline(
         if close_series is not None:
             prices_df = close_series.unstack('instrument')
 
-    if prices_df is None:
+    # Retrieve selected_params from the best MCTS node (resolves symbolic w1, w2, etc.)
+    best_selected_params = getattr(mcts, 'best_selected_params', None) or {}
+    if best_selected_params:
+        print(f"  Retrieved selected_params from MCTS: {best_selected_params}")
+    else:
+        print("  No selected_params found in MCTS — will use default param substitution")
+
+    # Split data into IS (train) and OOS (test) — only use test data for final evaluation
+    # to avoid data leakage
+    test_dates = [d for d in all_dates if str(d) > split_date]
+    if len(test_dates) < 10:
+        print(f"  WARNING: Only {len(test_dates)} OOS dates, using full data")
+        test_price_midx = price_midx
+        test_return_series = return_series
+        test_prices_df = prices_df
+    else:
+        print(f"  Filtering to OOS period: {test_dates[0]} → {test_dates[-1]} ({len(test_dates)} dates)")
+        # Filter price_midx (dict of MultiIndex Series) to OOS dates
+        test_price_midx = {}
+        for key, series in price_midx.items():
+            if isinstance(series, pd.Series) and isinstance(series.index, pd.MultiIndex):
+                # MultiIndex: (datetime, instrument)
+                oos_mask = series.index.get_level_values('datetime').isin(test_dates)
+                test_price_midx[key] = series[oos_mask]
+            else:
+                test_price_midx[key] = series
+
+        # Filter return_series to OOS dates
+        if isinstance(return_series, pd.Series) and isinstance(return_series.index, pd.MultiIndex):
+            oos_mask = return_series.index.get_level_values('datetime').isin(test_dates)
+            test_return_series = return_series[oos_mask]
+        else:
+            test_return_series = return_series
+
+        # Filter prices_df to OOS dates
+        if prices_df is not None:
+            test_prices_df = prices_df.loc[prices_df.index.isin(test_dates)]
+        else:
+            test_prices_df = None
+
+    if test_prices_df is None:
         print("  WARNING: No price data available for backtest, using zero metrics")
         metrics = _get_default_metrics()
     else:
+        # Pass FULL price_midx (not test_price_midx) to compute_portfolio_metrics
+        # so ExprParser has complete history for rolling-window operations
+        # (e.g. Std($close, 20) needs 20 days of history before OOS start).
+        # This is NOT data leakage: factor values at time t only use data up to t.
+        # The function internally filters to OOS for portfolio construction (L493)
+        # and IC computation (L546).
         metrics = compute_portfolio_metrics(
-            best_formula, price_midx, return_series,
-            prices_df, start_date, end_date, split_date, alpha_repository,
+            best_formula, price_midx, test_return_series,
+            test_prices_df, start_date, end_date, split_date, alpha_repository,
+            selected_params=best_selected_params,
         )
 
     # ── Save results ──────────────────────────────────────────────
@@ -266,8 +338,10 @@ def run_mcts_llm_alpha_baseline(
         'iterations': iterations,
         'has_llm': has_llm,
         'best_formula': best_formula,
+        'best_selected_params': best_selected_params if best_selected_params else None,
         'best_score': mcts.best_score if hasattr(mcts, 'best_score') else 0,
         'n_alpha_in_repo': len(alpha_repository),
+        'forward_period': forward_period,
         'metrics': metrics,
         'timestamp': datetime.now().isoformat(),
     }
@@ -367,6 +441,7 @@ def compute_portfolio_metrics(
     split_date: str,
     alpha_repository: list,
     top_n_stocks: int = 30,
+    selected_params: Optional[Dict] = None,
 ) -> Dict[str, float]:
     """
     Compute portfolio-level metrics using the unified BacktestEngine.
@@ -374,18 +449,49 @@ def compute_portfolio_metrics(
     Evaluates the best factor formula, constructs daily portfolios (top-N stocks
     by factor score, equal-weighted), and runs the unified BacktestEngine for
     consistent metrics across all baselines.
+
+    Args:
+        price_midx: FULL price data (all dates including IS period). ExprParser
+                    needs complete history for rolling-window operations (e.g.
+                    Std, Mean, Ref). OOS filtering is done internally.
+        return_series: OOS-only return series (or full — filtered internally).
+        prices: OOS-only prices DataFrame (or full — reindexed internally).
+        selected_params: Concrete parameter values from the MCTS best node
+                         (e.g. {"w1": 20, "w2": 30, "w3": 10}). Used to
+                         resolve symbolic params in best_formula.
     """
     try:
         from baselines.mcts_llm_alpha.src.mcts_llm_alpha.evaluation.pandas_evaluator import ExprParser
         import re
 
-        # Substitute default params for any unresolved placeholders
+        # Resolve symbolic parameters (w1, w2, t1, t2, etc.)
+        # Priority: (1) selected_params from MCTS node, (2) comprehensive defaults
         concrete_formula = best_formula
-        if any(ch in concrete_formula for ch in "tCpP"):
-            default_params = {"t1": 10, "t2": 20, "t3": 5, "C": 5, "P": 10}
-            for pn, pv in sorted(default_params.items(), key=lambda x: len(x[0]), reverse=True):
-                concrete_formula = re.sub(r"" + pn + r"", str(pv), concrete_formula)
-            print(f"[PortfolioMetrics] Substituted params: {best_formula[:60]}... -> {concrete_formula[:60]}...")
+
+        # All possible symbolic params used by the LLM prompt template
+        all_param_keywords = ["w1", "w2", "w3", "w4", "t1", "t2", "t3"]
+        has_symbolic = any(re.search(r"\b" + kw + r"\b", concrete_formula) for kw in all_param_keywords)
+
+        if has_symbolic:
+            # Start with selected_params from MCTS (if available), then fill gaps with defaults
+            default_params = {
+                "w1": 20, "w2": 30, "w3": 10, "w4": 5,
+                "t1": 10, "t2": 20, "t3": 5,
+            }
+            resolved_params = {**default_params, **(selected_params or {})}
+
+            # Sort by name length descending to avoid partial replacements
+            for pn, pv in sorted(resolved_params.items(), key=lambda x: len(x[0]), reverse=True):
+                # Use word boundaries to avoid corrupting other tokens
+                concrete_formula = re.sub(r"\b" + re.escape(pn) + r"\b", str(pv), concrete_formula)
+
+            print(f"[PortfolioMetrics] Param substitution:")
+            print(f"  Before: {best_formula}")
+            print(f"  After:  {concrete_formula}")
+            if selected_params:
+                print(f"  MCTS params used: {selected_params}")
+            else:
+                print(f"  (used default params - no MCTS selected_params available)")
 
         parser = ExprParser(price_midx)
         factor_series = parser.evaluate(concrete_formula)
@@ -496,6 +602,8 @@ def parse_args():
     parser.add_argument('--end-date', type=str, default='2023-12-31')
     parser.add_argument('--no-llm', action='store_true', default=False,
                         help='Disable LLM (use simulated formulas)')
+    parser.add_argument('--forward-period', type=int, default=10,
+                        help='Forward return period in days (default: 10, should match MASE)')
     return parser.parse_args()
 
 
@@ -508,5 +616,6 @@ if __name__ == "__main__":
         use_llm=not args.no_llm,
         start_date=args.start_date,
         end_date=args.end_date,
+        forward_period=args.forward_period,
     )
     print("\nDone!")
