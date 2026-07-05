@@ -35,7 +35,7 @@ from baselines.run_alphaagent import run_alphaagent_baseline
 from baselines.run_alphaforge import run_alphaforge_baseline
 
 # Import XGBoost runner
-from baselines.run_xgboost_baseline import run_xgboost_baseline
+from baselines.run_alpha_xgboost import run_xgboost_baseline
 
 # Import AlphaGrail runner
 from baselines.run_alphagrail import run_alphagrail_baseline
