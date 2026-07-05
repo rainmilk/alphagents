@@ -320,17 +320,37 @@ def run_xgboost_simple(
     print("=" * 60)
 
     # -- Step 1: Load data --
+    # Extend data loading by context_days to ensure forward return targets
+    # are valid for ALL test dates. Without the extension, the last
+    # forward_period days of test data have NaN targets because
+    # shift(-forward_period) goes beyond the loaded data.
+    from datetime import timedelta
+    buffer_calendar_days = int(max(context_days, forward_period) * 2) + 10
+    if end_date:
+        extended_end = (pd.Timestamp(end_date) + timedelta(days=buffer_calendar_days)).strftime('%Y-%m-%d')
+    else:
+        extended_end = None
+
     print("\n[Step 1] Loading data via main DataLoader...")
+    if extended_end and extended_end != end_date:
+        print(f"  Extending end_date by {context_days}d context: "
+              f"{end_date} -> {extended_end}")
     loader = DataLoader(config_path=config_path)
     price_data, _, _ = loader.load_data(
         start_date=start_date,
-        end_date=end_date,
+        end_date=extended_end,
         universe=universe,
     )
 
-    close = price_data['close']
-    print(f"  Loaded: {len(close.index)} trading days x "
-          f"{len(close.columns)} stocks")
+    close_extended = price_data['close']
+    # Trim close to original end_date for backtesting
+    if end_date:
+        close = close_extended[close_extended.index <= pd.Timestamp(end_date)]
+    else:
+        close = close_extended
+    print(f"  Loaded: {len(close_extended.index)} trading days (extended) x "
+          f"{len(close_extended.columns)} stocks")
+    print(f"  Test/backtest period: {len(close.index)} trading days")
 
     # -- Step 2: Determine train/test split --
     print("\n[Step 2] Determining train/test split...")
@@ -341,15 +361,24 @@ def run_xgboost_simple(
     print(f"  Train end: {train_end}, Test start: {test_start}")
 
     # -- Step 3: Build features (daily return only) --
+    # Compute on extended close (so first day's pct_change is valid),
+    # then trim to original period for train/test
     print("\n[Step 3] Building features (daily close-price return)...")
-    features = _build_features(close)
+    features = _build_features(close_extended)
+    if end_date:
+        end_ts = pd.Timestamp(end_date)
+        features = features[features.index.get_level_values('date') <= end_ts]
     n_features = len(features.columns)
     print(f"  Feature(s): {list(features.columns)}")
     print(f"  Feature panel: {len(features)} rows (date, stock)")
 
     # -- Step 4: Build targets --
+    # Compute on extended close so forward returns are valid for all test
+    # dates up to end_date, then trim
     print(f"\n[Step 4] Building targets ({forward_period}d forward return)...")
-    targets = _build_targets(close, forward_period=forward_period)
+    targets = _build_targets(close_extended, forward_period=forward_period)
+    if end_date:
+        targets = targets[targets.index.get_level_values('date') <= end_ts]
     print(f"  Target panel: {len(targets)} rows")
 
     # -- Step 5: One-shot training and prediction --

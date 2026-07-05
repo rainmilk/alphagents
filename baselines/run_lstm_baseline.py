@@ -360,12 +360,26 @@ def _train_predict_oneshot_lstm(
     print("  LSTM training complete.")
 
     # -- Predict on test period --
-    print("\n  Preparing test sequences...")
-    test_features = features[features.index.get_level_values('date') >= test_start_ts]
-    test_targets = targets[targets.index.get_level_values('date') >= test_start_ts]
-    X_test, y_test, test_sample_dates, test_sample_stocks = _prepare_lstm_data(
-        test_features, test_targets, test_dates, all_stocks, seq_len,
+    # Include seq_len days of training data before test_start so the LSTM
+    # can form sequences for ALL test dates (including the first one).
+    # Without this context, the first seq_len-1 test days would be skipped,
+    # causing incomplete test coverage.
+    print("\n  Preparing test sequences (with context from train period)...")
+    test_start_pos = all_dates.get_loc(test_dates[0])
+    context_start_pos = max(0, test_start_pos - seq_len + 1)
+    context_dates = all_dates[context_start_pos:]
+
+    context_features = features[features.index.get_level_values('date').isin(context_dates)]
+    context_targets = targets[targets.index.get_level_values('date').isin(context_dates)]
+    X_test, _, test_sample_dates, test_sample_stocks = _prepare_lstm_data(
+        context_features, context_targets, context_dates, all_stocks, seq_len,
     )
+
+    # Filter to only test dates (drop context days from predictions)
+    test_mask = np.array([d >= test_start_ts for d in test_sample_dates])
+    X_test = X_test[test_mask]
+    test_sample_dates = test_sample_dates[test_mask]
+    test_sample_stocks = test_sample_stocks[test_mask]
 
     print(f"  Predicting on {len(X_test)} test samples...")
     model.eval()
@@ -493,17 +507,37 @@ def run_lstm_baseline(
     print("=" * 60)
 
     # -- Step 1: Load data --
+    # Extend data loading by context_days to ensure forward return targets
+    # are valid for ALL test dates. Without the extension, the last
+    # forward_period days of test data have NaN targets because
+    # shift(-forward_period) goes beyond the loaded data.
+    from datetime import timedelta
+    buffer_calendar_days = int(max(context_days, forward_period) * 2) + 10
+    if end_date:
+        extended_end = (pd.Timestamp(end_date) + timedelta(days=buffer_calendar_days)).strftime('%Y-%m-%d')
+    else:
+        extended_end = None
+
     print("\n[Step 1] Loading data via main DataLoader...")
+    if extended_end and extended_end != end_date:
+        print(f"  Extending end_date by {context_days}d context: "
+              f"{end_date} -> {extended_end}")
     loader = DataLoader(config_path=config_path)
     price_data, _, _ = loader.load_data(
         start_date=start_date,
-        end_date=end_date,
+        end_date=extended_end,
         universe=universe,
     )
 
-    close = price_data['close']
-    print(f"  Loaded: {len(close.index)} trading days x "
-          f"{len(close.columns)} stocks")
+    close_extended = price_data['close']
+    # Trim close to original end_date for backtesting
+    if end_date:
+        close = close_extended[close_extended.index <= pd.Timestamp(end_date)]
+    else:
+        close = close_extended
+    print(f"  Loaded: {len(close_extended.index)} trading days (extended) x "
+          f"{len(close_extended.columns)} stocks")
+    print(f"  Test/backtest period: {len(close.index)} trading days")
 
     # -- Step 2: Determine train/test split --
     print("\n[Step 2] Determining train/test split...")
@@ -514,15 +548,24 @@ def run_lstm_baseline(
     print(f"  Train end: {train_end}, Test start: {test_start}")
 
     # -- Step 3: Build features (daily return only) --
+    # Compute on extended close (so first day's pct_change is valid),
+    # then trim to original period for train/test
     print("\n[Step 3] Building features (daily close-price return)...")
-    features = _build_features(close)
+    features = _build_features(close_extended)
+    if end_date:
+        end_ts = pd.Timestamp(end_date)
+        features = features[features.index.get_level_values('date') <= end_ts]
     n_features = len(features.columns)
     print(f"  Feature(s): {list(features.columns)}")
     print(f"  Feature panel: {len(features)} rows (date, stock)")
 
     # -- Step 4: Build targets --
+    # Compute on extended close so forward returns are valid for all test
+    # dates up to end_date, then trim
     print(f"\n[Step 4] Building targets ({forward_period}d forward return)...")
-    targets = _build_targets(close, forward_period=forward_period)
+    targets = _build_targets(close_extended, forward_period=forward_period)
+    if end_date:
+        targets = targets[targets.index.get_level_values('date') <= end_ts]
     print(f"  Target panel: {len(targets)} rows")
 
     # -- Step 5: One-shot LSTM training and prediction --
