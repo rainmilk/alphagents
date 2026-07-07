@@ -600,17 +600,37 @@ def run_alphafama_baseline(
 
     # ── Step 6: Merge LLM factors with original factors ────────────────
     if used_llm and n_llm_factors > 0:
-        print(f"\n[Step 6] Computing LLM factor exposures on test data...")
+        print(f"\n[Step 6] Computing LLM factor exposures on train + test data...")
         try:
+            # ── Test side ──
             llm_test_exposures = _compute_llm_factor_exposures(
                 test_df, llm_factor_expressions
             )
             llm_test_ic = compute_ic_matrix(llm_test_exposures, test_returns)
 
-            # Merge exposures: original Alpha101 + LLM-generated
+            # Merge test exposures: original Alpha101 + LLM-generated
             test_exposures_merged = pd.concat([test_exposures, llm_test_exposures], axis=1)
             # Remove duplicate columns (in case LLM generated an expression identical to an Alpha101)
             test_exposures_merged = test_exposures_merged.loc[:, ~test_exposures_merged.columns.duplicated()]
+
+            # Also merge test_ic for portfolio simulation
+            for col in llm_test_ic.columns:
+                if col not in test_ic.columns:
+                    test_ic[col] = llm_test_ic[col]
+
+            # ── Train side ──
+            # Compute LLM factor exposures and IC on training data so that
+            # train_ic has columns for LLM factors. Without this, the later
+            # train_ic[top_factor_names] lookup (in _simulate_portfolio_from_ic)
+            # raises KeyError when top_factor_names includes LLM expressions.
+            llm_train_exposures = _compute_llm_factor_exposures(
+                train_df, llm_factor_expressions
+            )
+            llm_train_ic = compute_ic_matrix(llm_train_exposures, train_returns)
+
+            for col in llm_train_ic.columns:
+                if col not in train_ic.columns:
+                    train_ic[col] = llm_train_ic[col]
 
             # Merge IC: combine original mean_train_ic with LLM rankic
             # For LLM factors, use their rankic as the IC estimate
@@ -618,17 +638,13 @@ def run_alphafama_baseline(
                 if expr not in mean_train_ic.index:
                     mean_train_ic[expr] = llm_rankic.get(expr, 0.0)
 
-            # Also merge test_ic for portfolio simulation
-            for col in llm_test_ic.columns:
-                if col not in test_ic.columns:
-                    test_ic[col] = llm_test_ic[col]
-
             n_total = len(test_exposures_merged.columns)
             print(f"  Merged: {n_factors} Alpha101 + {n_llm_factors} LLM = {n_total} total factors")
+            print(f"  train_ic columns: {len(train_ic.columns)}, test_ic columns: {len(test_ic.columns)}")
             test_exposures = test_exposures_merged
 
         except Exception as e:
-            print(f"  WARNING: Failed to compute LLM factor exposures on test data: {e}")
+            print(f"  WARNING: Failed to compute LLM factor exposures: {e}")
             print("  Falling back to Alpha101-only factors")
 
     # ── Step 7: Evaluate on test data ──────────────────────────────────
@@ -776,8 +792,27 @@ def _simulate_portfolio_from_ic(
     """
     from backtest.engine import BacktestEngine
 
-    # Get top factor names
+    # Get top factor names — filter to those actually present in train_ic
+    # (LLM-generated factors may appear in top_n_factors but could be missing
+    # from train_ic if the merge step was skipped or partially failed)
     top_factor_names = list(top_n_factors.index[:min(10, len(top_n_factors))])
+    available_in_train_ic = [f for f in top_factor_names if f in train_ic.columns]
+    if len(available_in_train_ic) < len(top_factor_names):
+        missing = set(top_factor_names) - set(available_in_train_ic)
+        logger.warning(
+            f"_simulate_portfolio_from_ic: {len(missing)} top factors missing "
+            f"from train_ic, using {len(available_in_train_ic)}/{len(top_factor_names)}"
+        )
+    top_factor_names = available_in_train_ic
+    if not top_factor_names:
+        logger.warning("_simulate_portfolio_from_ic: no factors available in train_ic")
+        return {
+            'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+            'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+            'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+            'n_trading_days': 0,
+        }
+
     factor_weights = train_ic[top_factor_names].abs().mean()
     factor_weights = factor_weights / factor_weights.sum()
 

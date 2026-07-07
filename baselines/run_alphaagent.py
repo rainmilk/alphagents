@@ -69,6 +69,278 @@ def _load_function_lib():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Factor Originality Regulator (AST-based, from original AlphaAgent)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Valid data variables allowed in factor expressions
+VALID_DATA_VARS = {'$open', '$close', '$high', '$low', '$volume', '$return'}
+
+# Cache for valid function names from function_lib
+_valid_functions_cache = None
+
+
+def _get_valid_functions() -> set:
+    """Get the set of valid function names from AlphaAgent's function library."""
+    global _valid_functions_cache
+    if _valid_functions_cache is None:
+        flib = _load_function_lib()
+        _valid_functions_cache = {
+            name for name in dir(flib)
+            if callable(getattr(flib, name)) and not name.startswith('_')
+        }
+    return _valid_functions_cache
+
+
+def _load_factor_ast():
+    """
+    Load AlphaAgent's factor_ast.py via importlib.
+
+    This module provides pyparsing-based AST parsing, maximum common subtree
+    matching with commutative operator handling, and originality metrics
+    (count_free_args, count_unique_vars, count_all_nodes).
+
+    Falls back to None if pyparsing or the module is unavailable.
+    """
+    try:
+        ast_path = (PROJECT_ROOT / "baselines" / "AlphaAgent" / "alphaagent" /
+                    "components" / "coder" / "factor_coder" / "factor_ast.py")
+        spec = importlib.util.spec_from_file_location("alphaagent_factor_ast", str(ast_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        logger.warning(f"  Failed to load factor_ast module: {e}")
+        logger.warning(f"  AST originality constraint will be disabled")
+        return None
+
+
+class FactorRegulator:
+    """
+    AST-based factor originality regulator, mirroring AlphaAgent's FactorRegulator.
+
+    Three-stage validation pipeline (matching original AlphaAgent):
+    1. is_parsable()        — pyparsing syntax check (catches malformed expressions)
+    2. validate_semantics() — function/variable name check (catches unknown functions/vars)
+    3. is_expression_acceptable() — originality check with 3 criteria:
+       - cond1: max common subtree with existing factors <= 8 nodes
+       - cond2: numeric constants / total nodes < 50%
+       - cond3: unique variables / total nodes < 50%
+
+    The factor zoo starts empty and accumulates accepted factors, so later
+    factors in the same run are checked against earlier ones for structural
+    duplication. Commutative operators (+, *) are handled: A+B matches B+A.
+    """
+
+    def __init__(self, duplication_threshold: int = 8):
+        self.ast_mod = _load_factor_ast()
+        self.duplication_threshold = duplication_threshold
+        self.factor_zoo = []  # List of expression strings (for AST comparison)
+
+    def is_available(self) -> bool:
+        """Check if the AST module loaded successfully."""
+        return self.ast_mod is not None
+
+    def is_parsable(self, expr: str) -> bool:
+        """
+        Stage 1: Check if expression can be parsed by pyparsing.
+
+        This catches syntax errors like mismatched parentheses, invalid tokens,
+        or malformed function calls — before sending to eval().
+        """
+        if not self.is_available():
+            return True  # Skip if AST module unavailable
+        try:
+            self.ast_mod.parse_expression(expr)
+            return True
+        except Exception:
+            return False
+
+    def validate_semantics(self, expr: str) -> Tuple[bool, str]:
+        """
+        Stage 2: Check that all function names and variable names are valid.
+
+        Walks the AST and verifies:
+        - All VarNode names starting with '$' are in VALID_DATA_VARS
+        - All FunctionNode names exist in AlphaAgent's function library
+
+        Returns (ok, error_message).
+        """
+        if not self.is_available():
+            return True, ""
+        try:
+            tree = self.ast_mod.parse_expression(expr)
+            errors = []
+            self._check_node_semantics(tree, errors)
+            if errors:
+                return False, "; ".join(errors[:3])  # Limit error messages
+            return True, ""
+        except Exception as e:
+            return False, f"parse error: {e}"
+
+    def _check_node_semantics(self, node, errors: list):
+        """Recursively check AST nodes for invalid function/variable names."""
+        ast_mod = self.ast_mod
+
+        if isinstance(node, ast_mod.VarNode):
+            # VarNode.name is always a string (from pyparsing Combine)
+            var_name = node.name if isinstance(node.name, str) else str(node.name)
+            if var_name.startswith('$') and var_name not in VALID_DATA_VARS:
+                errors.append(f"unknown variable '{var_name}'")
+
+        elif isinstance(node, ast_mod.FunctionNode):
+            # FunctionNode.name is stored as a VarNode (from pyparsing grammar:
+            # function_call = var + "(" + ...), so we extract the string
+            if isinstance(node.name, ast_mod.VarNode):
+                func_name = node.name.name if isinstance(node.name.name, str) else str(node.name.name)
+            else:
+                func_name = str(node.name)
+            valid_funcs = _get_valid_functions()
+            if func_name not in valid_funcs:
+                errors.append(f"unknown function '{func_name}()'")
+            for arg in node.args:
+                self._check_node_semantics(arg, errors)
+
+        elif isinstance(node, ast_mod.BinaryOpNode):
+            self._check_node_semantics(node.left, errors)
+            self._check_node_semantics(node.right, errors)
+
+        elif isinstance(node, ast_mod.ConditionalNode):
+            self._check_node_semantics(node.condition, errors)
+            self._check_node_semantics(node.true_expr, errors)
+            self._check_node_semantics(node.false_expr, errors)
+
+    def evaluate(self, expr: str) -> dict:
+        """
+        Compute originality metrics for an expression.
+
+        Returns dict with:
+        - duplicated_subtree_size: size of largest common subtree with factor zoo
+        - duplicated_subtree: the matched subtree (for feedback)
+        - matched_alpha: the zoo expression it duplicated
+        - num_free_args: count of numeric constants
+        - num_unique_vars: count of unique $-prefixed variables
+        - num_all_nodes: total AST node count
+        """
+        if not self.is_available():
+            return {
+                'duplicated_subtree_size': 0,
+                'duplicated_subtree': None,
+                'matched_alpha': None,
+                'num_free_args': 0,
+                'num_unique_vars': 0,
+                'num_all_nodes': 1,
+            }
+
+        # Compare against factor zoo
+        max_size = 0
+        matched_subtree = None
+        matched_alpha = None
+
+        for zoo_expr in self.factor_zoo:
+            try:
+                match = self.ast_mod.compare_expressions(expr, zoo_expr)
+                if match is not None and match.size > max_size:
+                    max_size = match.size
+                    matched_subtree = match.root1
+                    matched_alpha = zoo_expr
+            except Exception:
+                pass  # Skip comparison errors
+
+        num_free_args = self.ast_mod.count_free_args(expr)
+        num_unique_vars = self.ast_mod.count_unique_vars(expr)
+        num_all_nodes = self.ast_mod.count_all_nodes(expr)
+
+        return {
+            'duplicated_subtree_size': max_size,
+            'duplicated_subtree': matched_subtree,
+            'matched_alpha': matched_alpha,
+            'num_free_args': num_free_args,
+            'num_unique_vars': num_unique_vars,
+            'num_all_nodes': num_all_nodes,
+        }
+
+    def is_expression_acceptable(self, eval_dict: dict) -> bool:
+        """
+        Stage 3: Check three originality acceptance criteria.
+
+        cond1: duplicated_subtree_size <= duplication_threshold (default 8)
+            Prevents factors that are structurally near-identical to existing ones.
+
+        cond2: -ln(1 - free_args_ratio) < 0.693
+            Equivalent to: num_free_args / num_all_nodes < 0.5
+            Prevents factors that are mostly numeric constants (too simple).
+
+        cond3: -ln(1 - unique_vars_ratio) < 0.693
+            Equivalent to: num_unique_vars / num_all_nodes < 0.5
+            Prevents factors that are just variable stacking without operations.
+        """
+        num_all_nodes = eval_dict['num_all_nodes']
+        if num_all_nodes == 0:
+            return False
+
+        # cond1: structural originality
+        cond1 = eval_dict['duplicated_subtree_size'] <= self.duplication_threshold
+
+        # cond2: numeric constant ratio < 50%
+        free_args_ratio = float(eval_dict['num_free_args']) / float(num_all_nodes)
+        if free_args_ratio >= 1.0:
+            return False
+        cond2 = -np.log(1.0 - free_args_ratio) < 0.693
+
+        # cond3: variable ratio < 50%
+        unique_vars_ratio = float(eval_dict['num_unique_vars']) / float(num_all_nodes)
+        if unique_vars_ratio >= 1.0:
+            return False
+        cond3 = -np.log(1.0 - unique_vars_ratio) < 0.693
+
+        return cond1 and cond2 and cond3
+
+    def add_factor(self, name: str, expr: str):
+        """Add an accepted factor to the zoo for future originality checks."""
+        self.factor_zoo.append(expr)
+
+    def validate_factor(self, name: str, expr: str) -> Tuple[bool, str, Optional[dict]]:
+        """
+        Full validation pipeline: parsable → semantics → originality.
+
+        Returns (accepted, reason, eval_dict).
+        - accepted=True: factor passed all checks
+        - accepted=False: factor rejected, reason explains why
+        """
+        # Stage 1: Syntax
+        if not self.is_parsable(expr):
+            return False, "unparseable expression", None
+
+        # Stage 2: Semantics
+        ok, err = self.validate_semantics(expr)
+        if not ok:
+            return False, f"semantic error: {err}", None
+
+        # Stage 3: Originality
+        eval_dict = self.evaluate(expr)
+        if not self.is_expression_acceptable(eval_dict):
+            dup_size = eval_dict['duplicated_subtree_size']
+            if dup_size > self.duplication_threshold:
+                matched = eval_dict.get('matched_alpha', '')
+                return False, (
+                    f"structural duplication (subtree_size={dup_size} > {self.duplication_threshold})"
+                    + (f", similar to: {matched[:60]}..." if matched else "")
+                ), eval_dict
+
+            num_all = eval_dict['num_all_nodes']
+            free_ratio = eval_dict['num_free_args'] / max(num_all, 1)
+            var_ratio = eval_dict['num_unique_vars'] / max(num_all, 1)
+            if free_ratio >= 0.5:
+                return False, f"too many constants (ratio={free_ratio:.2f})", eval_dict
+            if var_ratio >= 0.5:
+                return False, f"too few operations (var_ratio={var_ratio:.2f})", eval_dict
+
+            return False, "originality check failed", eval_dict
+
+        return True, "accepted", eval_dict
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Data bridge: generate HDF5 files from main DataLoader
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -92,7 +364,12 @@ def convert_to_multindex(price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.Se
 
 
 def compute_returns(price_midx: Dict[str, pd.Series]) -> pd.Series:
-    """Compute daily returns from close prices."""
+    """Compute daily returns from close prices.
+
+    Used as $return in factor expressions (LLM-generated formulas may
+    reference $return). This is NOT the same as forward returns used
+    for IC computation — see compute_forward_returns().
+    """
     close = price_midx.get('close')
     if close is None:
         raise ValueError("Missing 'close' field in price data")
@@ -100,6 +377,40 @@ def compute_returns(price_midx: Dict[str, pd.Series]) -> pd.Series:
     returns = returns.stack()
     returns.index.names = ['datetime', 'instrument']
     return returns
+
+
+def compute_forward_returns(
+    price_midx: Dict[str, pd.Series],
+    forward_period: int = 10,
+) -> pd.Series:
+    """Compute forward N-day returns for IC-based factor ranking.
+
+    For forward_period=N:  return[t] = close[t+N] / close[t] - 1
+
+    This aligns AlphaAgent's IC evaluation with other baselines that use
+    forward_period-day forward returns (MCTS-LLM-Alpha, AlphaGrail, XGBoost,
+    LSTM, XGBoost-Simple all default to forward_period=10).
+
+    Note: compute_returns() produces 1-day daily returns for $return in
+    factor expressions. This function produces N-day forward returns used
+    for IC-based factor selection — the two serve different purposes.
+
+    Args:
+        price_midx: MultiIndex price data dict (must contain 'close')
+        forward_period: Number of trading days to look ahead (default 10,
+            matching other baselines for fair comparison)
+
+    Returns:
+        pd.Series of forward returns, aligned to current date.
+        Last forward_period days will be NaN (no future data available).
+    """
+    close = price_midx.get('close')
+    if close is None:
+        raise ValueError("Missing 'close' field in price data")
+    future_close = close.groupby(level='instrument').shift(-forward_period)
+    forward_ret = future_close / close - 1
+    forward_ret.name = 'forward_return'
+    return forward_ret
 
 
 def save_data_as_hdf5(
@@ -421,6 +732,7 @@ def _llm_generate_factors(
     model: str,
     hypothesis: str,
     prev_factors: List[Tuple[str, str]] = None,
+    feedback: str = None,
 ) -> List[Tuple[str, str]]:
     """
     Stage 2: Use LLM to convert a hypothesis into 2-3 factor expressions.
@@ -432,6 +744,9 @@ def _llm_generate_factors(
     Args:
         hypothesis: Market hypothesis from Stage 1
         prev_factors: Previously generated factors (to avoid duplication)
+        feedback: Originality rejection feedback (from FactorRegulator) to
+            inject into the prompt, guiding the LLM to avoid duplicated
+            sub-expressions. None for first attempt.
 
     Returns:
         List of (factor_name, expression_string) tuples.
@@ -492,6 +807,10 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
             for name, expr in prev_factors[-10:]:
                 user_parts.append(f"  - {name}: {expr}")
 
+        # Inject originality feedback if provided (from FactorRegulator rejection)
+        if feedback:
+            user_parts.append(feedback)
+
         user_prompt = "\n".join(user_parts)
 
         response = client.chat.completions.create(
@@ -526,13 +845,23 @@ def generate_llm_factors(
     n_formulas: int = 50,
     config_path: str = "config/config.yaml",
     seed: int = 42,
+    max_retries: int = 3,
 ) -> Tuple[List[Tuple[str, str]], bool]:
     """
     Generate factor formulas using LLM (AlphaAgent's core pipeline).
 
-    Implements a simplified version of AlphaAgent's two-stage loop:
+    Implements AlphaAgent's two-stage loop with AST originality constraint:
     Stage 1: LLM generates market hypotheses
     Stage 2: LLM converts hypotheses to factor expressions (2-3 per call)
+
+    Each generated factor undergoes three-stage validation:
+    1. is_parsable()        — pyparsing syntax check
+    2. validate_semantics() — function/variable name check
+    3. is_expression_acceptable() — AST originality (3 criteria)
+
+    If a factor fails originality, a feedback prompt is constructed and the
+    LLM is retried (up to max_retries times per round), mirroring the original
+    AlphaAgent's while-True retry loop in factor_proposal.py.
 
     Falls back to random generation if LLM is unavailable.
 
@@ -540,6 +869,8 @@ def generate_llm_factors(
         n_formulas: Target number of factor formulas
         config_path: Path to config.yaml for LLM settings
         seed: Random seed (used for direction selection and fallback)
+        max_retries: Max LLM retry attempts per round when factors are rejected
+            by the originality regulator (default 3)
 
     Returns:
         (formulas, used_llm) -- list of (name, expression) tuples and whether LLM was used.
@@ -552,9 +883,18 @@ def generate_llm_factors(
 
     print(f"  LLM backend: model={model}, base_url={base_url[:40]}...")
 
+    # Initialize AST originality regulator
+    regulator = FactorRegulator()
+    if regulator.is_available():
+        print(f"  AST originality regulator: enabled (threshold={regulator.duplication_threshold})")
+    else:
+        print(f"  AST originality regulator: disabled (factor_ast module unavailable)")
+
     rng = np.random.default_rng(seed)
     formulas = []
     prev_hypotheses = []
+    n_rejected = 0
+    n_retried = 0
 
     # Each LLM call generates 2-3 factors. Calculate rounds needed.
     n_rounds = max(1, (n_formulas + 2) // 3)
@@ -579,28 +919,77 @@ def generate_llm_factors(
         prev_hypotheses.append(hypothesis)
         print(f"    Hypothesis: {hypothesis[:100]}...")
 
-        # Stage 2: Generate factor expressions from hypothesis
-        new_factors = _llm_generate_factors(
-            api_key, base_url, model, hypothesis,
-            prev_factors=formulas,
-        )
+        # Stage 2: Generate factor expressions from hypothesis (with retry loop)
+        feedback = None
+        for retry_idx in range(max_retries + 1):  # +1 for initial attempt
+            if len(formulas) >= n_formulas:
+                break
 
-        if not new_factors:
-            print(f"    Factor generation failed, skipping this round")
-            continue
+            new_factors = _llm_generate_factors(
+                api_key, base_url, model, hypothesis,
+                prev_factors=formulas,
+                feedback=feedback,
+            )
 
-        for name, expr in new_factors:
-            # Avoid duplicate names
-            base_name = name
-            suffix = 1
-            while any(f[0] == name for f in formulas):
-                suffix += 1
-                name = f"{base_name}_{suffix}"
+            if not new_factors:
+                print(f"    Factor generation failed, skipping this round")
+                break
 
-            formulas.append((name, expr))
-            print(f"    -> {name}: {expr[:80]}")
+            # Validate each factor through the regulator
+            accepted_factors = []
+            rejection_feedbacks = []
 
-        print(f"    Total: {len(formulas)}/{n_formulas}")
+            for name, expr in new_factors:
+                accepted, reason, eval_dict = regulator.validate_factor(name, expr)
+
+                if accepted:
+                    # Avoid duplicate names
+                    base_name = name
+                    suffix = 1
+                    while any(f[0] == name for f in formulas):
+                        suffix += 1
+                        name = f"{base_name}_{suffix}"
+
+                    formulas.append((name, expr))
+                    regulator.add_factor(name, expr)
+                    accepted_factors.append((name, expr))
+                    print(f"    -> {name}: {expr[:80]}")
+                else:
+                    n_rejected += 1
+                    print(f"    [REJECT] {name}: {reason}")
+
+                    # Build feedback for rejected factors (originality rejections only)
+                    if eval_dict is not None:
+                        dup_size = eval_dict.get('duplicated_subtree_size', 0)
+                        if dup_size > 0:
+                            rejection_feedbacks.append(
+                                f"- Proposed Expression: {expr}\n"
+                                f"  Duplicated Sub-expression Size: {dup_size}\n"
+                                f"  Please avoid this pattern and generate a structurally novel factor."
+                            )
+
+            if accepted_factors:
+                print(f"    Accepted: {len(accepted_factors)}, Total: {len(formulas)}/{n_formulas}")
+
+            # If all factors accepted or no originality rejections, move to next round
+            if not rejection_feedbacks or len(formulas) >= n_formulas:
+                break
+
+            # Build feedback for retry
+            if retry_idx < max_retries:
+                n_retried += 1
+                feedback = (
+                    "\n**Alert: Duplication Detected in Previous Factor Expressions**\n"
+                    + "\n".join(rejection_feedbacks) +
+                    "\nRecommendations:\n"
+                    "- Avoid the duplicated sub-expressions above\n"
+                    "- Generate novel factors by uniquely combining data variables and operations\n"
+                    "- Experiment with different function combinations (e.g., TS_CORR, REGBETA, TS_MAD)\n"
+                    "- Replace raw variables with transformed variants to enhance expressiveness\n"
+                )
+                print(f"    Retrying with originality feedback (attempt {retry_idx+2}/{max_retries+1})...")
+            else:
+                print(f"    Max retries reached, accepting {len(accepted_factors)} factors from this round")
 
     if len(formulas) < n_formulas:
         # Supplement with random formulas if LLM didn't generate enough
@@ -608,6 +997,10 @@ def generate_llm_factors(
         print(f"  Supplementing with {remaining} random formulas...")
         random_formulas = generate_simulated_formulas(n_formulas=remaining, seed=seed + 1)
         formulas.extend(random_formulas)
+
+    # Report validation statistics
+    if regulator.is_available() and n_rejected > 0:
+        print(f"  AST regulator: rejected {n_rejected} factors, retried {n_retried} times")
 
     return formulas[:n_formulas], True
 
@@ -746,15 +1139,21 @@ def _eval_alphaagent_formula(
 
 def compute_rank_ic(
     factor_df: pd.DataFrame,
-    return_series: pd.Series,
+    forward_return_series: pd.Series,
     train_end_date: str,
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Compute Spearman Rank-IC for each factor on the training set.
 
+    IC measures the cross-sectional rank correlation between factor values
+    at date t and forward returns over forward_period days starting at t.
+    This ensures factor ranking is consistent with the prediction horizon
+    used by all other baselines (forward_period=10 by default).
+
     Args:
         factor_df: DataFrame with factor values (datetime x instrument)
-        return_series: Future returns (same index)
+        forward_return_series: Forward returns over forward_period days
+            (from compute_forward_returns, NOT daily returns)
         train_end_date: End of training period
 
     Returns:
@@ -763,7 +1162,7 @@ def compute_rank_ic(
     train_idx = factor_df.index.get_level_values('datetime') <= train_end_date
 
     factor_train = factor_df.loc[train_idx]
-    ret_train = return_series.reindex(factor_train.index)
+    ret_train = forward_return_series.reindex(factor_train.index)
 
     ic_results = {}
     for col in factor_train.columns:
@@ -896,6 +1295,7 @@ def run_alphaagent_baseline(
     train_end_date: str = None,
     test_start_date: str = None,
     use_llm: bool = True,
+    forward_period: int = 10,
 ) -> Dict:
     """
     Run AlphaAgent baseline using the main project's DataLoader.
@@ -919,6 +1319,9 @@ def run_alphaagent_baseline(
         test_start_date: Override test start date
         use_llm: If True, use LLM to generate factors (default True).
                  Falls back to random if LLM is unavailable.
+        forward_period: Forward return horizon in trading days (default 10).
+            Must match other baselines for fair IC-based factor comparison.
+            Used to compute forward returns for Rank-IC evaluation.
 
     Returns:
         Dict with metrics, IC information, and factor details
@@ -948,6 +1351,7 @@ def run_alphaagent_baseline(
 
     price_midx = convert_to_multindex(price_data)
     return_series = compute_returns(price_midx)
+    forward_return_series = compute_forward_returns(price_midx, forward_period=forward_period)
 
     # Extract prices DataFrame for BacktestEngine (close price, date x stock)
     prices = price_data.get('close')
@@ -958,6 +1362,7 @@ def run_alphaagent_baseline(
     n_dates = len(price_midx.get('close').index.get_level_values('datetime').unique())
     n_stocks = len(price_midx.get('close').index.get_level_values('instrument').unique())
     print(f"  Loaded: {n_dates} dates x {n_stocks} stocks")
+    print(f"  Forward period: {forward_period}d (for IC-based factor ranking)")
     print(f"  Train: <= {train_end_date}  |  Test: >= {test_start_date}")
 
     # ── 2. Save HDF5 data for AlphaAgent compatibility ─────────────
@@ -1002,8 +1407,8 @@ def run_alphaagent_baseline(
     print(f"  Saved factors to: {factor_path}")
 
     # ── 5. Compute IC and select factors ───────────────────────────
-    print(f"\n[5/6] Computing Rank-IC on training set...")
-    ic_mean, ic_df = compute_rank_ic(factor_df, return_series, train_end_date)
+    print(f"\n[5/6] Computing Rank-IC on training set (forward_period={forward_period}d)...")
+    ic_mean, ic_df = compute_rank_ic(factor_df, forward_return_series, train_end_date)
 
     print(f"  Top 10 factors by IC:")
     for i, (name, ic) in enumerate(ic_mean.head(10).items()):
@@ -1079,6 +1484,7 @@ def run_alphaagent_baseline(
         'avg_rank_ic_train': avg_ic,
         'icir': float(best_ic / max(ic_mean.std(), 1e-10)) if len(ic_mean) > 1 else 0.0,
         'n_factors': len(ic_mean),
+        'forward_period': forward_period,
         'annual_return': metrics.get('annual_return', 0.0),
         'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': metrics.get('max_drawdown', 0.0),
@@ -1118,6 +1524,9 @@ if __name__ == "__main__":
                         help="Use LLM to generate factors (default: True)")
     parser.add_argument("--no-llm", action="store_true", default=False,
                         help="Disable LLM, use random factor generation")
+    parser.add_argument("--forward-period", type=int, default=10,
+                        help="Forward return period in days for IC evaluation "
+                             "(default 10, matching other baselines)")
     args = parser.parse_args()
 
     run_alphaagent_baseline(
@@ -1128,4 +1537,5 @@ if __name__ == "__main__":
         start_date=args.start_date,
         end_date=args.end_date,
         use_llm=not args.no_llm,
+        forward_period=args.forward_period,
     )
