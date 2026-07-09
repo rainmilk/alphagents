@@ -49,6 +49,7 @@ class AlphaForgeConfig:
     n_factors: int = 10  # Number of factors to use in Stage 2
     window: Union[int, str] = "inf"  # Rolling window for factor evaluation
     top_n_stocks: int = 50  # Number of stocks in portfolio
+    forward_period: int = 10  # Forward return period for IC evaluation (must match other baselines)
     
     def __post_init__(self):
         if self.seeds is None:
@@ -77,17 +78,48 @@ def convert_to_multindex(prices: pd.DataFrame) -> pd.DataFrame:
 
 def compute_returns(prices_multindex: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute daily returns from MultiIndex price data.
-    
+    Compute 1-day forward returns from MultiIndex price data.
+
+    This is kept for backward compatibility. For IC-based factor evaluation
+    that aligns with other baselines, use compute_forward_returns() with
+    forward_period=10 instead.
+
     Args:
         prices_multindex: MultiIndex DataFrame with OHLCV data
-        
+
     Returns:
-        pd.DataFrame: Daily returns (date x symbol)
+        pd.DataFrame: 1-day forward returns (date x symbol)
     """
     close = prices_multindex['close']
     returns = close.pct_change().shift(-1)  # Forward 1-day return
     return returns
+
+
+def compute_forward_returns(
+    prices_multindex: pd.DataFrame,
+    forward_period: int = 10,
+) -> pd.DataFrame:
+    """
+    Compute forward N-day returns for IC-based factor evaluation.
+
+    For forward_period=N:  return[t] = close[t+N] / close[t] - 1
+
+    This aligns AlphaForge's IC evaluation with other baselines that use
+    forward_period-day forward returns (MCTS-LLM-Alpha, AlphaGrail, XGBoost,
+    LSTM, XGBoost-Simple, AlphaAgent all default to forward_period=10).
+
+    Args:
+        prices_multindex: MultiIndex DataFrame with OHLCV data
+        forward_period: Number of trading days to look ahead (default 10,
+            matching other baselines for fair comparison)
+
+    Returns:
+        pd.DataFrame: Forward returns (date x symbol).
+        Last forward_period days will be NaN (no future data available).
+    """
+    close = prices_multindex['close']
+    forward_returns = close.shift(-forward_period) / close - 1
+    return forward_returns
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -241,9 +273,10 @@ class _FactorGenerator:
     Each position has its own output head with softmax over its vocabulary.
     """
 
-    def __init__(self, latent_dim: int = 64, hidden_dim: int = 256):
+    def __init__(self, latent_dim: int = 64, hidden_dim: int = 256, device: str = 'cpu'):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.device = device
 
         self._build_network()
 
@@ -258,11 +291,11 @@ class _FactorGenerator:
             nn.ReLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
-        )
+        ).to(self.device)
         # One output head per position
         self._heads = nn.ModuleList([
             nn.Linear(self.hidden_dim, dim) for dim in TOKEN_DIMS
-        ])
+        ]).to(self.device)
 
     def generate(self, batch_size: int, device: str = 'cpu') -> "np.ndarray":
         """
@@ -304,9 +337,10 @@ class _FactorPredictor:
     Uses MLP for simplicity.
     """
 
-    def __init__(self, hidden_dim: int = 128):
+    def __init__(self, hidden_dim: int = 128, device: str = 'cpu'):
         self.hidden_dim = hidden_dim
         self.total_vocab = sum(TOKEN_DIMS)
+        self.device = device
         self._build_network()
 
     def _build_network(self):
@@ -321,7 +355,7 @@ class _FactorPredictor:
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(self.hidden_dim // 2, 1),
-        )
+        ).to(self.device)
 
     def _tokens_to_onehot(self, tokens: "np.ndarray") -> "np.ndarray":
         """Convert token sequences to one-hot vectors."""
@@ -348,9 +382,9 @@ class _FactorPredictor:
         """
         import torch
         onehot = self._tokens_to_onehot(tokens)
-        x = torch.from_numpy(onehot)
+        x = torch.from_numpy(onehot).to(self.device)
         with torch.no_grad():
-            scores = self._net(x).squeeze(-1).numpy()
+            scores = self._net(x).squeeze(-1).cpu().numpy()
         return scores
 
     def forward(self, onehot: "torch.Tensor") -> "torch.Tensor":
@@ -468,7 +502,7 @@ def _train_gan_step(
 
 def gan_mine_factors(
     prices_multindex: pd.DataFrame,
-    returns: pd.DataFrame,
+    forward_returns: pd.DataFrame,
     n_factors: int = 50,
     n_rounds: int = 5,
     batch_size: int = 64,
@@ -492,7 +526,7 @@ def gan_mine_factors(
 
     Args:
         prices_multindex: MultiIndex OHLCV data
-        returns: Daily returns DataFrame
+        forward_returns: Forward returns DataFrame (N-day, for IC evaluation)
         n_factors: Target number of factors to mine
         n_rounds: Training rounds
         batch_size: GAN batch size
@@ -515,12 +549,12 @@ def gan_mine_factors(
         factor_vals = evaluate_factor_expression(expr, prices_multindex)
         if factor_vals.isna().all().all():
             return 0.0
-        ric = calculate_rank_ic(factor_vals, returns)
+        ric = calculate_rank_ic(factor_vals, forward_returns)
         return float(ric)
 
     # ── Initialize Networks ──
-    generator = _FactorGenerator(latent_dim=latent_dim)
-    predictor = _FactorPredictor()
+    generator = _FactorGenerator(latent_dim=latent_dim, device=device)
+    predictor = _FactorPredictor(device=device)
 
     # ── Pre-population: generate random factors ──
     if verbose:
@@ -620,7 +654,7 @@ def gan_mine_factors(
     if not all_scores_list:
         if verbose:
             print("  [GAN] No valid factors mined, falling back to templates")
-        return generate_template_factors(prices_multindex, n_factors, returns), [], {}
+        return generate_template_factors(prices_multindex, n_factors, forward_returns), [], {}
 
     all_tokens_arr = np.array(all_tokens_list)
     all_scores_arr = np.array(all_scores_list)
@@ -650,7 +684,7 @@ def gan_mine_factors(
 def generate_template_factors(
     prices_multindex: pd.DataFrame = None,
     n_factors: int = 50,
-    returns: pd.DataFrame = None,
+    forward_returns: pd.DataFrame = None,
 ) -> List[str]:
     """
     Generate template alpha factor expressions (fallback when GAN unavailable).
@@ -660,7 +694,7 @@ def generate_template_factors(
     Args:
         prices_multindex: MultiIndex price data (unused, kept for API compatibility)
         n_factors: Number of factors to generate
-        returns: Unused, kept for API compatibility
+        forward_returns: Unused, kept for API compatibility
 
     Returns:
         List[str]: Factor expressions (as strings for evaluation)
@@ -841,7 +875,7 @@ def stage1_mine_factors(
 
     # Convert to MultiIndex format
     prices_multindex = convert_to_multindex(prices)
-    returns = compute_returns(prices_multindex)
+    forward_returns = compute_forward_returns(prices_multindex, config.forward_period)
 
     gan_stats = {}
 
@@ -857,7 +891,7 @@ def stage1_mine_factors(
         device = 'cuda:0' if False else 'cpu'  # Always CPU for safety
         factor_exprs, factor_rankics, gan_stats = gan_mine_factors(
             prices_multindex=prices_multindex,
-            returns=returns,
+            forward_returns=forward_returns,
             n_factors=config.zoo_size,
             n_rounds=5,
             batch_size=64,
@@ -873,7 +907,7 @@ def stage1_mine_factors(
         factor_rankics = []
 
     # ── Evaluate all factors ──
-    print("  Evaluating factors...")
+    print(f"  Evaluating factors (forward_period={config.forward_period}d)...")
     factor_scores_dict = {}
     factor_metrics = {}
 
@@ -882,8 +916,8 @@ def stage1_mine_factors(
             print(f"    Progress: {i}/{len(factor_exprs)}")
 
         factor_values = evaluate_factor_expression(expr, prices_multindex)
-        ic = calculate_ic(factor_values, returns)
-        rank_ic = calculate_rank_ic(factor_values, returns)
+        ic = calculate_ic(factor_values, forward_returns)
+        rank_ic = calculate_rank_ic(factor_values, forward_returns)
 
         factor_scores_dict[expr] = factor_values
         factor_metrics[expr] = {
@@ -960,7 +994,7 @@ def stage2_combine_factors(
     
     # Convert to MultiIndex format
     prices_multindex = convert_to_multindex(prices)
-    returns = compute_returns(prices_multindex)
+    forward_returns = compute_forward_returns(prices_multindex, config.forward_period)
     
     # Load factor expressions from Stage 1
     factor_exprs = stage1_results['factor_exprs']
@@ -972,15 +1006,15 @@ def stage2_combine_factors(
         all_factor_values[expr] = evaluate_factor_expression(expr, prices_multindex)
     
     # Calculate IC and Rank IC for each factor at each date
-    print("  Calculating rolling IC...")
-    n_dates = len(returns.index)
+    print(f"  Calculating rolling IC (forward_period={config.forward_period}d)...")
+    n_dates = len(forward_returns.index)
     n_factors = len(factor_exprs)
     
     # Store IC time series for each factor
     factor_ic_series = {expr: [] for expr in factor_exprs}
     factor_rankic_series = {expr: [] for expr in factor_exprs}
     
-    for i, date in enumerate(returns.index):
+    for i, date in enumerate(forward_returns.index):
         if i == 0:
             continue
             
@@ -992,7 +1026,7 @@ def stage2_combine_factors(
         
         for expr in factor_exprs:
             factor_past = all_factor_values[expr].iloc[start_idx:i]
-            returns_past = returns.iloc[start_idx:i]
+            returns_past = forward_returns.iloc[start_idx:i]
             
             ic = calculate_ic(factor_past, returns_past)
             rank_ic = calculate_rank_ic(factor_past, returns_past)
@@ -1003,6 +1037,7 @@ def stage2_combine_factors(
     # Rolling combination
     print("  Rolling combination...")
     predictions = []
+    prediction_dates = []  # Track date for each prediction (for Stage 3 filtering)
     selected_factors_history = []
     weights_history = []
     
@@ -1013,10 +1048,10 @@ def stage2_combine_factors(
         min_start = min(config.window, n_dates // 3)
     
     for i in range(min_start, n_dates):
-        if i >= len(returns.index):
+        if i >= len(forward_returns.index):
             break
             
-        date = returns.index[i]
+        date = forward_returns.index[i]
         
         # Calculate factor metrics using past window
         if config.window == "inf":
@@ -1068,13 +1103,15 @@ def stage2_combine_factors(
             all_factor_values[expr].loc[date].fillna(0)
             for expr in good_factors
         ])
-        y = returns.loc[date].fillna(0).values
+        y = forward_returns.loc[date].fillna(0).values
         
         # Fit linear regression using numpy lstsq
+        n_stocks = X.shape[0]
         valid_idx = np.isfinite(y)
         if valid_idx.sum() < 10:
-            predictions.append(0)
-            weights_history.append(np.zeros(len(good_factors)))
+            predictions.append(np.zeros(n_stocks))
+            prediction_dates.append(date)
+            weights_history.append(np.zeros(config.n_factors))
             continue
         
         X_valid = X[valid_idx]
@@ -1090,7 +1127,12 @@ def stage2_combine_factors(
         X_pred_bias = np.column_stack([X, np.ones(len(X))])
         pred = X_pred_bias @ coef
         predictions.append(pred)
-        weights_history.append(coef[:-1])  # Exclude bias term
+        prediction_dates.append(date)
+        # Pad weights to fixed length (config.n_factors) so np.array() produces
+        # a regular 2D array instead of crashing on ragged lists.
+        w = np.zeros(config.n_factors)
+        w[:len(good_factors)] = coef[:-1]  # Exclude bias term
+        weights_history.append(w)
     
     print(f"  Generated {len(predictions)} predictions")
     
@@ -1106,6 +1148,7 @@ def stage2_combine_factors(
     
     return {
         'predictions': predictions,
+        'prediction_dates': prediction_dates,
         'selected_factors': selected_factors_history,
         'weights': weights_history,
         'pred_path': pred_path,
@@ -1114,20 +1157,25 @@ def stage2_combine_factors(
 
 
 def stage3_evaluate_results(
-    prices: pd.DataFrame,
+    close_test: pd.DataFrame,
     stage2_results: Dict,
     config: AlphaForgeConfig,
+    test_start_ts: pd.Timestamp = None,
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
 
-    Constructs portfolio weights from Stage 2 predictions and runs the
-    unified backtest engine for consistent metrics across all baselines.
+    Constructs portfolio weights from Stage 2 predictions (filtered to test
+    period) and runs the unified backtest engine for consistent metrics.
 
     Args:
-        prices: Price data from main DataLoader (date x stock)
-        stage2_results: Results from Stage 2 (contains 'predictions' list)
+        close_test: Close prices for test period (date × stock DataFrame).
+            Columns are stock names, index is date.
+        stage2_results: Results from Stage 2 (contains 'predictions' and
+            'prediction_dates' lists)
         config: AlphaForge configuration
+        test_start_ts: Timestamp for test period start (used to filter
+            predictions). If None, uses all predictions.
 
     Returns:
         Dict: Final performance metrics (from BacktestEngine)
@@ -1136,7 +1184,9 @@ def stage3_evaluate_results(
     print("[Stage 3] Evaluating results (unified BacktestEngine)...")
     print("="*60)
 
-    predictions = stage2_results['predictions']
+    predictions = stage2_results.get('predictions', [])
+    prediction_dates = stage2_results.get('prediction_dates', [])
+
     if not predictions:
         print("  ⚠️  No predictions from Stage 2, returning zero metrics")
         return {
@@ -1149,21 +1199,44 @@ def stage3_evaluate_results(
             'portfolio_returns': pd.Series(dtype=float),
         }
 
-    # Build portfolios DataFrame from predictions
-    # predictions: list of arrays (one per date), each array = stock scores
+    # ── Filter predictions to test period ──
+    if test_start_ts is not None and prediction_dates:
+        test_mask = [d >= test_start_ts for d in prediction_dates]
+        test_predictions = [p for p, m in zip(predictions, test_mask) if m]
+        test_pred_dates = [d for d, m in zip(prediction_dates, test_mask) if m]
+        print(f"  Filtered predictions: {len(test_predictions)} / {len(predictions)} "
+              f"(test_start={test_start_ts.date()})")
+    else:
+        test_predictions = predictions
+        test_pred_dates = prediction_dates
+
+    if not test_predictions:
+        print("  ⚠️  No test-period predictions, returning zero metrics")
+        return {
+            'metrics': {
+                'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+                'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+                'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+                'n_trading_days': 0,
+            },
+            'portfolio_returns': pd.Series(dtype=float),
+        }
+
+    # ── Build portfolios from predictions ──
+    # Each prediction is a 1D array of stock scores; map to close_test.columns
     print("  Building portfolios from predictions...")
+    stock_names = close_test.columns
 
     portfolio_rows = []
     date_index = []
 
-    for i, pred in enumerate(predictions):
+    for pred, date in zip(test_predictions, test_pred_dates):
         if not isinstance(pred, np.ndarray):
             continue
 
-        # pred is a 1D array of scores for all stocks
-        # Need to map to stock names — use prices.columns
-        n_stocks = min(len(pred), len(prices.columns))
-        scores = pd.Series(pred[:n_stocks], index=prices.columns[:n_stocks])
+        # Map prediction scores to stock names
+        n_stocks = min(len(pred), len(stock_names))
+        scores = pd.Series(pred[:n_stocks], index=stock_names[:n_stocks])
 
         # Select top-N stocks and equal-weight
         top = scores.dropna().nlargest(config.top_n_stocks)
@@ -1172,9 +1245,7 @@ def stage3_evaluate_results(
 
         w = pd.Series(1.0 / len(top), index=top.index)
         portfolio_rows.append(w)
-        # Use prices.index aligned to predictions (skip first date which has no return)
-        if i + 1 < len(prices):
-            date_index.append(prices.index[i + 1])
+        date_index.append(date)
 
     if not portfolio_rows:
         print("  ⚠️  No valid portfolios built, returning zero metrics")
@@ -1188,7 +1259,7 @@ def stage3_evaluate_results(
             'portfolio_returns': pd.Series(dtype=float),
         }
 
-    # Align to common dates and columns
+    # Build portfolios DataFrame (date × stock)
     all_stocks = pd.Index(set().union(*(w.index for w in portfolio_rows)))
     portfolios = pd.DataFrame(
         index=pd.DatetimeIndex(date_index),
@@ -1200,8 +1271,8 @@ def stage3_evaluate_results(
     portfolios = portfolios.fillna(0.0)
     portfolios = portfolios.div(portfolios.sum(axis=1), axis=0).fillna(0.0)
 
-    # Align prices to portfolio dates
-    prices_aligned = prices.reindex(portfolios.index)
+    # Align close_test to portfolio dates and columns
+    prices_aligned = close_test.reindex(portfolios.index)
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
     # Run unified backtest
@@ -1242,6 +1313,10 @@ def run_alphaforge_baseline(
     output_dir: str = "results/alphaforge",
     verbose: bool = False,
     use_gan: bool = True,
+    forward_period: int = 10,
+    train_end_date: str = None,
+    test_start_date: str = None,
+    context_days: int = 30,
 ) -> Dict:
     """
     Run complete AlphaForge baseline (all 3 stages).
@@ -1250,6 +1325,12 @@ def run_alphaforge_baseline(
     1. If prices is provided, use it directly
     2. If dataloader is provided, call dataloader.get_prices()
     3. If config_path is provided (and dataloader/prices are None), load from config
+
+    Train/test split:
+    - Stage 1 (GAN factor mining) uses **train data only** (dates < test_start)
+    - Stage 2 (rolling combination) uses **all data** for walk-forward predictions
+    - Stage 3 (backtest) uses **test data only** (dates >= test_start),
+      receiving close prices as a date×stock DataFrame
 
     Args:
         config_path: Path to config YAML (used if dataloader/prices not provided)
@@ -1265,9 +1346,18 @@ def run_alphaforge_baseline(
         output_dir: Output directory
         verbose: Verbose output
         use_gan: Use GAN-based factor mining (True) or template fallback (False)
+        forward_period: Forward return period in days for IC evaluation
+            (default 10, matching other baselines for fair comparison)
+        train_end_date: Last date of training period (YYYY-MM-DD).
+            If None, reads from config or defaults to '2023-12-31'.
+        test_start_date: First date of test period (YYYY-MM-DD).
+            If None, reads from config or defaults to '2024-01-01'.
+        context_days: Number of calendar days to extend before test_start
+            for context window (ensures rolling features are valid at test start).
 
     Returns:
-        Dict: Results with metrics, used_gan, gan_pool_size
+        Dict: Results with metrics, used_gan, gan_pool_size, forward_period,
+            train_end, test_start
     """
     # Load config if needed (for defaults)
     if config_path and (start_date is None or end_date is None or instruments is None or top_n_stocks is None):
@@ -1295,6 +1385,9 @@ def run_alphaforge_baseline(
                 top_n_stocks = 50
     
     # Load data
+    price_data = None  # Raw price_data from DataLoader (if available)
+    loader = None
+
     if prices is None and dataloader is None and config_path:
         # Load from config
         print("Loading data from config...")
@@ -1324,9 +1417,38 @@ def run_alphaforge_baseline(
     elif dataloader is not None:
         print("Loading data from DataLoader...")
         prices = dataloader.get_prices(start_date, end_date)
+        # Try to get loader for config access
+        if hasattr(dataloader, 'data_config'):
+            loader = dataloader
     
     if prices is None:
         raise ValueError("Must provide either dataloader, prices, or a valid config_path")
+    
+    # ── Determine train/test split ──
+    print("\nDetermining train/test split...")
+    _cfg = loader.data_config if (loader is not None and hasattr(loader, 'data_config')) else {}
+    train_end = train_end_date or _cfg.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or _cfg.get('test_start_date', '2024-01-01')
+    test_start_ts = pd.Timestamp(test_start)
+    print(f"  Train end: {train_end}, Test start: {test_start}")
+
+    # ── Get close prices (date × stock wide format) ──
+    if price_data is not None:
+        close_all = price_data['close']
+    else:
+        # Convert long-format prices to MultiIndex to extract close
+        prices_multindex = convert_to_multindex(prices)
+        close_all = prices_multindex['close']
+
+    # Split close into train and test
+    close_test = close_all[close_all.index >= test_start_ts]
+    print(f"  Train close: {(close_all.index < test_start_ts).sum()} days, "
+          f"Test close: {len(close_test)} days")
+
+    # ── Split prices (long format) into train ──
+    prices['date'] = pd.to_datetime(prices['date'])
+    prices_train = prices[prices['date'] < test_start_ts].copy()
+    print(f"  Train prices: {len(prices_train)} records, All prices: {len(prices)} records")
     
     # Create config
     config = AlphaForgeConfig(
@@ -1335,19 +1457,32 @@ def run_alphaforge_baseline(
         zoo_size=zoo_size,
         seeds=seeds or [0],
         top_n_stocks=top_n_stocks,
+        forward_period=forward_period,
     )
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Stage 1: Mine factors
-    stage1_results = stage1_mine_factors(prices, config, output_dir, use_gan=use_gan)
+    # Stage 1: Mine factors (TRAIN data only — no test data leakage)
+    print("\n" + "="*60)
+    print("[Stage 1] Mining factors on TRAIN data only")
+    print("="*60)
+    stage1_results = stage1_mine_factors(prices_train, config, output_dir, use_gan=use_gan)
     
-    # Stage 2: Combine factors
+    # Stage 2: Combine factors (ALL data for walk-forward predictions)
+    # Factors are fixed from Stage 1; Stage 2 does rolling IC + linear regression
+    # using only past data at each step, so no leakage.
+    print("\n" + "="*60)
+    print("[Stage 2] Walk-forward combination on ALL data")
+    print("="*60)
     stage2_results = stage2_combine_factors(prices, stage1_results, config, output_dir)
     
-    # Stage 3: Evaluate results
-    stage3_results = stage3_evaluate_results(prices, stage2_results, config)
+    # Stage 3: Evaluate results (TEST data only)
+    # Receives close_test (date×stock DataFrame) and filters predictions to test dates
+    print("\n" + "="*60)
+    print("[Stage 3] Backtest on TEST data only")
+    print("="*60)
+    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts)
     
     return {
         'metrics': stage3_results['metrics'],
@@ -1356,6 +1491,9 @@ def run_alphaforge_baseline(
         'stage2_results': stage2_results,
         'used_gan': stage1_results.get('used_gan', False),
         'gan_pool_size': stage1_results.get('gan_stats', {}).get('pool_size', 0),
+        'forward_period': forward_period,
+        'train_end': train_end,
+        'test_start': test_start,
     }
 
 
@@ -1374,6 +1512,18 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--use-gan", action="store_true", default=True, help="Use GAN-based factor mining")
     parser.add_argument("--no-gan", action="store_false", dest="use_gan", help="Use template-based factor generation")
+    parser.add_argument("--forward-period", type=int, default=10,
+                        help="Forward return period in days for IC evaluation "
+                             "(default 10, matching other baselines)")
+    parser.add_argument("--train-end", type=str, default=None,
+                        help="Last date of training period (YYYY-MM-DD). "
+                             "Default: read from config or '2023-12-31'")
+    parser.add_argument("--test-start", type=str, default=None,
+                        help="First date of test period (YYYY-MM-DD). "
+                             "Default: read from config or '2024-01-01'")
+    parser.add_argument("--context-days", type=int, default=30,
+                        help="Context window in calendar days before test_start "
+                             "(default 30)")
 
     args = parser.parse_args()
 
@@ -1388,6 +1538,10 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         verbose=args.verbose,
         use_gan=args.use_gan,
+        forward_period=args.forward_period,
+        train_end_date=args.train_end,
+        test_start_date=args.test_start,
+        context_days=args.context_days,
     )
     
     print("\n" + "="*60)
@@ -1397,3 +1551,6 @@ if __name__ == "__main__":
     print(f"Sharpe Ratio: {results['metrics']['sharpe_ratio']:.4f}")
     print(f"Max Drawdown: {results['metrics']['max_drawdown']:.2%}")
     print(f"Information Ratio: {results['metrics']['information_ratio']:.4f}")
+    print(f"Forward Period:    {results['forward_period']}d")
+    print(f"Train End:         {results['train_end']}")
+    print(f"Test Start:        {results['test_start']}")
