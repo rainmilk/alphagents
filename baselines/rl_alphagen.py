@@ -364,8 +364,21 @@ class RLAlphaEnv:
             return 0.0
     
     def action_masks(self) -> np.ndarray:
-        """Return boolean mask of valid actions (for MaskablePPO)."""
-        return get_action_mask(self._builder)
+        """Return boolean mask of valid actions (for MaskablePPO).
+
+        Enforces min_tokens: SEP is hidden until the builder has used
+        at least min_tokens tokens, encouraging the policy to generate
+        complex expressions rather than trivial single-token ones.
+        """
+        mask = get_action_mask(self._builder)
+        # Hide SEP until min_tokens reached (prevents trivial expressions)
+        if self._builder.tokens_used < self.min_tokens:
+            mask[OFFSET_SEP] = False
+            # Safety: if hiding SEP leaves no valid actions, restore it
+            # (can happen at MAX_EXPR_LENGTH with an unfinished expression)
+            if not mask.any():
+                mask[OFFSET_SEP] = True
+        return mask
     
     def get_valid_actions(self) -> np.ndarray:
         """Return array of valid action IDs."""

@@ -1098,34 +1098,67 @@ def stage2_combine_factors(
         good_factors = good_factors[:config.n_factors]
         selected_factors_history.append(good_factors)
         
-        # Prepare data for linear regression
-        X = np.column_stack([
-            all_factor_values[expr].loc[date].fillna(0)
-            for expr in good_factors
-        ])
-        y = forward_returns.loc[date].fillna(0).values
-        
-        # Fit linear regression using numpy lstsq
-        n_stocks = X.shape[0]
-        valid_idx = np.isfinite(y)
-        if valid_idx.sum() < 10:
+        # ── Walk-forward linear regression (matches original combine_AFF.py) ──
+        #
+        # Original AlphaForge logic:
+        #   x        = fct_tensor[begin : cur-shift, :, good_idx]   # past panel
+        #   y        = tgt_tensor[begin : cur-shift]                 # past returns
+        #   to_pred  = fct_tensor[cur, :, good_idx]                 # today's factors
+        #   coef     = lstsq(x, y)
+        #   pred     = to_pred @ coef
+        #
+        # Key: forward_returns[t] is the return from t to t+N, which is only
+        # *known* at time t+N. So at time i we can only use training samples
+        # from [start_idx, i - forward_period] — anything later has unrealized
+        # forward returns (look-ahead bias).
+
+        shift = config.forward_period
+        train_end = i - shift  # last date whose forward return is realized by time i
+
+        if train_end <= start_idx:
+            # Not enough history for out-of-sample regression yet
+            n_stocks = len(forward_returns.columns)
             predictions.append(np.zeros(n_stocks))
             prediction_dates.append(date)
             weights_history.append(np.zeros(config.n_factors))
             continue
-        
-        X_valid = X[valid_idx]
-        y_valid = y[valid_idx]
-        
-        # Add bias term
-        X_bias = np.column_stack([X_valid, np.ones(len(X_valid))])
-        
-        # Solve using least squares
-        coef = np.linalg.lstsq(X_bias, y_valid, rcond=None)[0]
-        
-        # Predict
-        X_pred_bias = np.column_stack([X, np.ones(len(X))])
-        pred = X_pred_bias @ coef
+
+        # Build panel training data: (n_past_days * n_stocks, n_factors)
+        train_cols = []
+        for expr in good_factors:
+            vals = all_factor_values[expr].iloc[start_idx:train_end].values
+            train_cols.append(vals.flatten())
+        train_X = np.column_stack(train_cols)
+
+        # Corresponding forward returns, flattened to 1-D
+        train_y = forward_returns.iloc[start_idx:train_end].values.flatten()
+
+        # Filter rows: keep only where y is finite AND x has no NaN/inf
+        # (matches original torch.isfinite(y) filter + guards factor NaN)
+        valid_mask = np.isfinite(train_y) & np.all(np.isfinite(train_X), axis=1)
+        train_X = train_X[valid_mask]
+        train_y = train_y[valid_mask]
+
+        if len(train_y) < 10:
+            n_stocks = len(forward_returns.columns)
+            predictions.append(np.zeros(n_stocks))
+            prediction_dates.append(date)
+            weights_history.append(np.zeros(config.n_factors))
+            continue
+
+        # Add bias term and fit
+        X_train_bias = np.column_stack([train_X, np.ones(len(train_X))])
+        coef = np.linalg.lstsq(X_train_bias, train_y, rcond=None)[0]
+
+        # Predict on TODAY's factor values (out-of-sample)
+        # nan_to_num matches original combine_AFF.py's torch.nan_to_num
+        X_today = np.column_stack([
+            np.nan_to_num(all_factor_values[expr].loc[date].values)
+            for expr in good_factors
+        ])
+        X_today_bias = np.column_stack([X_today, np.ones(len(X_today))])
+        pred = X_today_bias @ coef
+
         predictions.append(pred)
         prediction_dates.append(date)
         # Pad weights to fixed length (config.n_factors) so np.array() produces

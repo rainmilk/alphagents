@@ -160,6 +160,9 @@ class UnaryOperator(ExprNode):
 
     def n_args(self): return 1
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.child!r})"
+
 
 class BinaryOperator(ExprNode):
     """Operator taking 2 operands."""
@@ -170,6 +173,9 @@ class BinaryOperator(ExprNode):
         self.is_featured = left.is_featured or right.is_featured
 
     def n_args(self): return 2
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.left!r}, {self.right!r})"
 
 
 class RollingOperator(ExprNode):
@@ -186,6 +192,9 @@ class RollingOperator(ExprNode):
 
     def n_args(self): return 2
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.child!r}, {self.dt!r})"
+
 
 class PairRollingOperator(ExprNode):
     """Operator taking (left, right, DeltaTime) — e.g. ts_corr($close, $volume, 20).
@@ -201,6 +210,9 @@ class PairRollingOperator(ExprNode):
         self.is_featured = left.is_featured or right.is_featured
 
     def n_args(self): return 3
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.left!r}, {self.right!r}, {self.dt!r})"
 
 
 # Concrete operators
@@ -566,8 +578,15 @@ class ExpressionBuilder:
         self._last_token_type = None
 
     def add_feature(self, name: str) -> bool:
-        """Add a feature token. Returns True if valid."""
+        """Add a feature token. Returns True if valid.
+
+        Grammar (matching original AlphaGen validate_feature):
+        Feature cannot follow a DeltaTime on the stack.
+        DeltaTime should only be consumed as the last arg of a rolling op.
+        """
         if self.tokens_used >= MAX_EXPR_LENGTH:
+            return False
+        if self.stack and isinstance(self.stack[-1], DeltaTime):
             return False
         self.stack.append(Feature(name))
         self.tokens_used += 1
@@ -575,8 +594,19 @@ class ExpressionBuilder:
         return True
 
     def add_constant(self, value: float) -> bool:
-        """Add a constant token. Returns True if valid."""
+        """Add a constant token. Returns True if valid.
+
+        Grammar (matching original AlphaGen validate_const):
+        Constant is only valid when:
+        - Stack is empty (first token), OR
+        - Top of stack is featured (preparing second operand for binary op)
+
+        This prevents Constant chains (Constant after Constant) which
+        create dead-end states where the stack can never be reduced.
+        """
         if self.tokens_used >= MAX_EXPR_LENGTH:
+            return False
+        if self.stack and not self.stack[-1].is_featured:
             return False
         self.stack.append(Constant(value))
         self.tokens_used += 1
@@ -584,7 +614,18 @@ class ExpressionBuilder:
         return True
 
     def add_operator(self, op_name: str) -> bool:
-        """Add an operator token. Pops operands from stack. Returns True if valid."""
+        """Add an operator token. Pops operands from stack. Returns True if valid.
+
+        Grammar rules (matching original AlphaGen validate_op):
+        - Unary:   single child must be featured (not Constant, not DeltaTime)
+        - Binary:  at least ONE child must be featured; neither can be DeltaTime
+                   (allows Constant as one operand, e.g. Add($close, 1))
+        - Rolling: [featured_expr, DeltaTime] — top=DeltaTime, below=featured
+        - PairRoll: [featured_left, featured_right, DeltaTime] — both must be featured
+
+        IMPORTANT: Validation happens BEFORE popping, matching original AlphaGen.
+        If validation fails, the stack is left unmodified.
+        """
         if self.tokens_used >= MAX_EXPR_LENGTH:
             return False
 
@@ -593,19 +634,40 @@ class ExpressionBuilder:
         if len(self.stack) < n_args:
             return False
 
-        # Pop operands in reverse order (right to left for binary)
+        # ── Validate BEFORE popping (matching original AlphaGen validate_op) ──
+        # This prevents stack corruption when validation fails.
+        if op_type == 'unary':
+            # n_args == 1; top must be featured and not DeltaTime
+            child = self.stack[-1]
+            if not child.is_featured or isinstance(child, DeltaTime):
+                return False
+        elif op_type == 'binary':
+            # n_args == 2; at least one must be featured, neither can be DeltaTime
+            a, b = self.stack[-2], self.stack[-1]
+            if isinstance(a, DeltaTime) or isinstance(b, DeltaTime):
+                return False
+            if not (a.is_featured or b.is_featured):
+                return False
+        elif op_type == 'rolling':
+            # n_args == 2; [featured_expr, DeltaTime]
+            # top must be DeltaTime, below must be featured
+            if not isinstance(self.stack[-1], DeltaTime):
+                return False
+            if not self.stack[-2].is_featured:
+                return False
+        elif op_type == 'pair_rolling':
+            # n_args == 3; [featured_left, featured_right, DeltaTime]
+            # top must be DeltaTime, both below must be featured
+            if not isinstance(self.stack[-1], DeltaTime):
+                return False
+            if not self.stack[-2].is_featured or not self.stack[-3].is_featured:
+                return False
+        else:
+            return False
+
+        # ── Validation passed — now safe to pop and construct ──
         children = [self.stack.pop() for _ in range(n_args)]
         children = list(reversed(children))  # left-to-right order
-
-        # Grammar: check each child
-        for i, child in enumerate(children):
-            if isinstance(child, DeltaTime):
-                # DeltaTime is only valid as the last child of a rolling/pair_rolling operator
-                is_last = (i == n_args - 1)
-                if op_type not in ('rolling', 'pair_rolling') or not is_last:
-                    return False
-            if not child.is_featured and not isinstance(child, DeltaTime):
-                return False
 
         # Construct the node
         if n_args == 1:
@@ -623,11 +685,16 @@ class ExpressionBuilder:
         return True
 
     def add_delta_time(self, d: int) -> bool:
-        """Add a DeltaTime token. Can only follow a featured expression."""
+        """Add a DeltaTime token. Top of stack must be featured.
+
+        Grammar (matching original AlphaGen validate_dt):
+        DeltaTime can only follow a featured expression on top of the stack.
+        After adding DeltaTime, the top becomes non-featured, preventing
+        consecutive DeltaTime additions naturally.
+        """
         if self.tokens_used >= MAX_EXPR_LENGTH:
             return False
-        # Must have at least one featured expression on stack
-        if not self.stack or not any(n.is_featured for n in self.stack):
+        if not self.stack or not self.stack[-1].is_featured:
             return False
         self.stack.append(DeltaTime(d))
         self.tokens_used += 1
@@ -648,6 +715,13 @@ class ExpressionBuilder:
         """
         Return which token types are grammatically valid for the next step.
         Mirrors the action masking logic in alphagen/rl/env/wrapper.py.
+
+        Grammar rules (matching original AlphaGen):
+        - Feature:  valid unless top is DeltaTime
+        - Constant: valid when stack empty OR top is featured (prevents Constant chains)
+        - Operator: unary needs 1 featured on top; binary needs ≥1 featured in top-2
+        - DeltaTime: valid after a featured expression (no DeltaTime already on stack)
+        - SEP:       valid when exactly 1 featured node on stack
         """
         n = len(self.stack)
         result = {
@@ -668,34 +742,44 @@ class ExpressionBuilder:
             result['CONSTANT'] = True
             return result
 
-        has_featured = any(n.is_featured for n in self.stack)
-        has_deltatime = any(isinstance(n, DeltaTime) for n in self.stack)
+        top = self.stack[-1]
 
-        # Feature: can always add during building
-        result['FEATURE'] = True
+        # Feature: cannot follow DeltaTime
+        if not isinstance(top, DeltaTime):
+            result['FEATURE'] = True
 
-        # Constant: can add if stack not exclusively DeltaTimes
-        if not (n == 1 and isinstance(self.stack[-1], DeltaTime)):
+        # Constant: valid when stack empty or top is featured
+        # (prevents Constant-after-Constant dead-end chains)
+        if top.is_featured:
             result['CONSTANT'] = True
 
-        # Unary operators: need 1 featured child below top
-        if n >= 1:
-            top = self.stack[-1]
-            if top.is_featured and not isinstance(top, DeltaTime):
-                result['OPERATOR'] = True  # unary ops valid
+        # Unary operators: need 1 featured child on top (not DeltaTime)
+        if top.is_featured and not isinstance(top, DeltaTime):
+            result['OPERATOR'] = True
 
-        # Binary operators: need 2 featured children below
+        # Binary operators: need ≥1 featured in top-2, neither can be DeltaTime
         if n >= 2:
-            if (self.stack[-1].is_featured and self.stack[-2].is_featured and
-                    not isinstance(self.stack[-1], DeltaTime) and
-                    not isinstance(self.stack[-2], DeltaTime)):
+            a, b = self.stack[-2], self.stack[-1]
+            if not isinstance(a, DeltaTime) and not isinstance(b, DeltaTime):
+                if a.is_featured or b.is_featured:
+                    result['OPERATOR'] = True
+
+        # Rolling operators: need [featured_expr, DeltaTime] on stack
+        if n >= 2:
+            child, dt = self.stack[-2], self.stack[-1]
+            if child.is_featured and isinstance(dt, DeltaTime):
                 result['OPERATOR'] = True
 
-        # DeltaTime: can add after a featured expression
-        # (but not after another DeltaTime or when stack is empty)
-        if has_featured and not has_deltatime and self.stack[-1].is_featured:
-            if not isinstance(self.stack[-1], DeltaTime):
-                result['DELTA_TIME'] = True
+        # Pair rolling operators: need [featured_left, featured_right, DeltaTime]
+        if n >= 3:
+            a, b, dt = self.stack[-3], self.stack[-2], self.stack[-1]
+            if a.is_featured and b.is_featured and isinstance(dt, DeltaTime):
+                result['OPERATOR'] = True
+
+        # DeltaTime: can add when top is featured (matching original validate_dt)
+        # After adding, top becomes DeltaTime (not featured), preventing chains
+        if top.is_featured:
+            result['DELTA_TIME'] = True
 
         return result
 
@@ -706,20 +790,20 @@ class ExpressionBuilder:
         n = len(self.stack)
         valid = []
 
-        # Check unary
+        # Check unary: top must be featured and not DeltaTime
         if n >= 1:
             top = self.stack[-1]
             if top.is_featured and not isinstance(top, DeltaTime):
                 valid.extend(name for name, (_, n_args, op_type) in OPERATOR_CLASSES.items()
-                             if n_args == 1)
+                             if op_type == 'unary')
 
-        # Check binary
+        # Check binary: ≥1 featured in top-2, neither can be DeltaTime
         if n >= 2:
             a, b = self.stack[-2], self.stack[-1]
-            if (a.is_featured and b.is_featured and
-                    not isinstance(a, DeltaTime) and not isinstance(b, DeltaTime)):
-                valid.extend(name for name, (_, n_args, op_type) in OPERATOR_CLASSES.items()
-                             if n_args == 2)
+            if not isinstance(a, DeltaTime) and not isinstance(b, DeltaTime):
+                if a.is_featured or b.is_featured:
+                    valid.extend(name for name, (_, n_args, op_type) in OPERATOR_CLASSES.items()
+                                 if op_type == 'binary')
 
         # Check rolling operators: need [featured_expr, DeltaTime] on stack
         # (top = DeltaTime, below = featured child)
@@ -809,7 +893,7 @@ def evaluate_factor(
 
     Args:
         factor_values: (n_dates, n_stocks) factor values
-        forward_returns: (n_dates, n_stocks) 1-day forward returns
+        forward_returns: (n_dates, n_stocks) forward returns (N-day, typically 10)
         debug: If True, print evaluation details
 
     Returns:
@@ -1268,6 +1352,7 @@ def run_alphagen_baseline(
     gamma: float = 1.0,
     ent_coef: float = 0.01,
     device: str = 'cpu',
+    forward_period: int = 10,
 ) -> Dict:
     """
     Run AlphaGen baseline — RL-based token factor generation.
@@ -1310,6 +1395,8 @@ def run_alphagen_baseline(
         gamma: Discount factor (1.0 = no discount, same as original AlphaGen)
         ent_coef: Entropy coefficient for exploration
         device: 'cpu' or 'cuda' for RL training
+        forward_period: Forward return period in days for IC evaluation
+            (default 10, matching other baselines for fair comparison)
 
     Returns:
         Dict with performance metrics and factor info
@@ -1356,8 +1443,8 @@ def run_alphagen_baseline(
     }
 
     # Compute forward returns
-    forward_returns_all = _compute_forward_returns(close, periods=[1])
-    fwd_ret = forward_returns_all[1].values.astype(np.float64)
+    forward_returns_all = _compute_forward_returns(close, periods=[forward_period])
+    fwd_ret = forward_returns_all[forward_period].values.astype(np.float64)
 
     # Split into train/test
     train_mask = close.index < test_start_ts
@@ -1534,6 +1621,7 @@ def run_alphagen_baseline(
     print(f"  Best ensemble IC:   {pool.best_ic_ret:.4f}")
     print(f"  Test Rank IC:       {test_ic_mean:.4f}")
     print(f"  Test ICIR:          {test_icir:.4f}")
+    print(f"  Forward Period:     {forward_period}d")
     print(f"  Annual Return:      {backtest_metrics.get('annual_return', 0):.4f}")
     print(f"  Sharpe Ratio:       {backtest_metrics.get('sharpe_ratio', 0):.4f}")
     print(f"  Max Drawdown:       {backtest_metrics.get('max_drawdown', 0):.4f}")
@@ -1555,6 +1643,7 @@ def run_alphagen_baseline(
         'test_icir': test_icir,
         'train_end': train_end,
         'test_start': test_start,
+        'forward_period': forward_period,
         'pool_weights': pool.weights.tolist() if pool.size > 0 else [],
         'pool_exprs': [repr(e) for e in pool.exprs],
     }
@@ -1644,6 +1733,9 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cpu',
                         choices=['cpu', 'cuda', 'auto'],
                         help='Device for RL training')
+    parser.add_argument('--forward-period', type=int, default=10,
+                        help='Forward return period in days for IC evaluation '
+                             '(default 10, matching other baselines)')
 
     args = parser.parse_args()
 
@@ -1670,6 +1762,7 @@ if __name__ == '__main__':
         gamma=args.gamma,
         ent_coef=args.ent_coef,
         device=args.device,
+        forward_period=args.forward_period,
     )
 
     print("\nFinal results:")
