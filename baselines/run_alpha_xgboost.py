@@ -224,7 +224,10 @@ def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFram
     forward_ret = close.shift(-forward_period) / close - 1
     # Cross-sectional rank, normalized to [0, 1]
     target_rank = forward_ret.rank(axis=1, pct=True)
-    panel = target_rank.stack().to_frame('target_rank')
+    # dropna=False: keep the full (date, stock) grid. The last forward_period
+    # rows are NaN (no future data); dropping them with the default dropna=True
+    # shifts the index and breaks alignment with features on merge.
+    panel = target_rank.stack(dropna=False).to_frame('target_rank')
     panel.index.names = ['date', 'stock']
     return panel
 

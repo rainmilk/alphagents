@@ -64,7 +64,11 @@ def _build_features(close: pd.DataFrame) -> pd.DataFrame:
         DataFrame, MultiIndex (date, stock), single column 'daily_return'
     """
     daily_ret = close.pct_change()
-    panel = daily_ret.stack().to_frame('daily_return')
+    # dropna=False: keep the full (date, stock) grid so features and targets
+    # share an identical MultiIndex. With the default dropna=True the first
+    # row (pct_change NaN) is dropped, shifting the index and breaking
+    # alignment/merging with targets downstream.
+    panel = daily_ret.stack(dropna=False).to_frame('daily_return')
     panel.index.names = ['date', 'stock']
     return panel
 
@@ -92,7 +96,10 @@ def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFram
     upper = row_mean + 3 * row_std
     forward_ret = forward_ret.clip(lower=lower, upper=upper, axis=0)
 
-    panel = forward_ret.stack().to_frame('forward_return')
+    # dropna=False: keep the full (date, stock) grid. The last forward_period
+    # rows are NaN (no future data for the shift); dropping them with the
+    # default dropna=True shifts the index and breaks alignment with features.
+    panel = forward_ret.stack(dropna=False).to_frame('forward_return')
     panel.index.names = ['date', 'stock']
     return panel
 
