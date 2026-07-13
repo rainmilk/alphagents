@@ -371,7 +371,7 @@ def convert_to_multindex(
 
 def compute_future_returns(
     price_data_midx: Dict[str, pd.Series],
-    forward_period: int = 1,
+    forward_period: int = 10,
 ) -> pd.Series:
     """
     Compute future N-day forward returns.
@@ -381,7 +381,7 @@ def compute_future_returns(
 
     Args:
         price_data_midx: MultiIndex price data dict
-        forward_period: Number of trading days to look ahead (default: 1)
+        forward_period: Number of trading days to look ahead (default: 10)
 
     Returns:
         Series of forward returns, aligned to current date.

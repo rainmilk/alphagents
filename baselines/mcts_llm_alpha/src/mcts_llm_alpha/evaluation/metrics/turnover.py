@@ -48,9 +48,19 @@ def calc_turnover(factor_df: pd.DataFrame) -> float:
     
     if not turnover_list:
         return 0.5  # 默认中等分数
-    
+
+    # 若所有日度换手率均为 NaN（例如因子值在测试期系统性缺失），
+    # 直接退回默认中等分数，避免 np.nanmean 触发 "Mean of empty slice" 警告
+    # 且返回 NaN 导致评分传播。
+    if all(np.isnan(x) for x in turnover_list):
+        return 0.5
+
     # 平均换手率（0-1之间）
-    avg_turnover = np.mean(turnover_list)
+    # 注意：turnover_list 中可能混入 NaN —— 当某相邻日期对的所有 common
+    # stocks 排名均为 NaN 时，daily_turnover 为 NaN。np.mean 不会跳过 NaN，
+    # 会直接把整条均值污染为 NaN，进而使最终评分变为 NaN、上游 LLM 公式生成
+    # 始终失败退回默认公式。因此必须用 np.nanmean 忽略 NaN 项。
+    avg_turnover = np.nanmean(turnover_list)
     
     # 转换为稳定性分数（换手率越低，分数越高）
     # 返回值范围在0-1之间，表示因子排名的稳定性

@@ -571,7 +571,7 @@ class FactorBacktester:
                  → close_df is treated as price_data['close'].
 
         Full:    FactorBacktester(price_df, volume_df, fundamentals_dict,
-                                  forward_period=20)
+                                  forward_period=10)
                  → price_df = close prices (dates × stocks)
                  → volume_df = volume (dates × stocks)
                  → fundamentals_dict = {'pe': df, 'pb': df, ...}
@@ -581,7 +581,7 @@ class FactorBacktester:
     with keys: open, high, low, close, volume, amount.
     """
 
-    _DEFAULT_FORWARD_PERIOD = 20
+    _DEFAULT_FORWARD_PERIOD = 10
 
     def __init__(
         self,
@@ -2078,7 +2078,7 @@ if __name__ == '__main__':
         index=dates, columns=codes,
     )
 
-    backtester = FactorBacktester(prices=close_prices, volume=volume_data, forward_period=20)
+    backtester = FactorBacktester(prices=close_prices, volume=volume_data, forward_period=10)
 
     test_expressions = [
         "rank(ts_corr(close, volume, 20))",

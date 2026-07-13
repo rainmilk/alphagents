@@ -1368,6 +1368,8 @@ def run_alphaagent_baseline(
     # ── 2. Save HDF5 data for AlphaAgent compatibility ─────────────
     print(f"\n[2/6] Generating HDF5 data files...")
     data_dir = os.path.join(output_dir, "data")
+    # NOTE: $return = DAILY returns, used as a FACTOR FEATURE only.
+    # The IC target (forward_return_series) is passed separately to compute_rank_ic below.
     save_data_as_hdf5(price_midx, return_series, data_dir)
 
     # ── 3. Generate factor formulas ─────────────────────────────────
@@ -1398,6 +1400,8 @@ def run_alphaagent_baseline(
 
     # ── 4. Compute factor values ───────────────────────────────────
     print(f"\n[4/6] Computing factor values...")
+    # NOTE: pass DAILY returns as the $return FEATURE for factor formulas.
+    # Do NOT pass forward_return_series here — that would leak future returns into the signal.
     factor_df = compute_factor_values(formulas, price_midx, return_series)
     print(f"  Shape: {factor_df.shape}")
 

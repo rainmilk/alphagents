@@ -457,6 +457,7 @@ def run_alphafama_baseline(
     output_dir: Optional[str] = None,
     use_llm: bool = True,
     llm_iters: int = 10,
+    forward_period: Optional[int] = None,
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -478,6 +479,9 @@ def run_alphafama_baseline(
         output_dir: Directory for saving results.
         use_llm: Whether to run LLM alpha-mining (default True).
         llm_iters: Number of LLM mining iterations (default 10).
+        forward_period: Forward return horizon (trading days) for IC evaluation.
+            Defaults to config['evolution']['forward_period'] (10). Must match the
+            other baselines so AlphaFAMA's Rank-IC is comparable.
 
     Returns:
         Dict of performance metrics with keys:
@@ -503,9 +507,24 @@ def run_alphafama_baseline(
     print(f"  Loaded: {len(price_data['close'].index)} trading days x "
           f"{len(price_data['close'].columns)} stocks")
 
+    # ── Resolve forward_period (align with other baselines) ───────────
+    if forward_period is None:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                _cfg = yaml.safe_load(f)
+            forward_period = int(
+                _cfg.get('evolution', {}).get('forward_period', 10)
+            )
+        except Exception:
+            forward_period = 10
+    print(f"  Forward period (IC horizon): {forward_period}d")
+
     # ── Step 2: Convert to AlphaFAMA format ────────────────────────────
     print("\n[Step 2] Converting data to AlphaFAMA format...")
-    af_df = convert_price_data_to_alphafama(price_data)
+    af_df = convert_price_data_to_alphafama(
+        price_data,
+        forward_period=forward_period,
+    )
     print(f"  Converted: {len(af_df)} rows, MultiIndex (date, ticker)")
 
     # ── Step 3: Train/Test split ───────────────────────────────────────
@@ -749,8 +768,14 @@ def _compute_factors(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         ex_list.append(
             pd.DataFrame(alphas, index=grp.index).assign(ticker=ticker)
         )
+        # IC TARGET must be the forward-period return so AlphaFAMA's Rank-IC is
+        # comparable to the other baselines. We keep the daily `returns` column
+        # intact for the Alpha101 feature inputs and use `forward_return` here.
+        # Rename to 'returns' so compute_ic_matrix (which reads ['returns']) works.
         ret_list.append(
-            grp[["returns"]].assign(ticker=ticker)
+            grp[["forward_return"]]
+            .rename(columns={"forward_return": "returns"})
+            .assign(ticker=ticker)
         )
 
     exposures = pd.concat(ex_list)
@@ -917,6 +942,9 @@ if __name__ == '__main__':
                         help='Disable LLM alpha-mining')
     parser.add_argument('--llm-iters', type=int, default=10,
                         help='Number of LLM mining iterations (default: 10)')
+    parser.add_argument('--forward-period', type=int, default=None,
+                        help='Forward return horizon (trading days) for IC evaluation. '
+                             'Defaults to config evolution.forward_period (10).')
 
     args = parser.parse_args()
 
@@ -931,6 +959,7 @@ if __name__ == '__main__':
         output_dir=args.output_dir,
         use_llm=args.use_llm,
         llm_iters=args.llm_iters,
+        forward_period=args.forward_period,
     )
 
     print("\n" + "=" * 60)

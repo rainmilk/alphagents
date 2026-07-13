@@ -91,7 +91,7 @@ llm:
     
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
-  forward_period: 20   # [ACTIVE] forward return horizon in trading days
+  forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   n_seeds: 10          # [ACTIVE] number of candidate factors per round
   n_best_factors: 10   # [ACTIVE] top-N factors to retain per round
   max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)

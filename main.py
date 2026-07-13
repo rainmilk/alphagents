@@ -392,15 +392,15 @@ class AAAI2027Pipeline:
         
         Args:
             n_rounds: Number of evolution rounds
-            forward_period: Forward return horizon in trading days (None → config or 20)
+            forward_period: Forward return horizon in trading days (None → config or 10)
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 4] Skipped: methods modules not available")
             return
         
-        # Resolve forward_period: explicit arg > config.yaml > default 20
+        # Resolve forward_period: explicit arg > config.yaml > default 10
         if forward_period is None:
-            forward_period = self.config.get('evolution', {}).get('forward_period', 20)
+            forward_period = self.config.get('evolution', {}).get('forward_period', 10)
         
         print(f"\n[Step 4] Evolving factors ({n_rounds} rounds, forward={forward_period}d)...")
         
@@ -769,7 +769,7 @@ class AAAI2027Pipeline:
             ic_sign = float(np.sign(ic_val)) if abs(ic_val) > 1e-10 else 1.0
             # Effective sample size for IC/ICIR:
             # factor values have T dates, but last forward_period dates lack forward returns
-            _fwd = getattr(self, '_forward_period', 20)
+            _fwd = getattr(self, '_forward_period', 10)
             n_periods = max(2, len(values_df) - _fwd)
             factor_infos.append(FactorInfo(
                 name=name, expression=name,
@@ -1138,7 +1138,7 @@ class AAAI2027Pipeline:
             output_dir: Output directory for step9. None = experiments/{YYYYMMDD}/results/
             split_train_end: Explicit train end date for train/test split
             split_test_start: Explicit test start date for train/test split
-            forward_period: Forward return horizon in trading days (None → config or 20)
+            forward_period: Forward return horizon in trading days (None → config or 10)
             holding_period: Backtest holding period in trading days.
                            1 = daily rebalance, 5 = weekly, 20 = monthly.
                            None → use config or default 1.
@@ -1466,11 +1466,11 @@ class AAAI2027Pipeline:
             vol_safe = data_map['volume'].replace(0, np.nan)
             data_map['vwap'] = data_map['amount'] / vol_safe
         # Forward returns — period must match step4 to keep IC computation consistent.
-        # Resolution order: explicit arg → self._forward_period (set in step4) → config → 20
+        # Resolution order: explicit arg → self._forward_period (set in step4) → config → 10
         if forward_period is None:
             forward_period = getattr(self, '_forward_period', None)
         if forward_period is None:
-            forward_period = self.config.get('evolution', {}).get('forward_period', 20)
+            forward_period = self.config.get('evolution', {}).get('forward_period', 10)
         data_map['forward_returns'] = close.pct_change(forward_period).shift(-forward_period)
 
 

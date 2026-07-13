@@ -372,11 +372,22 @@ def _neutralize_factor(
         regressors = []
 
         # Industry dummies
-        if industry_data is not None and date in industry_data.index:
-            ind = industry_data.loc[date].reindex(row.index)
-            dummies = pd.get_dummies(ind, drop_first=True)
-            if dummies.shape[1] > 0:
-                regressors.append(dummies.values.astype(float))
+        if industry_data is not None:
+            if isinstance(industry_data, pd.DataFrame) and date in industry_data.index:
+                # (date x stock) panel: pick this date's column of industry codes
+                ind = industry_data.loc[date].reindex(row.index)
+            elif isinstance(industry_data, pd.Series):
+                # Static per-stock classification (index = stock codes): the
+                # DataLoader returns this shape. Broadcast the same mapping
+                # across all dates since industry membership is time-invariant
+                # in this simplified setup.
+                ind = industry_data.reindex(row.index)
+            else:
+                ind = None
+            if ind is not None:
+                dummies = pd.get_dummies(ind, drop_first=True)
+                if dummies.shape[1] > 0:
+                    regressors.append(dummies.values.astype(float))
 
         # Size factor (log market cap)
         if size_data is not None and date in size_data.index:
@@ -1275,7 +1286,18 @@ def run_alphagrail_baseline(
 
         ind_data = None
         if industry_data is not None:
-            ind_data = industry_data if isinstance(industry_data, pd.DataFrame) else industry_data.get('industry')
+            # DataLoader returns industry_data as a pd.Series indexed by stock
+            # code (see loader.load_data: "industry_series: Series, index =
+            # stock codes"). The old check only accepted pd.DataFrame and then
+            # called .get('industry') on the Series, which returns None
+            # (Series.get looks up a *label*, not a key) -> ind_data stayed
+            # None and industry neutralization was silently skipped.
+            if isinstance(industry_data, (pd.DataFrame, pd.Series)):
+                ind_data = industry_data
+            elif hasattr(industry_data, 'get'):
+                ind_data = industry_data.get('industry')
+            else:
+                ind_data = industry_data
 
         if ind_data is not None or size_data is not None:
             factor_library = _neutralize_factor_library(factor_library, ind_data, size_data)

@@ -51,6 +51,8 @@ def run_mcts_llm_alpha_baseline(
     use_llm: bool = True,
     start_date: str = "2020-01-01",
     end_date: str = "2023-12-31",
+    train_end_date: Optional[str] = None,
+    test_start_date: Optional[str] = None,
     forward_period: int = 10,
 ) -> Dict:
     """
@@ -63,6 +65,12 @@ def run_mcts_llm_alpha_baseline(
         use_llm: Whether to use LLM for formula generation (requires OPENAI_API_KEY)
         start_date: Data start date
         end_date: Data end date
+        train_end_date: Last training (IS) date (YYYY-MM-DD). MCTS search & LLM
+            only see data up to this date. Falls back to data_config.train_end_date
+            then '2023-12-31'.
+        test_start_date: First test (OOS) date (YYYY-MM-DD). Evaluation/backtest
+            only use data from this date onward. Falls back to
+            data_config.test_start_date then '2024-01-01'.
 
     Returns:
         Dict with metrics: annual_return, sharpe_ratio, max_drawdown, etc.
@@ -89,18 +97,30 @@ def run_mcts_llm_alpha_baseline(
     print(f"  Loaded: {n_dates} dates × {n_stocks} stocks")
     print(f"  Forward period: {forward_period}d")
 
-    # Determine split date (70/30)
+    # ── Determine IS/OOS split using explicit dates (matches other baselines) ──
+    # Resolve from explicit args first, then fall back to data_config — same
+    # precedence as run_alpha_xgboost / run_lstm_baseline / run_alphagrail.
+    #   train_end_date : last date the MCTS/LLM search is allowed to see (IS)
+    #   test_start_date: first date used for out-of-sample (OOS) evaluation
+    # This replaces the old fixed 70/30 percentage split so all baselines
+    # share a consistent, comparable train/test boundary driven by calendar dates.
+    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    train_end_ts = pd.Timestamp(train_end)
+    test_start_ts = pd.Timestamp(test_start)
+    # split_date is the OOS boundary used by downstream portfolio/IC filtering.
+    # It is the first OOS date, so OOS filtering uses >= split_date (inclusive).
+    split_date = test_start
+
     all_dates = sorted(price_midx['close'].index.get_level_values('datetime').unique())
-    split_idx = int(len(all_dates) * 0.7)
-    split_date = str(all_dates[split_idx])
     print(f"  Date range: {start_date} → {end_date}")
-    print(f"  IS/OOS split: {split_date}")
+    print(f"  IS/OOS split: train_end={train_end}, test_start={test_start}")
 
     # ── 1b. Create train-only data for MCTS search & LLM ──────────
     # MCTS search and LLM formula generation/refinement must only see
     # training (IS) data. Using full data (including OOS) during search
     # causes data leakage — the search optimizes on future information.
-    train_dates = [d for d in all_dates if str(d) <= split_date]
+    train_dates = [d for d in all_dates if pd.Timestamp(str(d)) <= train_end_ts]
     print(f"  Train period: {train_dates[0]} → {train_dates[-1]} ({len(train_dates)} dates)")
 
     train_price_midx = {}
@@ -145,7 +165,7 @@ def run_mcts_llm_alpha_baseline(
 
         raw_scores, factor_df = evaluate_formula_pandas(
             concrete_formula, train_price_midx, train_return_series, repo_factors,
-            start_date=start_date, end_date=split_date,
+            start_date=start_date, end_date=train_end,
             split_date=None,  # Auto-split within train data for Overfitting metric
             ic_method=mcts_config.evaluation.ic_method,
         )
@@ -285,7 +305,7 @@ def run_mcts_llm_alpha_baseline(
 
     # Split data into IS (train) and OOS (test) — only use test data for final evaluation
     # to avoid data leakage
-    test_dates = [d for d in all_dates if str(d) > split_date]
+    test_dates = [d for d in all_dates if pd.Timestamp(str(d)) >= test_start_ts]
     if len(test_dates) < 10:
         print(f"  WARNING: Only {len(test_dates)} OOS dates, using full data")
         test_price_midx = price_midx
@@ -501,7 +521,7 @@ def compute_portfolio_metrics(
         factor_df = factor_series.unstack(fill_value=np.nan)
 
         # Only use OOS period for backtest
-        oos_dates = factor_df.index[factor_df.index > split_date]
+        oos_dates = factor_df.index[factor_df.index >= split_date]
         if len(oos_dates) < 10:
             oos_dates = factor_df.index
         factor_oos = factor_df.loc[oos_dates]
@@ -554,7 +574,7 @@ def compute_portfolio_metrics(
         mean_ic_val = 0.0
         try:
             oos_df = pd.concat([factor_series.rename("factor"), return_series], axis=1).dropna()
-            oos_df = oos_df[oos_df.index.get_level_values("datetime") > split_date]
+            oos_df = oos_df[oos_df.index.get_level_values("datetime") >= split_date]
             daily_ic = []
             for _, group in oos_df.groupby(level="datetime"):
                 if len(group) >= 5:
@@ -600,6 +620,10 @@ def parse_args():
                         help='Main project config path')
     parser.add_argument('--start-date', type=str, default='2020-01-01')
     parser.add_argument('--end-date', type=str, default='2023-12-31')
+    parser.add_argument('--train-end', type=str, default=None,
+                        help='Last training (IS) date YYYY-MM-DD (default: config train_end_date)')
+    parser.add_argument('--test-start', type=str, default=None,
+                        help='First test (OOS) date YYYY-MM-DD (default: config test_start_date)')
     parser.add_argument('--no-llm', action='store_true', default=False,
                         help='Disable LLM (use simulated formulas)')
     parser.add_argument('--forward-period', type=int, default=10,
@@ -616,6 +640,8 @@ if __name__ == "__main__":
         use_llm=not args.no_llm,
         start_date=args.start_date,
         end_date=args.end_date,
+        train_end_date=args.train_end,
+        test_start_date=args.test_start,
         forward_period=args.forward_period,
     )
     print("\nDone!")
