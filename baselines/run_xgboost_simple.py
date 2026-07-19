@@ -12,7 +12,7 @@ This runner mirrors the simplified LSTM baseline:
 
 Usage:
     python baselines/run_xgboost_simple.py
-    python baselines/run_xgboost_simple.py --start 2020-01-01 --end 2024-12-31 --universe hs300
+    python baselines/run_xgboost_simple.py --train-start 2020-01-01 --test-end 2024-12-31 --universe hs300
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 """
@@ -148,57 +148,55 @@ def _create_model(n_estimators: int = 200,
 
 
 def _train_predict_oneshot(
-    features: pd.DataFrame,
-    targets: pd.DataFrame,
-    test_start_date: str,
+    train_features: pd.DataFrame,
+    train_targets: pd.DataFrame,
+    test_features: pd.DataFrame,
     n_estimators: int = 200,
     max_depth: int = 5,
     learning_rate: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Train a single model on all training data and predict on the test period.
+    Train a single model on the training slice and predict on the test slice.
 
-    One-shot approach, consistent with all other baselines.
+    One-shot approach, consistent with all other baselines. The train/test
+    split is centralized in the DataLoader (bundle.train / bundle.test); this
+    function consumes the pre-sliced panels directly instead of masking a
+    full panel by date.
 
     Args:
-        features: MultiIndex (date, stock) feature panel (single column)
-        targets: MultiIndex (date, stock) target panel with 'forward_return'
-        test_start_date: First test date (YYYY-MM-DD)
+        train_features: MultiIndex (date, stock) feature panel (train slice)
+        train_targets: MultiIndex (date, stock) target panel ('forward_return')
+        test_features: MultiIndex (date, stock) feature panel (test slice)
         n_estimators, max_depth, learning_rate: Model hyperparameters
 
     Returns:
         DataFrame (date x stock) of predicted forward returns.
     """
-    test_start_ts = pd.Timestamp(test_start_date)
-    all_dates = features.index.get_level_values('date').unique().sort_values()
-    test_dates = all_dates[all_dates >= test_start_ts]
-    train_dates = all_dates[all_dates < test_start_ts]
+    train_dates = train_features.index.get_level_values('date').unique().sort_values()
+    test_dates = test_features.index.get_level_values('date').unique().sort_values()
 
     if len(test_dates) == 0:
-        raise ValueError(f"No test dates found after {test_start_date}")
+        raise ValueError("No test dates found in the test slice.")
     if len(train_dates) == 0:
-        raise ValueError(f"No train dates found before {test_start_date}")
+        raise ValueError("No train dates found in the train slice.")
 
     print(f"  Train period: {train_dates[0].date()} to {train_dates[-1].date()} "
           f"({len(train_dates)} days)")
     print(f"  Test period:  {test_dates[0].date()} to {test_dates[-1].date()} "
           f"({len(test_dates)} days)")
 
-    # Merge features and targets
-    merged = features.join(targets, how='inner')
-    feature_cols = [c for c in merged.columns if c != 'forward_return']
+    # Merge train features and targets
+    train_merged = train_features.join(train_targets, how='inner')
+    feature_cols = [c for c in train_merged.columns if c != 'forward_return']
 
-    # --- Train on all pre-test data ---
-    train_mask = merged.index.get_level_values('date') < test_start_ts
-    train_df = merged[train_mask].dropna(subset=['forward_return'])
-
+    train_df = train_merged.dropna(subset=['forward_return'])
     train_feature_vals = train_df[feature_cols].fillna(0.0)
-    train_targets = train_df['forward_return'].values
+    train_target_vals = train_df['forward_return'].values
 
     if len(train_df) < 100:
         raise ValueError(
             f"Too few valid training rows ({len(train_df)}). "
-            f"Check data availability before {test_start_date}."
+            f"Check data availability in the train slice."
         )
 
     print(f"  Training samples: {len(train_df)} rows, {len(feature_cols)} feature(s)")
@@ -208,14 +206,14 @@ def _train_predict_oneshot(
         max_depth=max_depth,
         learning_rate=learning_rate,
     )
-    model.fit(train_feature_vals.values, train_targets)
+    model.fit(train_feature_vals.values, train_target_vals)
     print(f"  Model trained (one-shot on {len(train_dates)} days)")
 
     # --- Predict on test period ---
     predictions_list = []
     for d in test_dates:
         try:
-            day_features = features.xs(d, level='date')
+            day_features = test_features.xs(d, level='date')
         except KeyError:
             continue
         day_features = day_features.fillna(0.0)
@@ -295,11 +293,11 @@ def _build_portfolios(predictions: pd.DataFrame,
 
 def run_xgboost_simple(
     config_path: str = "config/config.yaml",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    universe: Optional[str] = None,
+    train_start_date: Optional[str] = None,
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
+    test_end_date: Optional[str] = None,
+    universe: Optional[str] = None,
     context_days: int = 30,
     top_n_stocks: int = 50,
     n_estimators: int = 200,
@@ -327,73 +325,62 @@ def run_xgboost_simple(
     print("=" * 60)
 
     # -- Step 1: Load data --
-    # Extend data loading by context_days to ensure forward return targets
-    # are valid for ALL test dates. Without the extension, the last
-    # forward_period days of test data have NaN targets because
-    # shift(-forward_period) goes beyond the loaded data.
-    from datetime import timedelta
-    buffer_calendar_days = int(max(context_days, forward_period) * 2) + 10
-    if end_date:
-        extended_end = (pd.Timestamp(end_date) + timedelta(days=buffer_calendar_days)).strftime('%Y-%m-%d')
-    else:
-        extended_end = None
-
-    print("\n[Step 1] Loading data via main DataLoader...")
-    if extended_end and extended_end != end_date:
-        print(f"  Extending end_date by {context_days}d context: "
-              f"{end_date} -> {extended_end}")
+    # The full data span is now provided by the DataLoader/DatasetBundle
+    # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
-    price_data, _, _ = loader.load_data(
-        start_date=start_date,
-        end_date=extended_end,
-        universe=universe,
-    )
 
-    close_extended = price_data['close']
-    # Trim close to original end_date for backtesting
-    if end_date:
-        close = close_extended[close_extended.index <= pd.Timestamp(end_date)]
-    else:
-        close = close_extended
-    print(f"  Loaded: {len(close_extended.index)} trading days (extended) x "
-          f"{len(close_extended.columns)} stocks")
-    print(f"  Test/backtest period: {len(close.index)} trading days")
-
-    # -- Step 2: Determine train/test split --
-    print("\n[Step 2] Determining train/test split...")
+    # -- Step 2: Determine train/test split (config-backed) --
+    train_start = train_start_date or loader.data_config.get(
+        'train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get(
         'train_end_date', '2023-12-31')
     test_start = test_start_date or loader.data_config.get(
         'test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get(
+        'test_end_date', '2025-06-30')
+
+    # DatasetBundle: full span + pre-sliced train/test (split centralized in loader)
+    bundle = loader.load_data(universe=universe, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
+    price_data = bundle.full[0]
+
+    close_extended = price_data['close']
+    # Trim close to original test_end_date for backtesting
+    if test_end_date:
+        close = close_extended[close_extended.index <= pd.Timestamp(test_end_date)]
+    else:
+        close = close_extended
+    print(f"  Loaded (full): {len(close_extended.index)} trading days x "
+          f"{len(close_extended.columns)} stocks")
+    print(f"  Train: {len(train_price['close'].index)} days, "
+          f"Test: {len(test_price['close'].index)} days")
     print(f"  Train end: {train_end}, Test start: {test_start}")
 
-    # -- Step 3: Build features (daily return only) --
-    # Compute on extended close (so first day's pct_change is valid),
-    # then trim to original period for train/test
+    # -- Step 3: Build features (train & test slices, daily return only) --
+    # Built per-slice; the first day's pct_change is NaN and handled by
+    # dropna=False inside _build_features + dropna at training time.
     print("\n[Step 3] Building features (daily close-price return)...")
-    features = _build_features(close_extended)
-    if end_date:
-        end_ts = pd.Timestamp(end_date)
-        features = features[features.index.get_level_values('date') <= end_ts]
-    n_features = len(features.columns)
-    print(f"  Feature(s): {list(features.columns)}")
-    print(f"  Feature panel: {len(features)} rows (date, stock)")
+    train_features = _build_features(train_price['close'])
+    test_features = _build_features(test_price['close'])
+    n_features = len(train_features.columns)
+    print(f"  Feature(s): {list(train_features.columns)}")
+    print(f"  Train feature panel: {len(train_features)} rows, "
+          f"Test: {len(test_features)} rows (date, stock)")
 
-    # -- Step 4: Build targets --
-    # Compute on extended close so forward returns are valid for all test
-    # dates up to end_date, then trim
+    # -- Step 4: Build targets (train & test slices) --
     print(f"\n[Step 4] Building targets ({forward_period}d forward return)...")
-    targets = _build_targets(close_extended, forward_period=forward_period)
-    if end_date:
-        targets = targets[targets.index.get_level_values('date') <= end_ts]
-    print(f"  Target panel: {len(targets)} rows")
+    train_targets = _build_targets(train_price['close'], forward_period=forward_period)
+    test_targets = _build_targets(test_price['close'], forward_period=forward_period)
+    print(f"  Train target panel: {len(train_targets)} rows, "
+          f"Test: {len(test_targets)} rows")
 
     # -- Step 5: One-shot training and prediction --
     print("\n[Step 5] Training model (one-shot on train period)...")
     predictions = _train_predict_oneshot(
-        features=features,
-        targets=targets,
-        test_start_date=test_start,
+        train_features=train_features,
+        train_targets=train_targets,
+        test_features=test_features,
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
@@ -426,8 +413,8 @@ def run_xgboost_simple(
     # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "xgboost_simple"
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-    _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-    _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+    _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -437,8 +424,7 @@ def run_xgboost_simple(
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")
-    test_start_ts = pd.Timestamp(test_start)
-    test_targets = targets[targets.index.get_level_values('date') >= test_start_ts]
+    # test_targets already holds the test slice (no date masking needed)
 
     pred_stacked = predictions.stack()
     pred_stacked.index.names = ['date', 'stock']
@@ -524,9 +510,9 @@ if __name__ == '__main__':
         description='Run simplified XGBoost baseline (close-price-only) with main DataLoader')
     parser.add_argument('--config', default='config/config.yaml',
                         help='Path to main config')
-    parser.add_argument('--start', default=None,
+    parser.add_argument('--train-start', default=None,
                         help='Data start date (YYYY-MM-DD)')
-    parser.add_argument('--end', default=None,
+    parser.add_argument('--test-end', default=None,
                         help='Data end date (YYYY-MM-DD)')
     parser.add_argument('--universe', default=None,
                         help='Stock universe (hs300, zz500, all_a)')
@@ -553,11 +539,11 @@ if __name__ == '__main__':
 
     results = run_xgboost_simple(
         config_path=args.config,
-        start_date=args.start,
-        end_date=args.end,
         universe=args.universe,
+        train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
+        test_end_date=args.test_end,
         top_n_stocks=args.top_n,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,

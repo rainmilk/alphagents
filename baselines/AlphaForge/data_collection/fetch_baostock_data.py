@@ -65,6 +65,7 @@ class DataManager:
 
     @classmethod
     def _login_baostock(cls) -> None:
+        _mase_offline_guard("baselines/AlphaForge/data_collection/fetch_baostock_data.py::DataManager._login_baostock (baostock)")
         with open(os.devnull, "w") as devnull:
             with redirect_stdout(devnull):
                 bs.login()

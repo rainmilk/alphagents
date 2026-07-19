@@ -1321,10 +1321,10 @@ def run_alphaagent_baseline(
     output_dir: str = "experiments/alphaagent",
     n_formulas: int = 50,
     seed: int = 42,
-    start_date: str = None,
-    end_date: str = None,
+    train_start_date: str = None,
     train_end_date: str = None,
     test_start_date: str = None,
+    test_end_date: str = None,
     use_llm: bool = True,
     forward_period: int = 10,
     holding_period: int = None,  # None -> config['backtest']['holding_period'] or 1
@@ -1345,8 +1345,8 @@ def run_alphaagent_baseline(
         output_dir: Directory to save results
         n_formulas: Number of factor formulas to generate
         seed: Random seed for reproducibility
-        start_date: Override data start date
-        end_date: Override data end date
+        train_start_date: Override data start date
+        test_end_date: Override data end date
         train_end_date: Override train end date
         test_start_date: Override test start date
         use_llm: If True, use LLM to generate factors (default True).
@@ -1365,8 +1365,8 @@ def run_alphaagent_baseline(
         config = yaml.safe_load(f)
 
     data_cfg = config.get('data', {}).get('universe', {})
-    start_date = start_date or data_cfg.get('start_date', '2019-01-01')
-    end_date = end_date or data_cfg.get('end_date', '2025-12-31')
+    train_start_date = train_start_date or data_cfg.get('start_date', '2019-01-01')
+    test_end_date = test_end_date or data_cfg.get('end_date', '2025-12-31')
     train_end_date = train_end_date or config['data'].get('train_end_date', '2023-12-31')
     test_start_date = test_start_date or config['data'].get('test_start_date', '2024-01-01')
 
@@ -1376,10 +1376,12 @@ def run_alphaagent_baseline(
     print("=" * 60)
 
     loader = DataLoader(config_path=config_path)
-    price_data, fundamental_data, industry_series = loader.load_data(
-        start_date=start_date,
-        end_date=end_date,
-    )
+    train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+    bundle = loader.load_data(train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    price_data, fundamental_data, industry_series = bundle.full
 
     price_midx = convert_to_multindex(price_data)
     return_series = compute_returns(price_midx)
@@ -1389,7 +1391,7 @@ def run_alphaagent_baseline(
     prices = price_data.get('close')
     if prices is None:
         raise ValueError("Missing 'close' price data for backtest")
-    prices = prices.loc[start_date:end_date]
+    prices = prices.loc[train_start_date:test_end_date]
 
     n_dates = len(price_midx.get('close').index.get_level_values('datetime').unique())
     n_stocks = len(price_midx.get('close').index.get_level_values('instrument').unique())
@@ -1441,8 +1443,8 @@ def run_alphaagent_baseline(
     # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "alphaagent"
     _u = data_cfg.get('index', 'hs300')
-    _s = start_date
-    _e = end_date
+    _s = train_start_date
+    _e = test_end_date
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -1490,7 +1492,7 @@ def run_alphaagent_baseline(
         prices=prices,
         ic_mean=ic_mean,
         test_start_date=test_start_date,
-        end_date=end_date,
+        end_date=test_end_date,
     )
 
     if portfolios.empty:
@@ -1585,10 +1587,14 @@ if __name__ == "__main__":
                         help="Number of factor formulas to generate")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
-    parser.add_argument("--start-date", default=None,
+    parser.add_argument("--train-start", default=None,
                         help="Data start date (default from config)")
-    parser.add_argument("--end-date", default=None,
+    parser.add_argument("--test-end", default=None,
                         help="Data end date (default from config)")
+    parser.add_argument("--train-end", default=None,
+                        help="Train end date (default from config)")
+    parser.add_argument("--test-start", default=None,
+                        help="Test start date (default from config)")
     parser.add_argument("--use-llm", action="store_true", default=True,
                         help="Use LLM to generate factors (default: True)")
     parser.add_argument("--no-llm", action="store_true", default=False,
@@ -1606,8 +1612,10 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         n_formulas=args.n_formulas,
         seed=args.seed,
-        start_date=args.start_date,
-        end_date=args.end_date,
+        train_start_date=args.train_start,
+        train_end_date=args.train_end,
+        test_start_date=args.test_start,
+        test_end_date=args.test_end,
         use_llm=not args.no_llm,
         forward_period=args.forward_period,
         holding_period=args.holding_period,

@@ -87,7 +87,77 @@ For full LLM-driven functionality, you need API access to:
 2. **AkShare** — Open-source Python library (`pip install akshare`)
 3. **Tushare** — Requires token (`pip install tushare`, set `TUSHARE_TOKEN`)
 
-Real data is cached to `data/cache_*.pkl` after first load. Use `--force-refresh` to skip cache.
+### Local Dataset Store (pre-fetch once, retrieve many)
+
+Real data is **fetched exactly once** by the standalone `load_datasets.py` CLI, which
+downloads the **FULL** `(universe, start_date, end_date)` span, preprocesses it, and
+persists it to `datasets/{universe}_{start_date}_{end_date}.pkl`. **Every other entry point**
+(`main.py --real`, all 9 baselines running `--real`) then only **retrieves** that archive
+from disk — no network access at experiment time. This makes repeated experiments
+(different forward/holding periods, different factor strategies) instant and offline.
+
+`start_date` / `end_date` in `load_datasets.py` define the **full pre-fetch window** (the
+entire history you intend to train/test on). The train/test **split itself happens at
+retrieval time**: `DataLoader.load_data()` (and the module-level `retrieve_dataset()`)
+read the full archive once and slice out the `(train_start, train_end)` and
+`(test_start, test_end)` windows on demand — so every experiment shares one pre-fetched
+file and a single split location (`config.yaml` `train_start_date` / `train_end_date` /
+`test_start_date` / `test_end_date`).
+
+```bash
+# Pre-fetch the FULL span using config.yaml defaults (data.universe.*)
+python load_datasets.py
+
+# Explicit FULL span + source
+python load_datasets.py --universe hs300 \
+    --start-date 2019-01-01 --end-date 2025-12-31 --source westock
+
+# Re-download even if the archive already exists
+python load_datasets.py --force-refresh
+```
+
+Both `load_data()` and `retrieve_dataset()` return a **`DatasetBundle`** with three
+slices, each a `(price_data, fundamental_data, industry_data)` triple:
+
+| Attribute | Contents |
+|---|---|
+| `bundle.full`  | the entire pre-fetched span |
+| `bundle.train` | rows in `[train_start, train_end]` |
+| `bundle.test`  | rows in `[test_start, test_end]` |
+
+So a baseline no longer re-implements date masking — it just does:
+```python
+bundle = loader.load_data()                      # split read from config
+train_price, train_fund, train_ind = bundle.train
+test_price,  test_fund,  test_ind  = bundle.test
+# full span (if needed, e.g. for forward-return lookback): bundle.full[0]
+```
+
+> If you run `main.py --real` (or a baseline with real data) **before** pre-fetching,
+> `retrieve_dataset()` raises a `FileNotFoundError` telling you the exact
+> `load_datasets.py` command to run first. Sample mode (`--sample`, the default) is
+> unaffected and needs no pre-fetch.
+
+### Offline Guard (single live-fetch path)
+
+To keep the "fetch once, retrieve many" contract enforceable, **`load_datasets.py` is the
+only sanctioned live-data entry point.** The vendored baseline sub-packages (AlphaForge,
+AlphaAgent, AlphaFAMA, mcts_llm_alpha) still ship their *original* live-fetch scripts
+(baostock / Stooq / `qlib.init` / `QlibDataLoader`). Those are **not** part of the MASE
+flow and are blocked by default via `dataloader/_offline_guard.py` — running one raises:
+
+```text
+[offline-guard] <script> would connect to a live data source, but the MASE workflow
+forbids network access outside `load_datasets.py`.
+  → To use the unified local store, pre-fetch once:
+      python load_datasets.py --universe <u> --start-date <s> --end-date <e>
+  → To intentionally run this legacy live-fetch script, set:
+      export MASE_ALLOW_LEGACY_FETCH=1
+```
+
+Set `MASE_ALLOW_LEGACY_FETCH=1` only when you deliberately want to reproduce an original
+baseline's data pipeline for reference — doing so bypasses the unified `datasets/` store
+and may produce data inconsistent with MASE runs.
 
 ### Quick Demo (No LLM Required)
 
@@ -105,21 +175,21 @@ python main.py --full
 
 ### Full Pipeline (Real A-Share Data)
 
+> **First, pre-fetch the data once** (see Local Dataset Store above). The commands
+> below then retrieve it locally — no re-download.
+
 ```bash
-# Auto-detect best available source
+# Auto-detect best available source (data already pre-fetched)
 python main.py --full --real
 
 # Specify data source
 python main.py --full --real --source akshare
 
-# Custom date range + universe
+# Custom date range + universe (must match the pre-fetched archive)
 python main.py --full --real --start 2023-01-01 --end 2024-12-31 --universe hs300
 
 # Custom forward period and holding period
 python main.py --full --real --forward-period 20 --holding-period 5
-
-# Skip cache, force re-download
-python main.py --full --real --force-refresh
 ```
 
 ### Test Pipeline (Skip Evolution, Run Backtest Only)
@@ -292,7 +362,7 @@ Key active sections:
 
 All results are saved under a **parameter-tagged root** `experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/`
 (e.g. `experiments/hs300_2019-01-01_2025-12-31_forward-10_holding-1/`). The universe/start/end are taken from
-`config.yaml`'s `data.universe` (or CLI `--start`/`--end`/`--universe` overrides); `forward`/`holding` come from
+`config.yaml`'s `data.universe` (or CLI `--train-start`/`--test-end`/`--universe` overrides); `forward`/`holding` come from
 `evolution.forward_period` / `backtest.trading.holding_period` (or `--forward-period` / `--holding-period`).
 MASE and all 9 baselines share this same root, so results are directly comparable in one place.
 
@@ -339,11 +409,11 @@ python baselines/run_alphaagent.py --config-path config/config.yaml
 # Override key parameters (consistent across all baselines)
 python baselines/run_alphaforge.py \
     --config-path config/config.yaml \
-    --start 2022-01-01 --end 2024-06-30 \
+    --train-start 2022-01-01 --test-end 2024-06-30 \
     --forward-period 10 --holding-period 5
 ```
 
-Common CLI flags (all baselines): `--config-path`, `--start`, `--end`, `--forward-period`, `--holding-period`,
+Common CLI flags (all baselines): `--config-path`, `--train-start`, `--test-end`, `--forward-period`, `--holding-period`,
 `--output-dir`. `holding_period` and `forward_period` default to `config.yaml`
 (`backtest.trading.holding_period` / `evolution.forward_period`) so runs stay aligned with the MASE pipeline.
 

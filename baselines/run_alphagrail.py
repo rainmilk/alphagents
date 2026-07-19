@@ -1189,11 +1189,11 @@ def build_portfolios_from_factor(
 
 def run_alphagrail_baseline(
     config_path: str = "config/config.yaml",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    universe: Optional[str] = None,
+    train_start_date: Optional[str] = None,
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
+    test_end_date: Optional[str] = None,
+    universe: Optional[str] = None,
     top_n_stocks: int = 50,
     holding_period: int = 1,
     use_llm_tournament: bool = False,
@@ -1218,8 +1218,8 @@ def run_alphagrail_baseline(
 
     Args:
         config_path: Path to main project config file.
-        start_date: Data start date (YYYY-MM-DD).
-        end_date: Data end date (YYYY-MM-DD).
+        train_start_date: Data start date (YYYY-MM-DD).
+        test_end_date: Data end date (YYYY-MM-DD).
         universe: Stock universe (hs300, zz500, all_a).
         train_end_date: Last training date (YYYY-MM-DD).
         test_start_date: First test date (YYYY-MM-DD).
@@ -1245,11 +1245,19 @@ def run_alphagrail_baseline(
     # ── Step 1: Load data via main DataLoader ──────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
-    price_data, fundamental_data, industry_data = loader.load_data(
-        start_date=start_date,
-        end_date=end_date,
-        universe=universe,
-    )
+    train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+
+    bundle = loader.load_data(universe=universe, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
+    # FULL span (close / fundamental / industry) — used for factor building,
+    # neutralization size proxy, and backtest price alignment.
+    price_data = bundle.full[0]
+    fundamental_data = bundle.full[1]
+    industry_data = bundle.full[2]
 
     close = price_data['close']
     n_dates = len(close.index)
@@ -1260,13 +1268,13 @@ def run_alphagrail_baseline(
     else:
         print(f"  No fundamental data — will use price-based proxies for PE/PB/GPM/etc.")
 
-    # ── Step 2: Determine train/test split ─────────────────────────────
-    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
-    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    # ── Step 2: Train/test split ───────────────────────────────────────
+    # The split is produced centrally by loader.load_data (bundle.train /
+    # bundle.test); we use the slices' own date indices instead of re-deriving
+    # boundaries from train_end/test_start timestamps.
     print(f"  Train end: {train_end}, Test start: {test_start}")
-
-    train_end_ts = pd.Timestamp(train_end)
-    test_start_ts = pd.Timestamp(test_start)
+    train_dates = train_price['close'].index
+    test_dates = test_price['close'].index
 
     # ── Step 3: Build seed alpha factors ───────────────────────────────
     print("\n[Step 2] Building seed alpha factors...")
@@ -1311,11 +1319,10 @@ def run_alphagrail_baseline(
 
     # ── Step 5: Evaluate factors on training data ──────────────────────
     print("\n[Step 4] Evaluating factors on training data (comprehensive metrics)...")
-    train_mask = forward_returns.index < test_start_ts
-    train_returns = forward_returns.loc[train_mask]
+    train_returns = forward_returns.loc[forward_returns.index.isin(train_dates)]
 
     train_factors = {
-        name: vals.loc[train_mask] for name, vals in factor_library.items()
+        name: vals.loc[vals.index.isin(train_dates)] for name, vals in factor_library.items()
     }
 
     factor_eval = evaluate_factors(train_factors, train_returns, top_n=top_n_stocks, n_quantiles=n_quantiles)
@@ -1405,8 +1412,8 @@ def run_alphagrail_baseline(
     method_name = "alphagrail"
     if output_dir:
         _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-        _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-        _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+        _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+        _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
         _fp = forward_period if forward_period is not None else 10
         _hp = holding_period if holding_period is not None else 1
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -1415,9 +1422,8 @@ def run_alphagrail_baseline(
     metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # ── Step 9: Compute test-period IC for the winning factor ──────────
-    test_mask = forward_returns.index >= test_start_ts
-    test_returns = forward_returns.loc[test_mask]
-    test_factor = factor_library[winner].loc[test_mask]
+    test_returns = forward_returns.loc[forward_returns.index.isin(test_dates)]
+    test_factor = factor_library[winner].loc[factor_library[winner].index.isin(test_dates)]
     test_ic = _compute_rank_ic(test_factor, test_returns)
     # Also compute test ICIR from the daily Rank-IC series (reported in tables).
     test_ic_series = _compute_rank_ic_series(test_factor, test_returns)
@@ -1502,9 +1508,9 @@ if __name__ == '__main__':
     )
     parser.add_argument('--config', default='config/config.yaml',
                         help='Path to main config')
-    parser.add_argument('--start', default=None,
+    parser.add_argument('--train-start', default=None,
                         help='Data start date (YYYY-MM-DD)')
-    parser.add_argument('--end', default=None,
+    parser.add_argument('--test-end', default=None,
                         help='Data end date (YYYY-MM-DD)')
     parser.add_argument('--universe', default=None,
                         help='Stock universe (hs300, zz500, all_a)')
@@ -1531,11 +1537,11 @@ if __name__ == '__main__':
 
     results = run_alphagrail_baseline(
         config_path=args.config,
-        start_date=args.start,
-        end_date=args.end,
         universe=args.universe,
+        train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
+        test_end_date=args.test_end,
         top_n_stocks=args.top_n,
         holding_period=args.holding_period,
         use_llm_tournament=args.use_llm,

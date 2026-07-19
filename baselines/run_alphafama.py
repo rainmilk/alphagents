@@ -20,7 +20,7 @@ The LLM alpha-mining follows the original FAMA (FActor Mining Agent) framework:
 
 Usage:
     python baselines/run_alphafama.py
-    python baselines/run_alphafama.py --start 2020-01-01 --end 2024-12-31 --universe hs300
+    python baselines/run_alphafama.py --train-start 2020-01-01 --test-end 2024-12-31 --universe hs300
     python baselines/run_alphafama.py --no-llm          # disable LLM mining
     python baselines/run_alphafama.py --llm-iters 20    # set LLM iterations
 
@@ -50,7 +50,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dataloader.loader import DataLoader
 from baselines.AlphaFAMA.src.data_bridge import (
     convert_price_data_to_alphafama,
-    split_alphafama_data,
 )
 # NOTE: AlphaFAMA modules use relative imports; we import them via the
 # full package path to avoid polluting sys.path with AlphaFAMA's src/
@@ -448,11 +447,11 @@ def _compute_llm_factor_exposures(
 
 def run_alphafama_baseline(
     config_path: str = "config/config.yaml",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    universe: Optional[str] = None,
+    train_start_date: Optional[str] = None,
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
+    test_end_date: Optional[str] = None,
+    universe: Optional[str] = None,
     context_days: int = 30,
     output_dir: Optional[str] = None,
     use_llm: bool = True,
@@ -471,8 +470,8 @@ def run_alphafama_baseline(
 
     Args:
         config_path: Path to the main project config file.
-        start_date: Data start date (YYYY-MM-DD).
-        end_date: Data end date (YYYY-MM-DD).
+        train_start_date: Data start date (YYYY-MM-DD).
+        test_end_date: Data end date (YYYY-MM-DD).
         universe: Stock universe (hs300, zz500, all_a).
         train_end_date: Last training date (YYYY-MM-DD).
         test_start_date: First test date (YYYY-MM-DD).
@@ -499,11 +498,15 @@ def run_alphafama_baseline(
     # ── Step 1: Load data via main DataLoader ──────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
-    price_data, fundamental_data, industry_data = loader.load_data(
-        start_date=start_date,
-        end_date=end_date,
-        universe=universe,
-    )
+    train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+
+    bundle = loader.load_data(universe=universe, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
+    price_data = bundle.full[0]  # FULL span (kept for backtest prices + logging)
 
     print(f"  Loaded: {len(price_data['close'].index)} trading days x "
           f"{len(price_data['close'].columns)} stocks")
@@ -529,25 +532,20 @@ def run_alphafama_baseline(
     print(f"  Forward period (IC horizon): {forward_period}d")
     print(f"  Holding period (rebalance):  {holding_period}d")
 
-    # ── Step 2: Convert to AlphaFAMA format ────────────────────────────
+    # ── Step 2: Convert train/test slices to AlphaFAMA format ──────────
+    # The train/test split is now produced centrally by loader.load_data
+    # (bundle.train / bundle.test); no manual date-masking here.
     print("\n[Step 2] Converting data to AlphaFAMA format...")
-    af_df = convert_price_data_to_alphafama(
-        price_data,
+    train_df = convert_price_data_to_alphafama(
+        train_price,
         forward_period=forward_period,
     )
-    print(f"  Converted: {len(af_df)} rows, MultiIndex (date, ticker)")
-
-    # ── Step 3: Train/Test split ───────────────────────────────────────
-    print("\n[Step 3] Splitting into train/test...")
-    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
-    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
-
-    train_df, test_df = split_alphafama_data(
-        af_df,
-        train_end_date=train_end,
-        test_start_date=test_start,
-        context_days=context_days,
+    test_df = convert_price_data_to_alphafama(
+        test_price,
+        forward_period=forward_period,
     )
+    print(f"  Converted: train={len(train_df)} rows, test={len(test_df)} rows, "
+          f"MultiIndex (date, ticker)")
 
     # ── Step 4: Generate Alpha101 factors ──────────────────────────────
     print("\n[Step 4] Generating Alpha101 factors...")
@@ -715,8 +713,8 @@ def run_alphafama_baseline(
     method_name = "alphafama"
     if output_dir:
         _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-        _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-        _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+        _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+        _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
         _fp = forward_period if forward_period is not None else 10
         _hp = holding_period if holding_period is not None else 1
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -952,8 +950,8 @@ def _simulate_portfolio_from_ic(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run AlphaFAMA baseline with main DataLoader')
     parser.add_argument('--config', default='config/config.yaml', help='Path to main config')
-    parser.add_argument('--start', default=None, help='Data start date (YYYY-MM-DD)')
-    parser.add_argument('--end', default=None, help='Data end date (YYYY-MM-DD)')
+    parser.add_argument('--train-start', default=None, help='Data start date (YYYY-MM-DD)')
+    parser.add_argument('--test-end', default=None, help='Data end date (YYYY-MM-DD)')
     parser.add_argument('--universe', default=None, help='Stock universe (hs300, zz500, all_a)')
     parser.add_argument('--train-end', default=None, help='Train end date (YYYY-MM-DD)')
     parser.add_argument('--test-start', default=None, help='Test start date (YYYY-MM-DD)')
@@ -976,11 +974,11 @@ if __name__ == '__main__':
 
     results = run_alphafama_baseline(
         config_path=args.config,
-        start_date=args.start,
-        end_date=args.end,
         universe=args.universe,
+        train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
+        test_end_date=args.test_end,
         context_days=args.context_days,
         output_dir=args.output_dir,
         use_llm=args.use_llm,

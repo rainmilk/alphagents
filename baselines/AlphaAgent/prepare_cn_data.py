@@ -7,6 +7,25 @@ from pathlib import Path
 from dateutil.relativedelta import relativedelta
 import numpy as np
 
+# Offline guard: block live data access outside the unified load_datasets.py
+# flow. See dataloader/_offline_guard.py. Opt in with MASE_ALLOW_LEGACY_FETCH=1.
+import os
+import sys
+
+
+def _mase_repo_root():
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d and d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, "load_datasets.py")):
+            return d
+        d = os.path.dirname(d)
+    raise RuntimeError("Cannot locate MASE repo root (load_datasets.py).")
+
+
+sys.path.insert(0, _mase_repo_root())
+from dataloader._offline_guard import assert_offline_or_optin as _mase_offline_guard
+
+
 def get_all_stocks_in_period(start_date, end_date):
     """获取指定时间段内所有出现过的股票代码"""
     all_stocks = set()
@@ -30,6 +49,7 @@ def download_stock_data(start_date, end_date, output_dir):
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
     
+    _mase_offline_guard("baselines/AlphaAgent/prepare_cn_data.py::download_stock_data (baostock)")
     lg = bs.login()
     if lg.error_code != '0':
         print(f'登录失败: {lg.error_msg}')

@@ -20,6 +20,25 @@ from ..config import Config
 logger = logging.getLogger(__name__)
 
 
+# Offline guard: block live data access outside the unified load_datasets.py
+# flow. See dataloader/_offline_guard.py. Opt in with MASE_ALLOW_LEGACY_FETCH=1.
+import os
+import sys
+
+
+def _mase_repo_root():
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d and d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, "load_datasets.py")):
+            return d
+        d = os.path.dirname(d)
+    raise RuntimeError("Cannot locate MASE repo root (load_datasets.py).")
+
+
+sys.path.insert(0, _mase_repo_root())
+from dataloader._offline_guard import assert_offline_or_optin as _mase_offline_guard
+
+
 class ComprehensiveEvaluator:
     """
     基于配置结合所有评估方法的统一评估器。
@@ -151,6 +170,7 @@ class ComprehensiveEvaluator:
         """
         根据配置获取股票池。
         """
+        _mase_offline_guard("baselines/mcts_llm_alpha/.../evaluation/comprehensive.py::ComprehensiveEvaluator._get_universe (D.instruments)")
         # 使用Qlib获取真实的股票池
         try:
             from qlib.data import D

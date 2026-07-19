@@ -442,8 +442,10 @@ class ExperimentRunner:
                     output_dir=(
                         f"{self.output_dir}/cross_period/{period_label}"
                     ),
-                    split_train_end=train_end_fmt,
-                    split_test_start=test_start_fmt,
+                    train_start_date=train_start_fmt,
+                    train_end_date=train_end_fmt,
+                    test_start_date=test_start_fmt,
+                    test_end_date=test_end_fmt,
                 )
 
                 # Build structured result
@@ -591,8 +593,8 @@ class ExperimentRunner:
 
         results = run_alphagrail_baseline(
             config_path=self.config_path,
-            start_date=start_date,
-            end_date=end_date,
+            train_start_date=start_date,
+            test_end_date=end_date,
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,
@@ -676,8 +678,8 @@ class ExperimentRunner:
         
         results = run_alphafama_baseline(
             config_path="config/config.yaml",
-            start_date=start_date,
-            end_date=end_date,
+            train_start_date=start_date,
+            test_end_date=end_date,
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,
@@ -727,8 +729,8 @@ class ExperimentRunner:
             output_dir=output_dir,
             n_formulas=50,
             seed=42,
-            start_date=start_date,
-            end_date=end_date,
+            train_start_date=start_date,
+            test_end_date=end_date,
             train_end_date=train_end,
             test_start_date=test_start,
         )
@@ -762,8 +764,8 @@ class ExperimentRunner:
         try:
             results = run_alphaforge_baseline(
                 config_path=self.config_path,
-                start_date=self.config['data']['universe'].get('start_date', '2019-01-01'),
-                end_date=self.config['data']['universe'].get('end_date', '2025-12-31'),
+                train_start_date=self.config['data']['universe'].get('start_date', '2019-01-01'),
+                test_end_date=self.config['data']['universe'].get('end_date', '2025-12-31'),
                 instruments=self.config['data']['universe'].get('name', 'csi300'),
                 top_n_stocks=self.config.get('backtest', {}).get('top_n_stocks', 50),
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
@@ -822,8 +824,8 @@ class ExperimentRunner:
 
         results = run_xgboost_baseline(
             config_path=self.config_path,
-            start_date=start_date,
-            end_date=end_date,
+            train_start_date=start_date,
+            test_end_date=end_date,
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,
@@ -870,8 +872,8 @@ class ExperimentRunner:
 
         results = run_alphagen_baseline(
             config_path=self.config_path,
-            start_date=start_date,
-            end_date=end_date,
+            train_start_date=start_date,
+            test_end_date=end_date,
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,

@@ -15,6 +15,24 @@ from src.constants.formula_map import FORMULA_MAP as formula_map
 import json
 from src.deepseek_agent import run as alpha_mine  # DeepSeek integration
 
+# Offline guard: block live data access outside the unified load_datasets.py
+# flow. See dataloader/_offline_guard.py. Opt in with MASE_ALLOW_LEGACY_FETCH=1.
+import os
+import sys
+
+
+def _mase_repo_root():
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d and d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, "load_datasets.py")):
+            return d
+        d = os.path.dirname(d)
+    raise RuntimeError("Cannot locate MASE repo root (load_datasets.py).")
+
+
+sys.path.insert(0, _mase_repo_root())
+from dataloader._offline_guard import assert_offline_or_optin as _mase_offline_guard
+
 
 from src.utils.clustered_formulas import write_clustered_formulas
 
@@ -46,6 +64,7 @@ def main():
     args = p.parse_args()
 
     if args.fetch_data:
+        _mase_offline_guard("baselines/AlphaFAMA/main.py --fetch-data (Stooq via pandas_datareader)")
         download_spx_spy(
             start_date="2015-01-01",
             end_date=pd.Timestamp.today().strftime("%Y-%m-%d"),

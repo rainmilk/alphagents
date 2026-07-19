@@ -1327,11 +1327,11 @@ class AlphaGenConfig:
 
 def run_alphagen_baseline(
     config_path: str = "config/config.yaml",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    universe: Optional[str] = None,
+    train_start_date: Optional[str] = None,
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
+    test_end_date: Optional[str] = None,
+    universe: Optional[str] = None,
     n_generate: int = 300,
     pool_capacity: int = 20,
     top_n_stocks: int = 50,
@@ -1374,8 +1374,8 @@ def run_alphagen_baseline(
 
     Args:
         config_path: Path to main project config
-        start_date: Data start date (YYYY-MM-DD)
-        end_date: Data end date (YYYY-MM-DD)
+        train_start_date: Data start date (YYYY-MM-DD)
+        test_end_date: Data end date (YYYY-MM-DD)
         universe: Stock universe
         train_end_date: Training end date
         test_start_date: Test start date
@@ -1412,48 +1412,52 @@ def run_alphagen_baseline(
     # ── Step 1: Load data ──────────────────────────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
-    price_data, fundamental_data, industry_data = loader.load_data(
-        start_date=start_date,
-        end_date=end_date,
-        universe=universe,
-    )
+    train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+    bundle = loader.load_data(universe=universe, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    price_data, fundamental_data, industry_data = bundle.full
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
 
     close = price_data['close']
     n_dates = len(close.index)
     n_stocks = len(close.columns)
     print(f"  Loaded: {n_dates} dates x {n_stocks} stocks")
 
-    # ── Step 2: Train/test split ───────────────────────────────────────
-    train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
-    test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+    # ── Step 2: Train/test split (centralized in DatasetBundle) ─────────
     print(f"  Train end: {train_end}, Test start: {test_start}")
-
-    train_end_ts = pd.Timestamp(train_end)
-    test_start_ts = pd.Timestamp(test_start)
 
     # ── Step 3: Prepare numpy data dict ────────────────────────────────
     print("\n[Step 2] Preparing data for expression evaluation...")
-    data_dict = {
-        'close': close.values.astype(np.float64),
-        'open': price_data['open'].values.astype(np.float64),
-        'high': price_data['high'].values.astype(np.float64),
-        'low': price_data['low'].values.astype(np.float64),
-        'volume': price_data['volume'].values.astype(np.float64),
-        'vwap': (price_data['high'].values + price_data['low'].values + price_data['close'].values) / 3.0,
+    train_data = {
+        'close': train_price['close'].values.astype(np.float64),
+        'open': train_price['open'].values.astype(np.float64),
+        'high': train_price['high'].values.astype(np.float64),
+        'low': train_price['low'].values.astype(np.float64),
+        'volume': train_price['volume'].values.astype(np.float64),
+        'vwap': (train_price['high'].values + train_price['low'].values + train_price['close'].values) / 3.0,
+    }
+    test_data = {
+        'close': test_price['close'].values.astype(np.float64),
+        'open': test_price['open'].values.astype(np.float64),
+        'high': test_price['high'].values.astype(np.float64),
+        'low': test_price['low'].values.astype(np.float64),
+        'volume': test_price['volume'].values.astype(np.float64),
+        'vwap': (test_price['high'].values + test_price['low'].values + test_price['close'].values) / 3.0,
     }
 
-    # Compute forward returns
+    # Compute forward returns on the FULL close (the last train day needs the
+    # next day's close for its forward return), then split by the bundle's
+    # train/test indices so the split stays centralized and behavior identical.
     forward_returns_all = _compute_forward_returns(close, periods=[forward_period])
     fwd_ret = forward_returns_all[forward_period].values.astype(np.float64)
 
-    # Split into train/test
-    train_mask = close.index < test_start_ts
-    train_data = {k: v[train_mask] for k, v in data_dict.items()}
-    train_fwd_ret = fwd_ret[train_mask]
-
-    test_mask = close.index >= test_start_ts
-    test_data = {k: v[test_mask] for k, v in data_dict.items()}
-    test_fwd_ret = fwd_ret[test_mask]
+    train_idx = close.index.isin(train_price['close'].index)
+    train_fwd_ret = fwd_ret[train_idx]
+    test_idx = close.index.isin(test_price['close'].index)
+    test_fwd_ret = fwd_ret[test_idx]
 
     n_train_dates = train_fwd_ret.shape[0]
     print(f"  Train: {n_train_dates} dates, Test: {test_fwd_ret.shape[0]} dates")
@@ -1595,7 +1599,7 @@ def run_alphagen_baseline(
     print(f"\n[Step 7] Building top-{top_n_stocks} portfolios...")
     # Reconstruct full close timeline for portfolio building
     portfolios = build_portfolios_from_ensemble(
-        ensemble_test, close.iloc[test_mask], top_n=top_n_stocks,
+        ensemble_test, test_price['close'], top_n=top_n_stocks,
     )
     print(f"  Portfolios: {portfolios.shape}")
 
@@ -1614,8 +1618,8 @@ def run_alphagen_baseline(
     method_name = "alphagen"
     if output_dir:
         _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-        _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-        _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+        _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+        _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
         _fp = forward_period if forward_period is not None else 10
         _hp = holding_period if holding_period is not None else 1
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -1704,8 +1708,8 @@ if __name__ == '__main__':
         description='Run AlphaGen baseline — RL-based token factor generation'
     )
     parser.add_argument('--config', default='config/config.yaml', help='Path to main config')
-    parser.add_argument('--start', default=None, help='Data start date')
-    parser.add_argument('--end', default=None, help='Data end date')
+    parser.add_argument('--train-start', default=None, help='Data start date')
+    parser.add_argument('--test-end', default=None, help='Data end date')
     parser.add_argument('--universe', default=None, help='Stock universe')
     parser.add_argument('--train-end', default=None, help='Train end date')
     parser.add_argument('--test-start', default=None, help='Test start date')
@@ -1755,11 +1759,11 @@ if __name__ == '__main__':
 
     results = run_alphagen_baseline(
         config_path=args.config,
-        start_date=args.start,
-        end_date=args.end,
         universe=args.universe,
+        train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
+        test_end_date=args.test_end,
         n_generate=args.n_generate,
         pool_capacity=args.pool_capacity,
         top_n_stocks=args.top_n,

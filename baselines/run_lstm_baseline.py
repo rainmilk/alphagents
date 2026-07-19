@@ -12,7 +12,7 @@ This runner:
 
 Usage:
     python baselines/run_lstm_baseline.py
-    python baselines/run_lstm_baseline.py --start 2020-01-01 --end 2024-12-31 --universe hs300
+    python baselines/run_lstm_baseline.py --train-start 2020-01-01 --test-end 2024-12-31 --universe hs300
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 """
@@ -246,8 +246,10 @@ class LSTMModel(nn.Module):
 # ===========================================================================
 
 def _train_predict_oneshot_lstm(
-    features: pd.DataFrame,
-    targets: pd.DataFrame,
+    train_features: pd.DataFrame,
+    train_targets: pd.DataFrame,
+    test_features: pd.DataFrame,
+    test_targets: pd.DataFrame,
     test_start_date: str,
     seq_len: int = 20,
     hidden_size: int = 64,
@@ -258,13 +260,21 @@ def _train_predict_oneshot_lstm(
     learning_rate: float = 0.001,
 ) -> pd.DataFrame:
     """
-    Train a single LSTM on all training data and predict on the test period.
+    Train a single LSTM on the training slice and predict on the test slice.
 
     One-shot approach, consistent with other baselines.
 
+    The train/test split is centralized in the DataLoader
+    (bundle.train / bundle.test); this function consumes the pre-sliced
+    panels directly. For the test-period sequences we still prepend the
+    last (seq_len - 1) training days as context so the LSTM can form
+    sequences for ALL test dates (including the first one).
+
     Args:
-        features: MultiIndex (date, stock) feature panel
-        targets: MultiIndex (date, stock) target panel
+        train_features: MultiIndex (date, stock) feature panel (train slice)
+        train_targets: MultiIndex (date, stock) target panel ('forward_return')
+        test_features: MultiIndex (date, stock) feature panel (test slice)
+        test_targets: MultiIndex (date, stock) target panel ('forward_return')
         test_start_date: First test date (YYYY-MM-DD)
         seq_len: Lookback window in trading days
         hidden_size: LSTM hidden layer size
@@ -278,26 +288,30 @@ def _train_predict_oneshot_lstm(
         DataFrame (date x stock) of predicted forward returns.
     """
     test_start_ts = pd.Timestamp(test_start_date)
-    all_dates = features.index.get_level_values('date').unique().sort_values()
-    all_stocks = features.index.get_level_values('stock').unique().sort_values()
 
-    train_dates = all_dates[all_dates < test_start_ts]
-    test_dates = all_dates[all_dates >= test_start_ts]
+    # Reconstruct the continuous (train + test) panel. Config keeps the two
+    # slices adjacent, so concatenating yields the original full grid with a
+    # shared stock universe.
+    all_features = pd.concat([train_features, test_features]).sort_index()
+    all_targets = pd.concat([train_targets, test_targets]).sort_index()
+    all_dates = all_features.index.get_level_values('date').unique().sort_values()
+    all_stocks = all_features.index.get_level_values('stock').unique().sort_values()
+
+    train_dates = train_features.index.get_level_values('date').unique().sort_values()
+    test_dates = test_features.index.get_level_values('date').unique().sort_values()
 
     if len(test_dates) == 0:
-        raise ValueError(f"No test dates found after {test_start_date}")
+        raise ValueError("No test dates found in the test slice.")
     if len(train_dates) == 0:
-        raise ValueError(f"No train dates found before {test_start_date}")
+        raise ValueError("No train dates found in the train slice.")
 
     print(f"  Train period: {train_dates[0].date()} to {train_dates[-1].date()} "
           f"({len(train_dates)} days)")
     print(f"  Test period:  {test_dates[0].date()} to {test_dates[-1].date()} "
           f"({len(test_dates)} days)")
 
-    # -- Prepare sequences for train and test --
+    # -- Prepare sequences for train (train slice only) --
     print("\n  Preparing training sequences...")
-    train_features = features[features.index.get_level_values('date') < test_start_ts]
-    train_targets = targets[targets.index.get_level_values('date') < test_start_ts]
     X_train, y_train, _, _ = _prepare_lstm_data(
         train_features, train_targets, train_dates, all_stocks, seq_len,
     )
@@ -367,7 +381,7 @@ def _train_predict_oneshot_lstm(
     print("  LSTM training complete.")
 
     # -- Predict on test period --
-    # Include seq_len days of training data before test_start so the LSTM
+    # Include seq_len days of training context before test_start so the LSTM
     # can form sequences for ALL test dates (including the first one).
     # Without this context, the first seq_len-1 test days would be skipped,
     # causing incomplete test coverage.
@@ -376,8 +390,8 @@ def _train_predict_oneshot_lstm(
     context_start_pos = max(0, test_start_pos - seq_len + 1)
     context_dates = all_dates[context_start_pos:]
 
-    context_features = features[features.index.get_level_values('date').isin(context_dates)]
-    context_targets = targets[targets.index.get_level_values('date').isin(context_dates)]
+    context_features = all_features[all_features.index.get_level_values('date').isin(context_dates)]
+    context_targets = all_targets[all_targets.index.get_level_values('date').isin(context_dates)]
     X_test, _, test_sample_dates, test_sample_stocks = _prepare_lstm_data(
         context_features, context_targets, context_dates, all_stocks, seq_len,
     )
@@ -478,11 +492,11 @@ def _build_portfolios(predictions: pd.DataFrame,
 
 def run_lstm_baseline(
     config_path: str = "config/config.yaml",
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    universe: Optional[str] = None,
+    train_start_date: Optional[str] = None,
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
+    test_end_date: Optional[str] = None,
+    universe: Optional[str] = None,
     context_days: int = 30,
     top_n_stocks: int = 50,
     seq_len: int = 20,
@@ -514,72 +528,61 @@ def run_lstm_baseline(
     print("=" * 60)
 
     # -- Step 1: Load data --
-    # Extend data loading by context_days to ensure forward return targets
-    # are valid for ALL test dates. Without the extension, the last
-    # forward_period days of test data have NaN targets because
-    # shift(-forward_period) goes beyond the loaded data.
-    from datetime import timedelta
-    buffer_calendar_days = int(max(context_days, forward_period) * 2) + 10
-    if end_date:
-        extended_end = (pd.Timestamp(end_date) + timedelta(days=buffer_calendar_days)).strftime('%Y-%m-%d')
-    else:
-        extended_end = None
-
-    print("\n[Step 1] Loading data via main DataLoader...")
-    if extended_end and extended_end != end_date:
-        print(f"  Extending end_date by {context_days}d context: "
-              f"{end_date} -> {extended_end}")
+    # The full data span is now provided by the DataLoader/DatasetBundle
+    # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
-    price_data, _, _ = loader.load_data(
-        start_date=start_date,
-        end_date=extended_end,
-        universe=universe,
-    )
 
-    close_extended = price_data['close']
-    # Trim close to original end_date for backtesting
-    if end_date:
-        close = close_extended[close_extended.index <= pd.Timestamp(end_date)]
-    else:
-        close = close_extended
-    print(f"  Loaded: {len(close_extended.index)} trading days (extended) x "
-          f"{len(close_extended.columns)} stocks")
-    print(f"  Test/backtest period: {len(close.index)} trading days")
-
-    # -- Step 2: Determine train/test split --
-    print("\n[Step 2] Determining train/test split...")
+    # -- Step 2: Determine train/test split (config-backed) --
+    train_start = train_start_date or loader.data_config.get(
+        'train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get(
         'train_end_date', '2023-12-31')
     test_start = test_start_date or loader.data_config.get(
         'test_start_date', '2024-01-01')
+    test_end = test_end_date or loader.data_config.get(
+        'test_end_date', '2025-06-30')
+
+    # DatasetBundle: full span + pre-sliced train/test (split centralized in loader)
+    bundle = loader.load_data(universe=universe, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
+    price_data = bundle.full[0]
+
+    close_extended = price_data['close']
+    # Trim close to original test_end_date for backtesting
+    if test_end_date:
+        close = close_extended[close_extended.index <= pd.Timestamp(test_end_date)]
+    else:
+        close = close_extended
+    print(f"  Loaded (full): {len(close_extended.index)} trading days x "
+          f"{len(close_extended.columns)} stocks")
+    print(f"  Train: {len(train_price['close'].index)} days, "
+          f"Test: {len(test_price['close'].index)} days")
     print(f"  Train end: {train_end}, Test start: {test_start}")
 
-    # -- Step 3: Build features (daily return only) --
-    # Compute on extended close (so first day's pct_change is valid),
-    # then trim to original period for train/test
+    # -- Step 3: Build features (train & test slices, daily return only) --
     print("\n[Step 3] Building features (daily close-price return)...")
-    features = _build_features(close_extended)
-    if end_date:
-        end_ts = pd.Timestamp(end_date)
-        features = features[features.index.get_level_values('date') <= end_ts]
-    n_features = len(features.columns)
-    print(f"  Feature(s): {list(features.columns)}")
-    print(f"  Feature panel: {len(features)} rows (date, stock)")
+    train_features = _build_features(train_price['close'])
+    test_features = _build_features(test_price['close'])
+    n_features = len(train_features.columns)
+    print(f"  Feature(s): {list(train_features.columns)}")
+    print(f"  Train feature panel: {len(train_features)} rows, "
+          f"Test: {len(test_features)} rows (date, stock)")
 
-    # -- Step 4: Build targets --
-    # Compute on extended close so forward returns are valid for all test
-    # dates up to end_date, then trim
+    # -- Step 4: Build targets (train & test slices) --
     print(f"\n[Step 4] Building targets ({forward_period}d forward return)...")
-    targets = _build_targets(close_extended, forward_period=forward_period)
-    if end_date:
-        targets = targets[targets.index.get_level_values('date') <= end_ts]
-    print(f"  Target panel: {len(targets)} rows")
+    train_targets = _build_targets(train_price['close'], forward_period=forward_period)
+    test_targets = _build_targets(test_price['close'], forward_period=forward_period)
+    print(f"  Train target panel: {len(train_targets)} rows, "
+          f"Test: {len(test_targets)} rows")
 
     # -- Step 5: One-shot LSTM training and prediction --
     print("\n[Step 5] Training LSTM (one-shot on train period)...")
     predictions = _train_predict_oneshot_lstm(
-        features=features,
-        targets=targets,
+        train_features=train_features,
+        train_targets=train_targets,
+        test_features=test_features,
+        test_targets=test_targets,
         test_start_date=test_start,
         seq_len=seq_len,
         hidden_size=hidden_size,
@@ -611,8 +614,8 @@ def run_lstm_baseline(
     # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "lstm"
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-    _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-    _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+    _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -629,8 +632,7 @@ def run_lstm_baseline(
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")
-    test_start_ts = pd.Timestamp(test_start)
-    test_targets = targets[targets.index.get_level_values('date') >= test_start_ts]
+    # test_targets already holds the test slice (no date masking needed)
 
     pred_stacked = predictions.stack()
     pred_stacked.index.names = ['date', 'stock']
@@ -720,9 +722,9 @@ if __name__ == '__main__':
         description='Run LSTM baseline (close-price-only) with main DataLoader')
     parser.add_argument('--config', default='config/config.yaml',
                         help='Path to main config')
-    parser.add_argument('--start', default=None,
+    parser.add_argument('--train-start', default=None,
                         help='Data start date (YYYY-MM-DD)')
-    parser.add_argument('--end', default=None,
+    parser.add_argument('--test-end', default=None,
                         help='Data end date (YYYY-MM-DD)')
     parser.add_argument('--universe', default=None,
                         help='Stock universe (hs300, zz500, all_a)')
@@ -757,11 +759,11 @@ if __name__ == '__main__':
 
     results = run_lstm_baseline(
         config_path=args.config,
-        start_date=args.start,
-        end_date=args.end,
         universe=args.universe,
+        train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
+        test_end_date=args.test_end,
         top_n_stocks=args.top_n,
         seq_len=args.seq_len,
         hidden_size=args.hidden_size,

@@ -34,6 +34,25 @@ from mcts_llm_alpha.evaluation import evaluate_formula_qlib, create_evaluator
 from mcts_llm_alpha.data import create_data_provider, MarketDataManager
 
 
+# Offline guard: block live data access outside the unified load_datasets.py
+# flow. See dataloader/_offline_guard.py. Opt in with MASE_ALLOW_LEGACY_FETCH=1.
+import os
+import sys
+
+
+def _mase_repo_root():
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d and d != os.path.dirname(d):
+        if os.path.exists(os.path.join(d, "load_datasets.py")):
+            return d
+        d = os.path.dirname(d)
+    raise RuntimeError("Cannot locate MASE repo root (load_datasets.py).")
+
+
+sys.path.insert(0, _mase_repo_root())
+from dataloader._offline_guard import assert_offline_or_optin as _mase_offline_guard
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='MCTS-LLM Alpha挖掘系统')
@@ -167,6 +186,7 @@ def main():
     
     # 尝试初始化Qlib
     try:
+        _mase_offline_guard("baselines/mcts_llm_alpha/run_search.py (qlib.init)")
         import qlib
         # 初始化Qlib
         qlib.init(provider_uri=config.data.qlib_provider_uri, region="cn")

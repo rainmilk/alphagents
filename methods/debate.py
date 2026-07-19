@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import warnings
 import os
+import time
 import json
 from datetime import datetime
 
@@ -172,6 +173,8 @@ class DebateEvaluator:
         chair_temperature: float = 0.2,
         # --- Execution control ---
         parallel_eval: bool = True,
+        request_timeout: float = 120.0,
+        max_retries: int = 3,
     ):
         """
         Initialize debate evaluator.
@@ -203,6 +206,8 @@ class DebateEvaluator:
         self.chair_base_url = chair_base_url or base_url
         self.chair_temperature = chair_temperature
         self.parallel_eval = parallel_eval
+        self.request_timeout = request_timeout
+        self.max_retries = max(1, int(max_retries))
 
         # Initialize OpenAI client for EXPERT agents
         self.client = None
@@ -428,29 +433,46 @@ class DebateEvaluator:
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
 
-        try:
-            resp = client.chat.completions.create(**kwargs)
-
-            # Debug: inspect resp type to catch non-standard responses
-            if not hasattr(resp, "choices"):
-                resp_type = type(resp).__name__
-                resp_preview = str(resp)[:200]
-                raise RuntimeError(
-                    f"Unexpected LLM response type '{resp_type}'. "
-                    f"Response preview: {resp_preview}"
+        last_err = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = client.chat.completions.create(
+                    timeout=self.request_timeout, **kwargs
                 )
 
-            content = resp.choices[0].message.content
-            if content is None:
-                raise RuntimeError("LLM returned empty content (None).")
-            return content
+                # Debug: inspect resp type to catch non-standard responses
+                if not hasattr(resp, "choices"):
+                    resp_type = type(resp).__name__
+                    resp_preview = str(resp)[:200]
+                    raise RuntimeError(
+                        f"Unexpected LLM response type '{resp_type}'. "
+                        f"Response preview: {resp_preview}"
+                    )
 
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            print(f"  [debate] LLM call failed ({type(e).__name__}): {e}")
-            print(f"  [debate] Traceback (last frame): {tb.splitlines()[-1] if tb else 'N/A'}")
-            raise
+                content = resp.choices[0].message.content
+                if content is None:
+                    raise RuntimeError("LLM returned empty content (None).")
+                return content
+
+            except Exception as e:
+                last_err = e
+                import traceback
+                tb = traceback.format_exc()
+                print(f"  [debate] LLM call attempt {attempt + 1}/{self.max_retries} "
+                      f"failed ({type(e).__name__}): {e}")
+                # Exponential backoff before retry (capped at 8s) to ride out
+                # transient 429/timeout bursts from the API.
+                if attempt < self.max_retries - 1:
+                    time.sleep(min(2 ** attempt, 8))
+
+        # All retries exhausted — surface the last captured error.
+        import traceback
+        tb = traceback.format_exc() if last_err else ""
+        print(f"  [debate] LLM call failed after {self.max_retries} attempts.")
+        print(f"  [debate] Traceback (last frame): {tb.splitlines()[-1] if tb else 'N/A'}")
+        if last_err:
+            raise last_err
+        raise RuntimeError("LLM call failed with no captured error.")
 
     def _independent_evaluation(self, factor_proposal: FactorProposal) -> List[AgentOpinion]:
         """
@@ -575,50 +597,47 @@ class DebateEvaluator:
             # Build context from previous round
             context = self._build_debate_context(previous_opinions, round_id)
 
-            for i, agent in enumerate(self.agents):
-                role_name = agent.value
-                system_prompt = ROLE_PROMPTS.get(role_name, ROLE_PROMPTS["Momentum Expert"])
+            # --- Parallelize per-agent evaluation within the round. ---
+            # All agents in a round read the SAME previous_opinions (the context
+            # built above), so they are mutually independent and can run
+            # concurrently. This is the dominant cost of the debate: previously
+            # n_rounds * n_agents SERIAL calls. Parallelizing cuts it to
+            # n_rounds batches, each bounded by the slowest of n_agents calls.
+            if self.parallel_eval and len(self.agents) > 1:
+                import concurrent.futures
 
-                user_prompt = (
-                    f"You are participating in round {round_id + 1}/{self.n_rounds} of a factor evaluation debate.\n\n"
-                    f"Factor to evaluate:\n"
-                    f"Expression: {factor_proposal.expression}\n"
-                    f"Description: {factor_proposal.description}\n\n"
-                    f"Other experts' opinions from previous round:\n{context}\n\n"
-                    f"Based on the above discussion, refine YOUR evaluation of this factor. "
-                    f"Respond in JSON with keys: 'score' (float 0-10), 'reasoning' (string), "
-                    f"'concerns' (list), 'strengths' (list), 'changed_mind' (bool, whether you revised your score)."
-                )
+                role_order = list(self.agents)  # snapshot to preserve order
+                future_to_role = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.agents)) as executor:
+                    for agent in role_order:
+                        future = executor.submit(
+                            self._evaluate_agent_in_round,
+                            agent, factor_proposal, context, round_id,
+                        )
+                        future_to_role[future] = agent
 
-                if self.use_llm and self.client:
-                    try:
-                        raw = self._call_llm(system_prompt, user_prompt, temperature=0.3)
-                        parsed = json.loads(raw)
-                        score = float(parsed["score"])
-                        reasoning = str(parsed.get("reasoning", ""))
-                        concerns = [str(c) for c in parsed.get("concerns", [])]
-                        strengths = [str(s) for s in parsed.get("strengths", [])]
-                    except Exception as e:
-                        print(f"    [debate] Round {round_id + 1} LLM failed for {role_name}: {e}. Using fallback.")
-                        score = self.rng.uniform(5.0, 9.0)
-                        reasoning = f"After debate round {round_id + 1}, I refine my opinion (fallback)."
-                        concerns = ["Addressed in debate (fallback)"]
-                        strengths = ["Refined through debate"]
-                else:
-                    score = self.rng.uniform(5.0, 9.0)
-                    reasoning = f"After debate round {round_id + 1}, I refine my opinion (mock)."
-                    concerns = ["Addressed in debate"]
-                    strengths = ["Refined through debate"]
+                    opinions_by_role = {}
+                    for future in concurrent.futures.as_completed(future_to_role):
+                        agent = future_to_role[future]
+                        try:
+                            opinions_by_role[agent] = future.result()
+                        except Exception as e:
+                            print(f"    [debate] Round {round_id + 1} parallel eval failed "
+                                  f"for {agent.value}: {e}")
+                            # Deterministic fallback on executor error
+                            opinions_by_role[agent] = self._fallback_round_opinion(
+                                agent, factor_proposal, round_id
+                            )
 
-                opinion = AgentOpinion(
-                    agent_role=agent,
-                    factor_proposal=factor_proposal,
-                    score=score,
-                    reasoning=reasoning,
-                    concerns=concerns,
-                    strengths=strengths,
-                )
-                opinions.append(opinion)
+                # Return in original role order
+                opinions = [opinions_by_role[agent] for agent in role_order]
+            else:
+                # Serial path (debug-friendly / single agent)
+                opinions = []
+                for agent in self.agents:
+                    opinions.append(
+                        self._evaluate_agent_in_round(agent, factor_proposal, context, round_id)
+                    )
 
             # Calculate consensus and disagreements
             scores = [op.score for op in opinions]
@@ -669,6 +688,77 @@ class DebateEvaluator:
             previous_opinions = opinions
 
         return debate_rounds
+
+    def _evaluate_agent_in_round(
+        self,
+        agent: "AgentRole",
+        factor_proposal: "FactorProposal",
+        context: str,
+        round_id: int,
+    ) -> "AgentOpinion":
+        """Evaluate one agent's refinement for a single debate round.
+
+        Extracted from the serial loop in ``_structured_debate`` so it can run
+        concurrently via ``ThreadPoolExecutor``. It is a pure function of
+        (agent, context, round_id) with no shared mutable state, so it is
+        thread-safe when dispatched across the thread pool.
+        """
+        role_name = agent.value
+        system_prompt = ROLE_PROMPTS.get(role_name, ROLE_PROMPTS["Momentum Expert"])
+
+        user_prompt = (
+            f"You are participating in round {round_id + 1}/{self.n_rounds} of a factor evaluation debate.\n\n"
+            f"Factor to evaluate:\n"
+            f"Expression: {factor_proposal.expression}\n"
+            f"Description: {factor_proposal.description}\n\n"
+            f"Other experts' opinions from previous round:\n{context}\n\n"
+            f"Based on the above discussion, refine YOUR evaluation of this factor. "
+            f"Respond in JSON with keys: 'score' (float 0-10), 'reasoning' (string), "
+            f"'concerns' (list), 'strengths' (list), 'changed_mind' (bool, whether you revised your score)."
+        )
+
+        if self.use_llm and self.client:
+            try:
+                raw = self._call_llm(system_prompt, user_prompt, temperature=0.3)
+                parsed = json.loads(raw)
+                score = float(parsed["score"])
+                reasoning = str(parsed.get("reasoning", ""))
+                concerns = [str(c) for c in parsed.get("concerns", [])]
+                strengths = [str(s) for s in parsed.get("strengths", [])]
+            except Exception as e:
+                print(f"    [debate] Round {round_id + 1} LLM failed for {role_name}: {e}. Using fallback.")
+                return self._fallback_round_opinion(agent, factor_proposal, round_id)
+        else:
+            # Mock mode
+            score = self.rng.uniform(5.0, 9.0)
+            reasoning = f"After debate round {round_id + 1}, I refine my opinion (mock)."
+            concerns = ["Addressed in debate"]
+            strengths = ["Refined through debate"]
+
+        return AgentOpinion(
+            agent_role=agent,
+            factor_proposal=factor_proposal,
+            score=score,
+            reasoning=reasoning,
+            concerns=concerns,
+            strengths=strengths,
+        )
+
+    def _fallback_round_opinion(
+        self,
+        agent: "AgentRole",
+        factor_proposal: "FactorProposal",
+        round_id: int,
+    ) -> "AgentOpinion":
+        """Deterministic fallback opinion when a round-eval LLM call fails."""
+        return AgentOpinion(
+            agent_role=agent,
+            factor_proposal=factor_proposal,
+            score=self.rng.uniform(5.0, 9.0),
+            reasoning=f"After debate round {round_id + 1}, I refine my opinion (fallback).",
+            concerns=["Addressed in debate (fallback)"],
+            strengths=["Refined through debate"],
+        )
 
     def _build_debate_context(self, opinions: List[AgentOpinion], round_id: int) -> str:
         """Build context string from previous round opinions."""

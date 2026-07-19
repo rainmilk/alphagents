@@ -14,16 +14,21 @@ data:
   # Stock universe
   universe:
     index: "hs300"  # hs300, zz500, all_a
-    start_date: "2019-01-01"
-    end_date: "2025-12-31"
+    start_date: "2020-01-01"
+    end_date: "2026-06-30"
     min_market_cap: 5e9  # 5 billion
     exclude_st: true
     exclude_suspended: true
   
   # Train/Test split (CRITICAL for preventing overfitting)
-  # Factors are evolved on TRAIN data, backtested on TEST data
-  train_end_date: "2023-12-31"  # Last date of training period
-  test_start_date: "2024-01-01"  # First date of test period
+  # Factors are evolved on TRAIN data, backtested on TEST data.
+  # train_start_date / test_end_date bound the two windows; they default to
+  # universe.start_date / universe.end_date when omitted. retrieve_dataset()
+  # slices these windows out of the FULL pre-fetched archive.
+  train_start_date: "2023-01-01"  # First date of training period (defaults to universe.start_date)
+  train_end_date: "2024-12-31"    # Last date of training period
+  test_start_date: "2025-01-01"   # First date of test period
+  test_end_date: "2025-06-30"     # Last date of test period (defaults to universe.end_date)
   # If these are not set, default to 80/20 split
   
   # Context window: prepend N train days to test_data as lookback so

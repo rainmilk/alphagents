@@ -11,9 +11,9 @@ Date: 2026-06-07
 Usage:
     python main.py              # Quick demo (no LLM required)
     python main.py --full       # Full end-to-end pipeline
-    python main.py --full --start 2023-01-01 --end 2024-12-31
+    python main.py --full --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
     python main.py --test --factor-path experiments/YYYYMMDD/results/final_factors.json
-    python main.py --test --factor-path PATH --start 2023-01-01 --end 2024-12-31
+    python main.py --test --factor-path PATH --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
 """
 
 import os
@@ -32,7 +32,7 @@ import config as global_config  # module holding experiment-dir tags (universe/s
 warnings.filterwarnings('ignore')
 
 # Import all modules
-from dataloader.loader import DataLoader, load_sample_data, load_real_data
+from dataloader.loader import DataLoader, load_sample_data, retrieve_dataset
 from backtest.engine import BacktestEngine
 
 # Import methods (with error handling for missing dependencies)
@@ -99,14 +99,12 @@ class AAAI2027Pipeline:
         
     def step1_load_data(
         self,
-        start_date: str = None,
-        end_date: str = None,
         universe: str = None,
         use_sample: bool = True,
-        data_source: str = "auto",
-        force_refresh: bool = False,
-        split_train_end: str = None,
-        split_test_start: str = None,
+        train_start_date: str = None,
+        train_end_date: str = None,
+        test_start_date: str = None,
+        test_end_date: str = None,
         forward_period: int = None,
         holding_period: int = None,
     ):
@@ -115,17 +113,20 @@ class AAAI2027Pipeline:
 
         Data source selection (single decision point):
         - use_sample=True  → fast synthetic data for testing (n_stocks=100, n_days=500)
-        - use_sample=False → real data via westock/AkShare/Tushare with cache
+        - use_sample=False → real data RETRIEVED from the local dataset store
+                             (datasets/{universe}_{start}_{end}.pkl). Pre-fetch it once
+                             with `python load_datasets.py ...`; load_data() never hits
+                             the network.
 
         Args:
-            start_date: Start date (YYYY-MM-DD), for real data only
-            end_date: End date (YYYY-MM-DD), for real data only
-            universe: Stock universe (hs300, zz500, all_a), for real data only
+            universe: Stock universe (hs300, zz500, all_a), for real data only.
+                      None → read from config['data']['universe'].
             use_sample: True=sample data, False=real data
-            data_source: 'westock', 'akshare', 'tushare', or 'auto'
             force_refresh: Skip cache and re-download real data
-            split_train_end: Explicit train end date (overrides config)
-            split_test_start: Explicit test start date (overrides config)
+            train_start_date: Explicit train start date (overrides config)
+            train_end_date: Explicit train end date (overrides config)
+            test_start_date: Explicit test start date (overrides config)
+            test_end_date: Explicit test end date (overrides config)
         """
 
         print("\n[Step 1] Loading data...")
@@ -139,17 +140,41 @@ class AAAI2027Pipeline:
             self._data_source_label = "sample"
             print(f"  [sample] Loaded: {self.price_data['close'].shape}")
         else:
-            # Real data via westock → AkShare → Tushare → synthetic fallback
-            self.price_data, self.fundamental_data, self.industry_data = load_real_data(
-                universe=universe or self.config['data']['universe']['index'],
-                start_date=start_date or self.config['data']['universe']['start_date'],
-                end_date=end_date or self.config['data']['universe']['end_date'],
-                source=data_source,
-                force_refresh=force_refresh,
-                config=self.config,
+            # Real data: retrieve the pre-fetched archive from the local store.
+            # The actual download + preprocessing happens once in
+            # `python load_datasets.py ...` (DataLoader.fetch_and_store_dataset).
+            # If the archive is missing, retrieve_dataset raises a FileNotFoundError
+            # that tells you exactly which `load_datasets.py` command to run.
+            _univ = self.config['data']['universe']
+            _data = self.config['data']
+
+            # Train/test windows (explicit params override config). Passed through
+            # to retrieve_dataset so the returned bundle honors the SAME 4
+            # boundaries as split_data() below — mirrors the baselines' load_data().
+            # (bundle.train/.test are re-carved by split_data() for the context
+            # window, but keeping the slices consistent avoids surprises.)
+            _train_start = train_start_date or _data.get('train_start_date')
+            _train_end = train_end_date or _data.get('train_end_date')
+            _test_start = test_start_date or _data.get('test_start_date')
+            _test_end = test_end_date or _data.get('test_end_date')
+            bundle = retrieve_dataset(
+                universe=universe or _univ.get('index'),
+                train_start=_train_start,
+                train_end=_train_end,
+                test_start=_test_start,
+                test_end=_test_end,
             )
+            self.price_data, self.fundamental_data, self.industry_data = bundle.full
+            self.train_data = bundle.train
+            self.test_data = bundle.test
+            global_config.train_start_date = train_start_date or _data.get('train_start_date') or 'na'
+            global_config.train_end_date = train_end_date or _data.get('train_end_date') or 'na'
+            global_config.test_start_date = test_start_date or _data.get('test_start_date') or 'na'
+            global_config.test_end_date = test_end_date or _data.get('test_end_date') or 'na'
             self._data_source_label = "real"
-            print(f"  [real] Loaded: {self.price_data['close'].shape}")
+            print(f"  [real] Loaded full: {self.price_data['close'].shape}  "
+                  f"train: {bundle.train[0]['close'].shape}  "
+                  f"test: {bundle.test[0]['close'].shape}")
 
         # Initialize backtest engine
         self.backtest_engine = BacktestEngine(
@@ -171,8 +196,6 @@ class AAAI2027Pipeline:
         # L363-365), which is bypassed here because data is assigned directly.
         _univ_cfg = self.config['data']['universe']
         global_config.universe = universe or _univ_cfg.get('index', 'hs300')
-        global_config.start_date = start_date or _univ_cfg.get('start_date', 'na')
-        global_config.end_date = end_date or _univ_cfg.get('end_date', 'na')
 
         # Forward/holding tags so experiment dirs match the baseline format
         # experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/...
@@ -189,44 +212,57 @@ class AAAI2027Pipeline:
         )
 
         # Read split config from explicit params, config.yaml, or defaults
-        train_end_date = split_train_end or self.config.get('data', {}).get('train_end_date', None)
-        test_start_date = split_test_start or self.config.get('data', {}).get('test_start_date', None)
+        train_start_date = train_start_date or self.config.get('data', {}).get('train_start_date', None)
+        train_end_date = train_end_date or self.config.get('data', {}).get('train_end_date', None)
+        test_start_date = test_start_date or self.config.get('data', {}).get('test_start_date', None)
+        test_end_date = test_end_date or self.config.get('data', {}).get('test_end_date', None)
         
-        if train_end_date is None:
-            # Default: use 80/20 split (80% train, 20% test)
-            # For default date range 2019-01-01 to 2024-12-31, this is ~2023-12-31
-            dates = self.price_data['close'].index
-            split_idx = int(len(dates) * 0.8)
-            train_end_date = dates[split_idx - 1].strftime('%Y-%m-%d')
-            test_start_date = dates[split_idx].strftime('%Y-%m-%d')
-            print(f"  [split] Using default 80/20 split: train_end={train_end_date}, test_start={test_start_date}")
-        elif test_start_date is None:
-            # train_end specified but test_start not — set test_start to day after
-            test_start_date = train_end_date
-            print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
-        else:
-            print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
+        # if train_end_date is None:
+        #     # Default: use 80/20 split (80% train, 20% test)
+        #     # For default date range 2019-01-01 to 2024-12-31, this is ~2023-12-31
+        #     dates = self.price_data['close'].index
+        #     split_idx = int(len(dates) * 0.8)
+        #     train_end_date = dates[split_idx - 1].strftime('%Y-%m-%d')
+        #     test_start_date = dates[split_idx].strftime('%Y-%m-%d')
+        #     print(f"  [split] Using default 80/20 split: train_end={train_end_date}, test_start={test_start_date}")
+        # elif test_start_date is None:
+        #     # train_end specified but test_start not — set test_start to day after
+        #     test_start_date = train_end_date
+        #     print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
+        # else:
+        #     print(f"  [split] Using explicit split: train_end={train_end_date}, test_start={test_start_date}")
         
         # Context days: prepend N training days to test_data so rolling-window
         # factor expressions (ts_mean, ts_std, etc.) have history on day 1.
         context_days = self.config.get('data', {}).get('context_days', 30)
         self.train_data, self.test_data = self.data_loader.split_data(
+            train_start_date=train_start_date,
             train_end_date=train_end_date,
             test_start_date=test_start_date,
+            test_end_date=test_end_date,
             context_days=context_days,
         )
+        self._train_start_date = train_start_date
         self._train_end_date = train_end_date
         self._test_start_date = test_start_date
+        self._test_end_date = test_end_date
         self._context_days = context_days
         
         # --- Save train/test data to data directory ---
-        self._save_split_data(train_end_date, test_start_date)
+        self._save_split_data(
+            train_start_date=train_start_date,
+            train_end_date=train_end_date,
+            test_start_date=test_start_date,
+            test_end_date=test_end_date,
+        )
         
         print(f"  [✓] Train/Test split complete")
-        print(f"       Train: {train_end_date}, Test: {test_start_date}")
+        print(f"       Train: {train_start_date or '(archive start)'} → {train_end_date}")
+        print(f"       Test:  {test_start_date} → {test_end_date or '(archive end)'}")
         print("  [✓] Data loading complete")
         
-    def _save_split_data(self, train_end_date: str, test_start_date: str):
+    def _save_split_data(self, train_start_date: str = None, train_end_date: str = None,
+                         test_start_date: str = None, test_end_date: str = None):
         """
         Persist train/test data as CSV files under data/train/ and data/test/.
 
@@ -273,8 +309,10 @@ class AAAI2027Pipeline:
         test_dates = self.test_data['price_data']['close'].index
         
         split_info = {
+            "train_start_date": train_start_date,
             "train_end_date": train_end_date,
             "test_start_date": test_start_date,
+            "test_end_date": test_end_date,
             "train_dates": f"{train_dates[0].strftime('%Y-%m-%d')} ~ {train_dates[-1].strftime('%Y-%m-%d')}",
             "test_dates": f"{test_dates[0].strftime('%Y-%m-%d')} ~ {test_dates[-1].strftime('%Y-%m-%d')}",
             "train_days": int(len(train_dates)),
@@ -1192,14 +1230,14 @@ class AAAI2027Pipeline:
 
     def run_full_pipeline(
         self,
-        start_date: str = "2021-01-01",
-        end_date: str = "2025-12-31",
         use_sample: bool = True,
-        data_source: str = "auto",
         n_evolution_rounds: int = 5,
         output_dir: str = None,
-        split_train_end: str = None,
-        split_test_start: str = None,
+        universe: str = None,
+        train_start_date: str = None,
+        train_end_date: str = None,
+        test_start_date: str = None,
+        test_end_date: str = None,
         forward_period: int = None,
         holding_period: int = None,
         test_data=None,
@@ -1217,8 +1255,10 @@ class AAAI2027Pipeline:
             data_source: Real data source ('westock', 'akshare', 'tushare', 'auto')
             n_evolution_rounds: Number of evolution rounds (overrides config)
             output_dir: Output directory for step9. None = experiments/{YYYYMMDD}/results/
-            split_train_end: Explicit train end date for train/test split
-            split_test_start: Explicit test start date for train/test split
+            train_start_date: Explicit train start date for train/test split
+            train_end_date: Explicit train end date for train/test split
+            test_start_date: Explicit test start date for train/test split
+            test_end_date: Explicit test end date for train/test split
             forward_period: Forward return horizon in trading days (None → config or 10)
             holding_period: Backtest holding period in trading days.
                            1 = daily rebalance, 5 = weekly, 20 = monthly.
@@ -1235,13 +1275,22 @@ class AAAI2027Pipeline:
         if holding_period is not None:
             self.config.setdefault('backtest', {}).setdefault('trading', {})['holding_period'] = holding_period
 
+        # Resolve the 4 date boundaries with config fallbacks.
+        # (Mirrors the baselines' `loader.data_config` pattern; main.py's config
+        #  lives in self.config['data'] instead of a standalone loader object.)
+        train_start = train_start_date or self.config.get('data', {}).get('train_start_date', '2023-01-01')
+        train_end   = train_end_date   or self.config.get('data', {}).get('train_end_date', '2023-12-31')
+        test_start  = test_start_date  or self.config.get('data', {}).get('test_start_date', '2024-01-01')
+        test_end    = test_end_date    or self.config.get('data', {}).get('test_end_date', '2025-06-30')
+
         # Run all steps
         self.step1_load_data(
-            start_date, end_date,
             use_sample=use_sample,
-            data_source=data_source,
-            split_train_end=split_train_end,
-            split_test_start=split_test_start,
+            universe=universe,
+            train_start_date=train_start,
+            train_end_date=train_end,
+            test_start_date=test_start,
+            test_end_date=test_end,
             forward_period=forward_period,
             holding_period=holding_period,
         )
@@ -1678,10 +1727,10 @@ Examples:
   python main.py --full                                   Full pipeline with sample data
   python main.py --full --real                            Full pipeline with real data
   python main.py --full --real --source westock            Real data via westock (WorkBuddy)
-  python main.py --full --real --start 2023-01-01 --end 2024-12-31
+  python main.py --full --real --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
   python main.py --full --real --force-refresh             Skip cache, re-download
   python main.py --test --factor-path experiments/20260601/results/final_factors.json
-  python main.py --test --factor-path PATH --real --start 2023-01-01 --end 2024-12-31
+  python main.py --test --factor-path PATH --real --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
   python main.py --test --factor-path PATH --holding-period 5
         """,
     )
@@ -1708,12 +1757,20 @@ Examples:
         help='Skip cache and re-download real data',
     )
     parser.add_argument(
-        '--start', type=str, default='2022-01-01',
-        help='Start date for real data (YYYY-MM-DD, default: 2022-01-01)',
+        '--train-start', type=str, default='2022-01-01',
+        help='Train start date (YYYY-MM-DD, default: 2022-01-01)',
     )
     parser.add_argument(
-        '--end', type=str, default='2024-12-31',
-        help='End date for real data (YYYY-MM-DD, default: 2024-12-31)',
+        '--test-end', type=str, default='2024-12-31',
+        help='Test end date (YYYY-MM-DD, default: 2024-12-31)',
+    )
+    parser.add_argument(
+        '--train-end', type=str, default='2023-12-31',
+        help='Train end date (YYYY-MM-DD, default: 2023-12-31)',
+    )
+    parser.add_argument(
+        '--test-start', type=str, default='2024-01-01',
+        help='Test start date (YYYY-MM-DD, default: 2024-01-01)',
     )
     parser.add_argument(
         '--universe', type=str, default='hs300',
@@ -1777,10 +1834,12 @@ Examples:
             pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
         
         metrics = pipeline.run_full_pipeline(
-            start_date=args.start,
-            end_date=args.end,
+            train_start_date=args.train_start,
+            train_end_date=args.train_end,
+            test_start_date=args.test_start,
+            test_end_date=args.test_end,
             use_sample=not args.real,
-            data_source=args.source,
+            universe=args.universe,
             n_evolution_rounds=args.n_evolution_rounds,
             output_dir=args.output_dir,
             forward_period=args.forward_period,
@@ -1823,15 +1882,11 @@ Examples:
             exit(1)
 
         # Load data (step1) to get test_data for the test period.
-        # The split (train/test) is controlled by split_train_end / split_test_start
+        # The split (train/test) is controlled by train_end_date / test_start_date
         # from config, which defaults to the last ~2 years as test.
         pipeline.step1_load_data(
-            start_date=args.start,
-            end_date=args.end,
             use_sample=not args.real,
-            data_source=args.source,
-            force_refresh=args.force_refresh,
-            forward_period=None,
+            forward_period=args.forward_period,
             holding_period=args.holding_period,
         )
 

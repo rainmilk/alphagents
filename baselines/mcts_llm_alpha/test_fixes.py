@@ -68,6 +68,7 @@ def test_universe_loading():
     print("=" * 60)
     
     try:
+        _mase_offline_guard("baselines/mcts_llm_alpha/test_fixes.py::test_universe_loading (qlib.init)")
         # 初始化Qlib
         import qlib
         qlib.init(provider_uri=os.environ["QLIB_PROVIDER_URI"], region="cn")

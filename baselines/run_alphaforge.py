@@ -73,8 +73,29 @@ def convert_to_multindex(prices: pd.DataFrame) -> pd.DataFrame:
     # Pivot to (date, symbol) format
     result = prices.pivot(index='date', columns='symbol')
     result.columns.names = ['field', 'symbol']
-    
+
     return result
+
+
+def _price_dict_to_long(pd_dict: dict) -> pd.DataFrame:
+    """
+    Convert a main-DataLoader price dict (date-indexed OHLCV DataFrames) into the
+    long-format (symbol, date, open, high, low, close, volume) frame used by
+    AlphaForge's Stage 1/2 factor mining.
+    """
+    rows = []
+    for date in pd_dict['close'].index:
+        for symbol in pd_dict['close'].columns:
+            rows.append({
+                'symbol': symbol,
+                'date': date,
+                'open': pd_dict['open'].loc[date, symbol] if 'open' in pd_dict else np.nan,
+                'high': pd_dict['high'].loc[date, symbol] if 'high' in pd_dict else np.nan,
+                'low': pd_dict['low'].loc[date, symbol] if 'low' in pd_dict else np.nan,
+                'close': pd_dict['close'].loc[date, symbol],
+                'volume': pd_dict['volume'].loc[date, symbol] if 'volume' in pd_dict else np.nan,
+            })
+    return pd.DataFrame(rows)
 
 
 def compute_returns(prices_multindex: pd.DataFrame) -> pd.DataFrame:
@@ -1389,8 +1410,10 @@ def run_alphaforge_baseline(
     config_path: str = "config/config.yaml",
     dataloader=None,
     prices: pd.DataFrame = None,
-    start_date: str = None,
-    end_date: str = None,
+    train_start_date: str = None,
+    train_end_date: str = None,
+    test_start_date: str = None,
+    test_end_date: str = None,
     instruments: str = None,
     top_n_stocks: int = None,
     n_factors: int = 10,
@@ -1401,8 +1424,6 @@ def run_alphaforge_baseline(
     use_gan: bool = True,
     forward_period: int = 10,
     holding_period: int = None,  # None -> use AlphaForgeConfig default (1)
-    train_end_date: str = None,
-    test_start_date: str = None,
     context_days: int = 30,
 ) -> Dict:
     """
@@ -1423,8 +1444,8 @@ def run_alphaforge_baseline(
         config_path: Path to config YAML (used if dataloader/prices not provided)
         dataloader: Main project DataLoader (optional)
         prices: Price data DataFrame (optional)
-        start_date: Start date (overrides config)
-        end_date: End date (overrides config)
+        train_start_date: Start date (overrides config)
+        test_end_date: End date (overrides config)
         instruments: Instrument list name (overrides config)
         top_n_stocks: Number of stocks in portfolio (overrides config)
         n_factors: Number of factors to combine
@@ -1447,14 +1468,14 @@ def run_alphaforge_baseline(
             train_end, test_start
     """
     # Load config if needed (for defaults)
-    if config_path and (start_date is None or end_date is None or instruments is None or top_n_stocks is None):
+    if config_path and (train_start_date is None or test_end_date is None or instruments is None or top_n_stocks is None):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
-            if start_date is None:
-                start_date = config['data']['universe'].get('start_date', '2019-01-01')
-            if end_date is None:
-                end_date = config['data']['universe'].get('end_date', '2025-12-31')
+            if train_start_date is None:
+                train_start_date = config['data']['universe'].get('start_date', '2019-01-01')
+            if test_end_date is None:
+                test_end_date = config['data']['universe'].get('end_date', '2025-12-31')
             if instruments is None:
                 instruments = config['data']['universe'].get('name', 'csi300')
             if top_n_stocks is None:
@@ -1462,79 +1483,87 @@ def run_alphaforge_baseline(
         except Exception as e:
             print(f"Warning: Could not load config from {config_path}: {e}")
             # Use defaults
-            if start_date is None:
-                start_date = "2023-01-01"
-            if end_date is None:
-                end_date = "2024-12-31"
+            if train_start_date is None:
+                train_start_date = "2023-01-01"
+            if test_end_date is None:
+                test_end_date = "2024-12-31"
             if instruments is None:
                 instruments = "csi300"
             if top_n_stocks is None:
                 top_n_stocks = 50
     
-    # Load data
-    price_data = None  # Raw price_data from DataLoader (if available)
+    # Load data (new DataLoader DatasetBundle contract — train/test slices are
+    # produced centrally by loader.load_data, so no manual date-masking here).
     loader = None
+    price_data = None
+    prices = None           # ALL data (long format) — Stage 2 walk-forward
+    prices_train = None     # TRAIN data (long format) — Stage 1
+    close_test = None       # TEST close (date × stock) — Stage 3
+    train_end = train_end_date
+    test_start = test_start_date
 
     if prices is None and dataloader is None and config_path:
-        # Load from config
+        # Load from config via the new DataLoader bundle contract
         print("Loading data from config...")
         try:
             from dataloader.loader import DataLoader as ProjectDataLoader
             loader = ProjectDataLoader(config_path=config_path)
-            price_data, _, _ = loader.load_data(start_date=start_date, end_date=end_date)
-            
-            # Convert to DataFrame format expected by our functions
-            rows = []
-            for date in price_data['close'].index:
-                for symbol in price_data['close'].columns:
-                    rows.append({
-                        'symbol': symbol,
-                        'date': date,
-                        'open': price_data['open'].loc[date, symbol] if 'open' in price_data else np.nan,
-                        'high': price_data['high'].loc[date, symbol] if 'high' in price_data else np.nan,
-                        'low': price_data['low'].loc[date, symbol] if 'low' in price_data else np.nan,
-                        'close': price_data['close'].loc[date, symbol],
-                        'volume': price_data['volume'].loc[date, symbol] if 'volume' in price_data else np.nan,
-                    })
-            prices = pd.DataFrame(rows)
+            train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+            train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+            test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+            test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+
+            bundle = loader.load_data(train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+            train_price, train_fund, train_ind = bundle.train
+            test_price, test_fund, test_ind = bundle.test
+            price_data = bundle.full[0]  # FULL span
+
+            prices = _price_dict_to_long(price_data)         # ALL data
+            prices_train = _price_dict_to_long(train_price)   # TRAIN only
+            close_test = test_price['close']                  # TEST close
             print(f"  Loaded {len(prices)} records")
         except Exception as e:
             raise ValueError(f"Failed to load data from config: {e}. Please provide dataloader or prices.")
-    
+
     elif dataloader is not None:
         print("Loading data from DataLoader...")
-        prices = dataloader.get_prices(start_date, end_date)
-        # Try to get loader for config access
-        if hasattr(dataloader, 'data_config'):
-            loader = dataloader
-    
+        loader = dataloader
+        train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
+        train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
+        test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
+        test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
+        bundle = loader.load_data(train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
+        train_price, train_fund, train_ind = bundle.train
+        test_price, test_fund, test_ind = bundle.test
+        price_data = bundle.full[0]
+        prices = _price_dict_to_long(price_data)
+        prices_train = _price_dict_to_long(train_price)
+        close_test = test_price['close']
+
     if prices is None:
         raise ValueError("Must provide either dataloader, prices, or a valid config_path")
-    
-    # ── Determine train/test split ──
+
+    # ── Determine train/test split (timestamps used by Stage 3 filtering) ──
     print("\nDetermining train/test split...")
     _cfg = loader.data_config if (loader is not None and hasattr(loader, 'data_config')) else {}
-    train_end = train_end_date or _cfg.get('train_end_date', '2023-12-31')
-    test_start = test_start_date or _cfg.get('test_start_date', '2024-01-01')
+    if train_end is None:
+        train_end = _cfg.get('train_end_date', '2023-12-31')
+    if test_start is None:
+        test_start = _cfg.get('test_start_date', '2024-01-01')
     test_start_ts = pd.Timestamp(test_start)
     print(f"  Train end: {train_end}, Test start: {test_start}")
 
-    # ── Get close prices (date × stock wide format) ──
-    if price_data is not None:
-        close_all = price_data['close']
-    else:
-        # Convert long-format prices to MultiIndex to extract close
-        prices_multindex = convert_to_multindex(prices)
-        close_all = prices_multindex['close']
-
-    # Split close into train and test
-    close_test = close_all[close_all.index >= test_start_ts]
-    print(f"  Train close: {(close_all.index < test_start_ts).sum()} days, "
-          f"Test close: {len(close_test)} days")
-
-    # ── Split prices (long format) into train ──
-    prices['date'] = pd.to_datetime(prices['date'])
-    prices_train = prices[prices['date'] < test_start_ts].copy()
+    # Direct `prices` input path (no DataLoader): the only available source is the
+    # supplied frame, so derive the test/train slices by masking it here.
+    if close_test is None or prices_train is None:
+        if price_data is not None:
+            close_all = price_data['close']
+        else:
+            close_all = convert_to_multindex(prices)['close']
+        close_test = close_all[close_all.index >= test_start_ts]
+        prices = prices.copy()
+        prices['date'] = pd.to_datetime(prices['date'])
+        prices_train = prices[prices['date'] < test_start_ts].copy()
     print(f"  Train prices: {len(prices_train)} records, All prices: {len(prices)} records")
     
     # Create config
@@ -1555,8 +1584,8 @@ def run_alphaforge_baseline(
     # ── Parameter-tagged, date-isolated run directory ──
     method_name = "alphaforge"
     _u = instruments or _cfg.get('universe', {}).get('index', 'csi300')
-    _s = start_date or _cfg.get('universe', {}).get('start_date', 'na')
-    _e = end_date or _cfg.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or _cfg.get('universe', {}).get('start_date', 'na')
+    _e = test_end_date or _cfg.get('universe', {}).get('end_date', 'na')
     _fp = forward_period
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -1602,8 +1631,8 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Run AlphaForge baseline")
     parser.add_argument("--config-path", type=str, default="config/config.yaml", help="Path to config YAML")
-    parser.add_argument("--start", type=str, default=None, help="Start date (overrides config)")
-    parser.add_argument("--end", type=str, default=None, help="End date (overrides config)")
+    parser.add_argument("--train-start", type=str, default=None, help="Start date (overrides config)")
+    parser.add_argument("--test-end", type=str, default=None, help="End date (overrides config)")
     parser.add_argument("--instruments", type=str, default=None, help="Instruments list (overrides config)")
     parser.add_argument("--top-n", type=int, default=None, help="Number of stocks in portfolio (overrides config)")
     parser.add_argument("--n-factors", type=int, default=10, help="Number of factors to combine")
@@ -1632,8 +1661,10 @@ if __name__ == "__main__":
 
     results = run_alphaforge_baseline(
         config_path=args.config_path,
-        start_date=args.start,
-        end_date=args.end,
+        train_start_date=args.train_start,
+        train_end_date=args.train_end,
+        test_start_date=args.test_start,
+        test_end_date=args.test_end,
         instruments=args.instruments,
         top_n_stocks=args.top_n,
         n_factors=args.n_factors,
@@ -1643,8 +1674,6 @@ if __name__ == "__main__":
         use_gan=args.use_gan,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
-        train_end_date=args.train_end,
-        test_start_date=args.test_start,
         context_days=args.context_days,
     )
     

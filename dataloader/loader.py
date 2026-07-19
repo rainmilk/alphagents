@@ -17,6 +17,7 @@ import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 import yaml
 import warnings
 
@@ -42,6 +43,136 @@ def _load_cache(cache_file: str):
         with open(cache_file, 'rb') as f:
             return pd.read_pickle(f)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Local dataset store (pre-fetched, queryable by universe + date range)
+# ---------------------------------------------------------------------------
+# Per the project workflow, raw market data is fetched ONCE by the standalone
+# `load_datasets.py` CLI (which calls load_real_data + preprocess and persists
+# the result here). Every other entry point (MASE main.py, the 9 baselines)
+# then RETRIEVES the requested (universe, start_date, end_date) slice from this
+# local store via DataLoader.load_data() — no network access at experiment time.
+DATASETS_DIR = "datasets"
+
+
+def dataset_path(universe: str, start_date: str = None, end_date: str = None) -> str:
+    """Canonical path of a pre-fetched dataset archive.
+
+    The filename encodes the exact (universe, start_date, end_date) triple so
+    that retrieval is an exact-key lookup — no date slicing needed.
+    """
+    file_name = f"{universe}.pkl" if end_date is None else f"{universe}_{start_date}_{end_date}.pkl"
+    return os.path.join(DATASETS_DIR, file_name)
+
+
+def _slice_dataset(triple, start: str, end: str):
+    """Slice a (price_data, fundamental_data, industry_data) triple to [start, end].
+
+    price_data / fundamental_data are dicts of date-indexed DataFrames; they are
+    cropped with pandas label-based `.loc[start:end]` (inclusive on both ends).
+    industry_data is time-invariant (indexed by stock code), so it is returned
+    unchanged.
+    """
+    price_data, fundamental_data, industry_data = triple
+    sliced_price = {k: v.loc[start:end] for k, v in price_data.items()}
+    sliced_fund = (
+        {k: v.loc[start:end] for k, v in fundamental_data.items()}
+        if fundamental_data else {}
+    )
+    return sliced_price, sliced_fund, industry_data
+
+
+@dataclass
+class DatasetBundle:
+    """Returned by retrieve_dataset() / DataLoader.load_data().
+
+    Holds the full pre-fetched triple plus train/test slices cut from it.
+    Each component is a (price_data, fundamental_data, industry_data) triple:
+      - price_data:       dict of DataFrames [open, high, low, close, volume, amount]
+      - fundamental_data: dict of DataFrames (empty dict if unavailable)
+      - industry_data:    Series indexed by stock code (time-invariant)
+
+    Convenience properties (.price_data / .fundamental_data / .industry_data)
+    expose the FULL triple's elements so legacy code that only needs the full
+    span keeps working.
+    """
+    full: Tuple
+    train: Tuple
+    test: Tuple
+
+    @property
+    def price_data(self):
+        return self.full[0]
+
+    @property
+    def fundamental_data(self):
+        return self.full[1]
+
+    @property
+    def industry_data(self):
+        return self.full[2]
+
+
+def retrieve_dataset(
+    universe: str,
+    train_start: str = None,
+    train_end: str = None,
+    test_start: str = None,
+    test_end: str = None,
+    full_start: str = None,
+    full_end: str = None,
+):
+    """Load a pre-fetched dataset from the local store and slice train/test.
+
+    The archive (datasets/{universe}_{full_start}_{full_end}.pkl) is produced
+    once by `python load_datasets.py --universe ... --start-date ... --end-date ...`
+    and contains the FULL data span. This function retrieves it and cuts out the
+    (train_start, train_end) and (test_start, test_end) windows on demand, so
+    every experiment shares one pre-fetched archive and a single split location.
+
+    Args:
+        universe, full_start, full_end: identify the pre-fetched archive
+            (must match what `load_datasets.py` stored).
+        train_start, train_end: training window (YYYY-MM-DD, inclusive).
+            Defaults to the full span when omitted.
+        test_start, test_end: test window (YYYY-MM-DD, inclusive).
+            Defaults to the full span when omitted.
+        (Pass the project's train_end_date / test_start_date from config to get
+         a real train/test split; omit them to get the full span in both.)
+
+    Returns:
+        DatasetBundle with .full / .train / .test, each a
+        (price_data, fundamental_data, industry_data) triple.
+
+    Raises:
+        FileNotFoundError: if no matching archive exists, with the exact
+            `load_datasets.py` command to run.
+    """
+    path = dataset_path(universe, full_start, full_end)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Local dataset not found: {path}\n"
+            f"  → Pre-fetch the FULL span once with:\n"
+            f"      python load_datasets.py --universe {universe} "
+            f"--start-date {full_start} --end-date {full_end}\n"
+            f"  (retrieve_dataset() only slices from this local store and "
+            f"never hits the network)"
+        )
+    with open(path, 'rb') as f:
+        full = pd.read_pickle(f)
+
+    # Resolve train/test windows. When a bound is omitted we fall back to the
+    # full span so callers that don't care about splitting still get a usable
+    # bundle (train/test == full).
+    train_start = train_start or full_start
+    train_end = train_end or full_end
+    test_start = test_start or full_start
+    test_end = test_end or full_end
+
+    train = _slice_dataset(full, train_start, train_end)
+    test = _slice_dataset(full, test_start, test_end)
+    return DatasetBundle(full=full, train=train, test=test)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,48 +1558,118 @@ class DataLoader:
         
     def load_data(
         self,
+        universe: str = None,
+        train_start: str = None,
+        train_end: str = None,
+        test_start: str = None,
+        test_end: str = None,
+        full_start: str = None,
+        full_end: str = None
+    ) -> DatasetBundle:
+        """
+        Retrieve the pre-fetched dataset for (universe, full_start, full_end)
+        from the local store and return train/test slices.
+
+        This method NEVER downloads data. Populate the store once with
+        `python load_datasets.py --universe ... --start-date ... --end-date ...`
+        (the FULL span). If the archive is missing, retrieve_dataset raises a
+        FileNotFoundError with run instructions.
+
+        Args:
+            full_start, full_end: the FULL pre-fetch span (YYYY-MM-DD); fall
+                back to config data.universe.* if None.
+            universe: Stock universe (hs300, zz500, all_a); falls back to config.
+            train_start, train_end, test_start, test_end: train/test windows
+                (YYYY-MM-DD); fall back to config split dates
+                (train_start_date / train_end_date / test_start_date /
+                test_end_date) if None. Omit all four to get the full span in
+                both .train and .test.
+            force_refresh: accepted for signature compatibility, ignored here —
+                re-fetching is done via `load_datasets.py --force-refresh`.
+
+        Returns:
+            DatasetBundle with .full / .train / .test, each a
+            (price_data, fundamental_data, industry_data) triple. The loader's
+            .price_data / .fundamental_data / .industry_data are set to the
+            FULL triple; .train_data / .test_data hold the sliced tuples.
+        """
+        # full_start = full_start or self.data_config['universe']['start_date']
+        # full_end = full_end or self.data_config['universe']['end_date']
+        universe = universe or self.data_config['universe']['index']
+        d = self.data_config
+        train_start = train_start or d.get('train_start_date', full_start)
+        train_end = train_end or d.get('train_end_date', full_end)
+        test_start = test_start or d.get('test_start_date', full_start)
+        test_end = test_end or d.get('test_end_date', full_end)
+
+        print(f"[loader] Retrieving local dataset: {universe}")
+
+        bundle = retrieve_dataset(
+            universe, train_start, train_end, test_start, test_end, full_start, full_end
+        )
+
+        self.price_data, self.fundamental_data, self.industry_data = bundle.full
+        self.train_data = bundle.train
+        self.test_data = bundle.test
+
+        return bundle
+
+    def fetch_and_store_dataset(
+        self,
         start_date: str = None,
         end_date: str = None,
         universe: str = None,
+        source: str = None,
         force_refresh: bool = False,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    ) -> DatasetBundle:
         """
-        Load stock data for the specified period and universe.
+        Fetch real data from the network source, preprocess it, and persist it
+        to the local dataset store (datasets/{universe}_{start}_{end}.pkl).
+
+        This is the ONLY method that downloads data. It is intended to be called
+        by the standalone `load_datasets.py` CLI. Because the already-processed
+        triple is stored, subsequent load_data() calls are pure in-memory
+        retrieval (no re-preprocessing, no network).
 
         Args:
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD)
-            universe: Stock universe (hs300, zz500, all_a)
-            force_refresh: Skip cache and re-download
+            start_date, end_date, universe: the FULL pre-fetch span (config
+                fallback applies). NOTE: these name the full archive span, not a
+                train/test split — splitting happens at retrieve time.
+            source: data source override ('westock'/'tushare'/'akshare'/'auto')
+            force_refresh: if False and the archive already exists, skip the
+                fetch and return the stored bundle; if True, always re-fetch.
 
         Returns:
-            Tuple of (price_data, fundamental_data, industry_series)
-            - price_data: Dict of DataFrames with keys [open, high, low, close, volume, amount]
-            - fundamental_data: Dict of DataFrames
-            - industry_series: Series, index = stock codes
+            DatasetBundle (see retrieve_dataset) — .full holds the fetched
+            triple; .train/.test equal .full when no split bounds are given.
+            The (price_data, fundamental_data, industry_series) triple.
         """
         start_date = start_date or self.data_config['universe']['start_date']
         end_date = end_date or self.data_config['universe']['end_date']
         universe = universe or self.data_config['universe']['index']
-        source = self.data_config.get('source', 'auto')
+        source = source or self.data_config.get('source', 'auto')
 
-        print(f"Loading data from {start_date} to {end_date}, universe: {universe}")
+        path = dataset_path(universe, start_date, end_date)
+        if os.path.exists(path) and not force_refresh:
+            print(f"[loader] Dataset already exists, skipping fetch: {path}")
+            return retrieve_dataset(universe, start_date, end_date)
 
-        # Use the centralized real-data loader (handles cache + fallback)
+        print(f"[loader] Fetching data from {start_date} to {end_date}, universe: {universe} (source={source})")
+
+        # Centralized real-data loader. force_refresh=True bypasses the old
+        # date-blind data/cache.pkl so we always pull the requested range
+        # straight from the source rather than a possibly-wrong cached slice.
         price_data, fundamental_data, industry_data = load_real_data(
             universe=universe,
             start_date=start_date,
             end_date=end_date,
             source=source,
-            force_refresh=force_refresh,
+            force_refresh=True,
             config=self.config,
         )
 
-        # Filter both price_data and fundamental_data to actual trading days only.
-        # dates was built with freq='B' (weekdays), which still includes Chinese public
-        # holidays (Spring Festival, National Day, etc.).  Those rows are all-NaN in
-        # price_data['close'].  We derive the real trading-day index from the rows that
-        # have at least one non-NaN close value and reindex everything to it.
+        # Filter to actual trading days only (drop holiday weekdays that are
+        # all-NaN in close). Mirrors the historical load_data() preprocessing.
         if price_data and 'close' in price_data:
             actual_trading_days = price_data['close'].dropna(how='all').index
             n_removed = len(price_data['close'].index) - len(actual_trading_days)
@@ -1485,12 +1686,18 @@ class DataLoader:
         price_data = self._preprocess_price_data(price_data)
         fundamental_data = self._preprocess_fundamental_data(fundamental_data)
 
+        # Persist the fully-processed triple to the local store
+        os.makedirs(DATASETS_DIR, exist_ok=True)
+        with open(path, 'wb') as f:
+            pd.to_pickle((price_data, fundamental_data, industry_data), f)
+        print(f"[loader] Saved dataset -> {path}")
+
         self.price_data = price_data
         self.fundamental_data = fundamental_data
         self.industry_data = industry_data
 
         return price_data, fundamental_data, industry_data
-    
+
     def _preprocess_price_data(self, price_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
         Preprocess price data.
@@ -1638,9 +1845,10 @@ class DataLoader:
     def split_data(
         self,
         test_ratio: float = 0.2,
-        method: str = 'chronological',
+        train_start_date: str = None,
         train_end_date: str = None,
         test_start_date: str = None,
+        test_end_date: str = None,
         context_days: int = 30,
     ) -> Tuple[Dict, Dict]:
         """
@@ -1659,7 +1867,16 @@ class DataLoader:
             method: Split method ('chronological', 'rolling')
             train_end_date: Explicit train/test split date (YYYY-MM-DD).
                          If given, overrides test_ratio.
-            test_start_date: Explicit test start date. If None, derived from train_end_date.
+            test_start_date: Explicit test start date. If given (and train_end_date is
+                         None), it defines the train/test boundary — training ends the
+                         day before test_start_date. If None, the boundary comes from
+                         train_end_date (or test_ratio). Recorded in _meta for downstream
+                         result cropping; the returned test_data still prepends context_days
+                         of training history, so its first row precedes test_start_date.
+            train_start_date: Explicit first day of training (YYYY-MM-DD). If None, training
+                         starts at the first available date. Clamps the train window's start.
+            test_end_date: Explicit last day of testing (YYYY-MM-DD, inclusive). If None,
+                         testing runs to the last available date. Clamps the test window's end.
             context_days: Number of trading days from end of training to prepend as context
                          for factor calculation. Default 30 (covers typical rolling windows).
 
@@ -1675,17 +1892,64 @@ class DataLoader:
         n_days = len(close_prices)
         dates = close_prices.index
 
-        # --- Determine split index ---
+        # --- Determine split index (train/test boundary) ---
         if train_end_date is not None:
-            # Use explicit date boundary
+            # Use explicit train-end boundary
             train_end = pd.Timestamp(train_end_date)
             split_idx = int(np.searchsorted(dates, train_end))
             if split_idx >= n_days:
                 raise ValueError(f"train_end_date {train_end_date} is at or after the last date {dates[-1]}")
             if split_idx <= 0:
                 raise ValueError(f"train_end_date {train_end_date} is before the first date {dates[0]}")
+            # Guard against a contradictory explicit test_start_date
+            if test_start_date is not None and pd.Timestamp(test_start_date) <= train_end:
+                raise ValueError(
+                    f"test_start_date {test_start_date} must be strictly after train_end_date {train_end_date}"
+                )
+        elif test_start_date is not None:
+            # Derive the boundary from the explicit test start: training ends the
+            # day right before test_start_date, so split_idx points AT test_start_date
+            # (which then becomes the first real test day). This makes test_start_date
+            # actually define the split when train_end_date is not supplied.
+            test_start = pd.Timestamp(test_start_date)
+            split_idx = int(np.searchsorted(dates, test_start))
+            if split_idx <= 0:
+                raise ValueError(f"test_start_date {test_start_date} is at or before the first date {dates[0]}")
+            if split_idx >= n_days:
+                raise ValueError(f"test_start_date {test_start_date} is at or after the last date {dates[-1]}")
         else:
             split_idx = int(n_days * (1 - test_ratio))
+
+        # --- Determine train start index ---
+        # train_start_date is the FIRST day of training (inclusive). Defaults to
+        # the first available date when omitted.
+        if train_start_date is not None:
+            train_start = pd.Timestamp(train_start_date)
+            train_start_idx = int(np.searchsorted(dates, train_start))
+            if train_start_idx < 0:
+                train_start_idx = 0
+            if train_start_idx >= split_idx:
+                raise ValueError(
+                    f"train_start_date {train_start_date} is at or after train_end_date {train_end_date}"
+                )
+        else:
+            train_start_idx = 0
+
+        # --- Determine test end index ---
+        # test_end_date is the LAST day of testing (inclusive). Defaults to the
+        # last available date when omitted. +1 makes the endpoint inclusive to
+        # match the user's intent ("up to and including test_end_date").
+        if test_end_date is not None:
+            test_end = pd.Timestamp(test_end_date)
+            test_end_idx = int(np.searchsorted(dates, test_end)) + 1
+            if test_end_idx <= split_idx:
+                raise ValueError(
+                    f"test_end_date {test_end_date} is at or before the train/test split"
+                )
+            if test_end_idx > n_days:
+                test_end_idx = n_days
+        else:
+            test_end_idx = n_days
 
         # --- Determine context start index ---
         # test_data includes context_days from end of training so factor
@@ -1700,8 +1964,8 @@ class DataLoader:
         train_price = {}
         test_price = {}
         for col in self.price_data:
-            train_price[col] = self.price_data[col].iloc[:split_idx]
-            test_price[col] = self.price_data[col].iloc[context_start:]  # includes context
+            train_price[col] = self.price_data[col].iloc[train_start_idx:split_idx]
+            test_price[col] = self.price_data[col].iloc[context_start:test_end_idx]  # includes context
 
         # --- Split fundamental_data (all keys) ---
         train_fund = {}
@@ -1709,8 +1973,8 @@ class DataLoader:
         if self.fundamental_data:
             for key in self.fundamental_data:
                 df = self.fundamental_data[key]
-                train_fund[key] = df.iloc[:split_idx]
-                test_fund[key] = df.iloc[context_start:]  # includes context
+                train_fund[key] = df.iloc[train_start_idx:split_idx]
+                test_fund[key] = df.iloc[context_start:test_end_idx]  # includes context
 
         # --- Split industry_data (Series) ---
         train_industry = None
@@ -1734,9 +1998,14 @@ class DataLoader:
             '_meta': {
                 'context_days': context_days,
                 'context_start_idx': int(context_start),
+                'train_start_idx': int(train_start_idx),
+                'test_end_idx': int(test_end_idx),
                 'test_start_idx': int(split_idx),
+                'train_start_date': train_start_date,
+                'train_end_date': train_end_date,
                 'test_start_date': test_start_date if test_start_date is not None
                                   else (str(dates[split_idx].date()) if split_idx < n_days else None),
+                'test_end_date': test_end_date,
             },
         }
 
@@ -1821,11 +2090,12 @@ if __name__ == '__main__':
     print("=== Data Loader Demo ===\n")
     
     loader = DataLoader()
-    price_data, fundamental_data, industry_data = loader.load_data(
-        start_date='2022-01-01',
-        end_date='2024-12-31',
+    bundle = loader.load_data(
+        full_start='2022-01-01',
+        full_end='2024-12-31',
         universe='hs300',
     )
+    price_data, fundamental_data, industry_data = bundle.full
     
     print(f"Price data keys: {list(price_data.keys())}")
     print(f"Close prices shape: {price_data['close'].shape}")

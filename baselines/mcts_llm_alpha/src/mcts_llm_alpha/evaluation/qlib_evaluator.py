@@ -90,7 +90,8 @@ def evaluate_formula_qlib(
         if cached_result is not None:
             print(f"[缓存命中] 公式: {formula[:50]}...")
             return cached_result
-    
+
+    _mase_offline_guard("baselines/mcts_llm_alpha/.../evaluation/qlib_evaluator.py::evaluate_formula_qlib (D.features)")
     try:
         # 1. 获取因子数据
         print(f"正在获取因子数据: {formula}")
