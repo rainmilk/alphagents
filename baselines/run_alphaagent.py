@@ -1438,8 +1438,15 @@ def run_alphaagent_baseline(
     print(f"  Shape: {factor_df.shape}")
 
     # ── Date-isolated run directory (matches MASE: experiments/{base}/{YYYYMMDD}) ──
-    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
-    run_dir = os.path.join(output_dir, _date_str)
+    # ── Parameter-tagged, date-isolated run directory ──
+    method_name = "alphaagent"
+    _u = data_cfg.get('index', 'hs300')
+    _s = start_date
+    _e = end_date
+    _fp = forward_period if forward_period is not None else 10
+    _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
+    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
     os.makedirs(run_dir, exist_ok=True)
 
     # Save factor values
@@ -1509,12 +1516,12 @@ def run_alphaagent_baseline(
             holding_period=holding_period if holding_period is not None
             else config.get('backtest', {}).get('holding_period', 1),  # Daily rebalance
         )
-        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
 
         # Save portfolio values for analysis
         pv = engine.get_portfolio_values()
         if pv is not None and not pv.empty:
-            pv_path = os.path.join(run_dir, "portfolio_values.csv")
+            pv_path = os.path.join(run_dir, f"{method_name}_portfolio_values.csv")
             pv.to_csv(pv_path, header=['portfolio_value'])
             print(f"  Portfolio values saved to: {pv_path}")
 

@@ -1196,6 +1196,7 @@ def stage3_evaluate_results(
     config: AlphaForgeConfig,
     test_start_ts: pd.Timestamp = None,
     save_dir: Optional[str] = None,
+    method_prefix: Optional[str] = None,
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1318,7 +1319,7 @@ def stage3_evaluate_results(
         risk_free_rate=0.0,
         holding_period=config.holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir, method_prefix=method_prefix)
 
     # ── Compute test-period Mean IC / ICIR ──
     # Cross-sectional Spearman between the Stage-2 combined factor scores
@@ -1552,8 +1553,15 @@ def run_alphaforge_baseline(
     os.makedirs(output_dir, exist_ok=True)
 
     # Date-isolated run directory (one subdir per execution, for multiple runs)
-    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
-    run_dir = os.path.join(output_dir, _date_str)
+    # ── Parameter-tagged, date-isolated run directory ──
+    method_name = "alphaforge"
+    _u = instruments or _cfg.get('universe', {}).get('index', 'csi300')
+    _s = start_date or _cfg.get('universe', {}).get('start_date', 'na')
+    _e = end_date or _cfg.get('universe', {}).get('end_date', 'na')
+    _fp = forward_period
+    _hp = holding_period if holding_period is not None else 1
+    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
     os.makedirs(run_dir, exist_ok=True)
 
     # Stage 1: Mine factors (TRAIN data only — no test data leakage)
@@ -1575,7 +1583,7 @@ def run_alphaforge_baseline(
     print("\n" + "="*60)
     print("[Stage 3] Backtest on TEST data only")
     print("="*60)
-    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir)
+    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir, method_prefix=method_name)
     
     return {
         'metrics': stage3_results['metrics'],

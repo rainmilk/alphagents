@@ -67,6 +67,7 @@ class BacktestEngine:
         market_cap: Optional[pd.DataFrame] = None,
         holding_period: Optional[int] = None,
         save_dir: Optional[str] = None,
+        method_prefix: Optional[str] = None,
     ) -> Dict:
         """
         Run backtest simulation.
@@ -194,14 +195,18 @@ class BacktestEngine:
         # daily_returns.csv (referenced by our own MASE model's date-isolated layout).
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
+            # Prefix filenames with the method name so multiple baselines can
+            # share one parameter-isolated directory without clobbering each other.
+            dr_name = f"{method_prefix}_daily_returns.csv" if method_prefix else "daily_returns.csv"
+            pv_name = f"{method_prefix}_portfolio_values.csv" if method_prefix else "portfolio_values.csv"
             if isinstance(self.returns, pd.Series) and len(self.returns) > 0:
                 self.returns.to_csv(
-                    os.path.join(save_dir, "daily_returns.csv"),
+                    os.path.join(save_dir, dr_name),
                     header=["daily_return"],
                 )
             if isinstance(self.portfolio_values, pd.Series) and len(self.portfolio_values) > 0:
                 self.portfolio_values.to_csv(
-                    os.path.join(save_dir, "portfolio_values.csv"),
+                    os.path.join(save_dir, pv_name),
                     header=["portfolio_value"],
                 )
 

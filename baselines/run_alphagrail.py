@@ -1402,11 +1402,17 @@ def run_alphagrail_baseline(
         holding_period=holding_period,
     )
     run_dir = None
+    method_name = "alphagrail"
     if output_dir:
-        _date_str = pd.Timestamp.now().strftime("%Y%m%d")
-        run_dir = os.path.join(output_dir, _date_str)
+        _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
+        _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+        _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+        _fp = forward_period if forward_period is not None else 10
+        _hp = holding_period if holding_period is not None else 1
+        param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+        run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
         os.makedirs(run_dir, exist_ok=True)
-    metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
 
     # ── Step 9: Compute test-period IC for the winning factor ──────────
     test_mask = forward_returns.index >= test_start_ts

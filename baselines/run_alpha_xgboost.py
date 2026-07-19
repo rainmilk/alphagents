@@ -549,10 +549,18 @@ def run_xgboost_baseline(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
-    run_dir = os.path.join(output_dir, _date_str)
+    # ── Parameter-tagged, date-isolated run directory ──
+    # Layout: experiments/{method}/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{YYYYMMDD}/
+    method_name = "alpha_xgboost"
+    _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
+    _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
+    _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+    _fp = forward_period if forward_period is not None else 10
+    _hp = holding_period if holding_period is not None else 1
+    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
     os.makedirs(run_dir, exist_ok=True)
-    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")

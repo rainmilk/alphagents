@@ -79,8 +79,15 @@ def run_mcts_llm_alpha_baseline(
     os.makedirs(output_dir, exist_ok=True)
 
     # Date-isolated run directory (one subdir per execution, for multiple runs)
-    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
-    run_dir = os.path.join(output_dir, _date_str)
+    # ── Parameter-tagged, date-isolated run directory ──
+    method_name = "mcts_llm"
+    _u = "hs300"  # mcts default universe (not exposed via CLI)
+    _s = start_date
+    _e = end_date
+    _fp = forward_period
+    _hp = holding_period if holding_period is not None else 1
+    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
     os.makedirs(run_dir, exist_ok=True)
 
     # ── 1. Load data from main DataLoader ──────────────────────────
@@ -359,6 +366,7 @@ def run_mcts_llm_alpha_baseline(
             selected_params=best_selected_params,
             save_dir=run_dir,
             holding_period=holding_period if holding_period is not None else mcts_config.holding_period,
+            method_prefix=method_name,
         )
 
     # ── Save results ──────────────────────────────────────────────
@@ -473,6 +481,7 @@ def compute_portfolio_metrics(
     selected_params: Optional[Dict] = None,
     save_dir: Optional[str] = None,
     holding_period: int = 1,
+    method_prefix: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Compute portfolio-level metrics using the unified BacktestEngine.
@@ -579,7 +588,7 @@ def compute_portfolio_metrics(
             risk_free_rate=0.0,
             holding_period=holding_period,
         )
-        metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
+        metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir, method_prefix=method_prefix)
 
         # Add IC info
         mean_ic_val = 0.0
