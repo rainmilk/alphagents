@@ -1178,6 +1178,37 @@ def compute_rank_ic(
     return ic_mean, ic_df
 
 
+def compute_rank_ic_test(
+    factor_df: pd.DataFrame,
+    forward_return_series: pd.Series,
+    test_start_date: str,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Compute Spearman Rank-IC for each factor on the TEST set (>= test_start_date).
+
+    Mirrors :func:`compute_rank_ic` but evaluates on the out-of-sample period so
+    the reported IC/ICIR reflect test performance, not in-sample fit. This is the
+    number that should appear in the paper tables.
+    """
+    test_idx = factor_df.index.get_level_values('datetime') >= test_start_date
+
+    factor_test = factor_df.loc[test_idx]
+    ret_test = forward_return_series.reindex(factor_test.index)
+
+    ic_results = {}
+    for col in factor_test.columns:
+        df = pd.DataFrame({'factor': factor_test[col], 'ret': ret_test})
+        ic = df.groupby('datetime').apply(
+            lambda x: x['factor'].corr(x['ret'], method='spearman')
+        )
+        ic_results[col] = ic
+
+    ic_df = pd.DataFrame(ic_results)
+    ic_mean = ic_df.mean().sort_values(ascending=False)
+
+    return ic_mean, ic_df
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Portfolio construction (returns portfolios DataFrame for BacktestEngine)
 # ═══════════════════════════════════════════════════════════════════════
@@ -1296,6 +1327,7 @@ def run_alphaagent_baseline(
     test_start_date: str = None,
     use_llm: bool = True,
     forward_period: int = 10,
+    holding_period: int = None,  # None -> config['backtest']['holding_period'] or 1
 ) -> Dict:
     """
     Run AlphaAgent baseline using the main project's DataLoader.
@@ -1405,8 +1437,13 @@ def run_alphaagent_baseline(
     factor_df = compute_factor_values(formulas, price_midx, return_series)
     print(f"  Shape: {factor_df.shape}")
 
+    # ── Date-isolated run directory (matches MASE: experiments/{base}/{YYYYMMDD}) ──
+    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+    run_dir = os.path.join(output_dir, _date_str)
+    os.makedirs(run_dir, exist_ok=True)
+
     # Save factor values
-    factor_path = os.path.join(output_dir, "factors.csv")
+    factor_path = os.path.join(run_dir, "factors.csv")
     factor_df.to_csv(factor_path)
     print(f"  Saved factors to: {factor_path}")
 
@@ -1418,8 +1455,22 @@ def run_alphaagent_baseline(
     for i, (name, ic) in enumerate(ic_mean.head(10).items()):
         print(f"    {i+1}. {name}: Rank-IC = {ic:.4f}")
 
+    # ── 5b. Compute Rank-IC on TEST set (the number reported in tables) ──
+    print(f"\n[5b/6] Computing Rank-IC on TEST set (>= {test_start_date})...")
+    ic_mean_test, ic_df_test = compute_rank_ic_test(
+        factor_df, forward_return_series, test_start_date
+    )
+    print(f"  Top 10 factors by test IC:")
+    for i, (name, ic) in enumerate(ic_mean_test.head(10).items()):
+        print(f"    {i+1}. {name}: Rank-IC = {ic:.4f}")
+    best_ic_test = float(ic_mean_test.iloc[0]) if len(ic_mean_test) > 0 else 0.0
+    icir_test = (
+        float(best_ic_test / max(ic_mean_test.std(), 1e-10))
+        if len(ic_mean_test) > 1 else 0.0
+    )
+
     # Save IC results
-    ic_path = os.path.join(output_dir, "ic_results.csv")
+    ic_path = os.path.join(run_dir, "ic_results.csv")
     ic_mean.to_csv(ic_path, header=['mean_rank_ic'])
     print(f"  Saved IC results to: {ic_path}")
 
@@ -1455,14 +1506,15 @@ def run_alphaagent_baseline(
             commission=0.0003,
             slippage=0.001,
             risk_free_rate=0.0,
-            holding_period=1,  # Daily rebalance
+            holding_period=holding_period if holding_period is not None
+            else config.get('backtest', {}).get('holding_period', 1),  # Daily rebalance
         )
-        metrics = engine.run(portfolios, prices_aligned)
+        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
         # Save portfolio values for analysis
         pv = engine.get_portfolio_values()
         if pv is not None and not pv.empty:
-            pv_path = os.path.join(output_dir, "portfolio_values.csv")
+            pv_path = os.path.join(run_dir, "portfolio_values.csv")
             pv.to_csv(pv_path, header=['portfolio_value'])
             print(f"  Portfolio values saved to: {pv_path}")
 
@@ -1476,6 +1528,9 @@ def run_alphaagent_baseline(
     print(f"  Win Rate:         {metrics.get('win_rate', 0):.4f}")
     print(f"  Calmar Ratio:     {metrics.get('calmar_ratio', 0):.4f}")
     print(f"  Avg Turnover:     {metrics.get('avg_turnover', 0):.4f}")
+    print(f"  Mean IC (train):  {best_ic:.4f}")
+    print(f"  Mean IC (test):   {best_ic_test:.4f}")
+    print(f"  ICIR (test):      {icir_test:.4f}")
     print(f"  N Factors:        {len(ic_mean)}")
 
     # ── Build result ───────────────────────────────────────────────
@@ -1486,7 +1541,9 @@ def run_alphaagent_baseline(
         'metrics': metrics,
         'mean_rank_ic_train': best_ic,
         'avg_rank_ic_train': avg_ic,
+        'mean_rank_ic_test': best_ic_test,
         'icir': float(best_ic / max(ic_mean.std(), 1e-10)) if len(ic_mean) > 1 else 0.0,
+        'icir_test': icir_test,
         'n_factors': len(ic_mean),
         'forward_period': forward_period,
         'annual_return': metrics.get('annual_return', 0.0),
@@ -1531,6 +1588,9 @@ if __name__ == "__main__":
     parser.add_argument("--forward-period", type=int, default=10,
                         help="Forward return period in days for IC evaluation "
                              "(default 10, matching other baselines)")
+    parser.add_argument("--holding-period", type=int, default=None,
+                        help="Portfolio holding period in days for backtest "
+                             "(default: config['backtest']['holding_period'], 1 = daily rebalance)")
     args = parser.parse_args()
 
     run_alphaagent_baseline(
@@ -1542,4 +1602,5 @@ if __name__ == "__main__":
         end_date=args.end_date,
         use_llm=not args.no_llm,
         forward_period=args.forward_period,
+        holding_period=args.holding_period,
     )

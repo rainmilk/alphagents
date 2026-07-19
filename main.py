@@ -966,6 +966,8 @@ class AAAI2027Pipeline:
                 weighted = weighted.add(fv_weighted, fill_value=0)
 
         test_composite_scores = normalizer.normalize(weighted, _industry)
+        # Persist for test-period Mean IC / ICIR computation in run_test_pipeline.
+        self.test_composite_scores = test_composite_scores
 
         if test_composite_scores.empty:
             print("  [error] Computed composite scores are empty")
@@ -1326,6 +1328,25 @@ class AAAI2027Pipeline:
         # ── 7. Run step8 (backtest) ──
         self.step8_backtest(test_data=test_data)
 
+        # ── 8. Compute test-period Mean IC / ICIR for the composite factor ──
+        # Uses the fused test-period factor scores (self.test_composite_scores)
+        # vs the N-day forward returns, all on the out-of-sample period.
+        try:
+            from backtest.metrics import factor_ic_metrics
+            _test_close = test_data['price_data']['close']
+            _fp = getattr(self, '_forward_period', None) or self.config.get('evolution', {}).get('forward_period', 10)
+            _fwd = _test_close.pct_change(_fp).shift(-_fp)
+            _scores = getattr(self, 'test_composite_scores', None)
+            if _scores is not None and not _scores.empty:
+                _common = _scores.index.intersection(_fwd.index)
+                if len(_common) > 0:
+                    _ic = factor_ic_metrics(_scores.loc[_common], _fwd.loc[_common])
+                    self.performance_metrics['mean_ic'] = float(_ic['mean_ic'])
+                    self.performance_metrics['icir'] = float(_ic['icir'])
+                    print(f"  Mean IC (test): {_ic['mean_ic']:.4f}, ICIR (test): {_ic['icir']:.4f}")
+        except Exception as e:
+            print(f"  [warn] Could not compute test IC: {e}")
+
         print("\n" + "=" * 60)
         print("  Test Pipeline Complete!")
         print("=" * 60)
@@ -1465,13 +1486,11 @@ class AAAI2027Pipeline:
         if 'amount' in data_map and 'volume' in data_map:
             vol_safe = data_map['volume'].replace(0, np.nan)
             data_map['vwap'] = data_map['amount'] / vol_safe
-        # Forward returns — period must match step4 to keep IC computation consistent.
-        # Resolution order: explicit arg → self._forward_period (set in step4) → config → 10
-        if forward_period is None:
-            forward_period = getattr(self, '_forward_period', None)
-        if forward_period is None:
-            forward_period = self.config.get('evolution', {}).get('forward_period', 10)
-        data_map['forward_returns'] = close.pct_change(forward_period).shift(-forward_period)
+        # NOTE: forward_returns is intentionally NOT added to data_map.
+        # It holds the N-day FUTURE return; exposing it as an expression field would let a
+        # factor reference future prices (look-ahead bias). It is still used as the IC /
+        # portfolio target in run_test_pipeline via a separate computation.
+        # (`forward_period` param is retained for signature compatibility with callers.)
 
 
         # ---- Factor list ----
@@ -1698,6 +1717,9 @@ Examples:
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
+            print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:
             print("\nPipeline completed, but no metrics available.")
 
@@ -1756,6 +1778,9 @@ Examples:
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
+            print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:
             print("\nTest pipeline completed, but no metrics available.")
     else:
@@ -1763,5 +1788,8 @@ Examples:
         metrics = run_demo()
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
+            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
+            print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:
             print("\nDemo completed, but no metrics available.")

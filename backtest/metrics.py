@@ -216,3 +216,32 @@ def rank_ic(
     ic_ir = mean_ic / std_ic if std_ic > 0 else 0.0
 
     return mean_ic, ic_ir
+
+
+def factor_ic_metrics(
+    factor_scores: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+) -> dict:
+    """
+    Compute Mean IC and ICIR for test-period factor scores.
+
+    Thin, ergonomic wrapper around :func:`rank_ic` that returns a dict so
+    baseline runners can unpack ``mean_ic`` / ``icir`` uniformly instead of
+    dealing with positional tuple returns.
+
+    Both inputs must be cross-sectional panels indexed by date (rows) with
+    stocks as columns. The function ranks across stocks per date and computes
+    the Spearman Rank-IC time series, then returns its mean and IR.
+
+    Args:
+        factor_scores: Factor scores on the TEST period (date × stock).
+        forward_returns: Forward returns aligned to ``factor_scores``
+            (date × stock), same horizon as used everywhere else
+            (``forward_period`` days, default 10).
+
+    Returns:
+        ``{'mean_ic': float, 'icir': float}``. Both are 0.0 when no valid
+        cross-sectional IC can be computed (e.g. constant factor).
+    """
+    mean_ic, icir = rank_ic(factor_scores, forward_returns)
+    return {"mean_ic": float(mean_ic), "icir": float(icir)}

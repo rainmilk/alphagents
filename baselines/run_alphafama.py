@@ -701,6 +701,12 @@ def run_alphafama_baseline(
     if prices is None:
         raise ValueError("Missing 'close' price data for backtest")
 
+    run_dir = None
+    if output_dir:
+        _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+        run_dir = os.path.join(output_dir, _date_str)
+        os.makedirs(run_dir, exist_ok=True)
+
     simulated_metrics = _simulate_portfolio_from_ic(
         train_ic=train_ic,
         test_ic=test_ic,
@@ -710,6 +716,7 @@ def run_alphafama_baseline(
         test_start_date=test_start,
         prices=prices,
         holding_period=1,  # Daily rebalance for fairest comparison
+        save_dir=run_dir,
     )
 
     # ── Step 10: Compile results ───────────────────────────────────────
@@ -739,8 +746,7 @@ def run_alphafama_baseline(
 
     # ── Step 11: Save results ──────────────────────────────────────────
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        result_path = os.path.join(output_dir, 'alphafama_results.json')
+        result_path = os.path.join(run_dir, 'alphafama_results.json')
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         print(f"\n  Results saved to {result_path}")
@@ -792,6 +798,7 @@ def _simulate_portfolio_from_ic(
     test_start_date: str,
     prices: pd.DataFrame,
     holding_period: int = 1,
+    save_dir: Optional[str] = None,
 ) -> Dict:
     """
     Simulate an IC-weighted portfolio using the unified BacktestEngine.
@@ -921,7 +928,7 @@ def _simulate_portfolio_from_ic(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
 
     return metrics
 

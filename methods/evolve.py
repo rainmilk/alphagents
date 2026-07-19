@@ -131,11 +131,11 @@ class _FactorExprEvaluator:
     Supported data sources:
         open, high, low, close, volume, amount  (price_data dict keys)
         pe, pb, ps, roe, market_cap             (fundamental_data dict keys)
-        eps, return, returns, vwap, forward_returns  (derived fields)
+        eps, return, returns, vwap  (derived fields)
         — eps = close / pe
         — return / returns = 1-day daily return (close.pct_change(1))
         — vwap = amount / volume
-        — forward_returns = N-day forward return (precomputed)
+        — NOTE: forward_returns is intentionally NOT an expression field (look-ahead bias)
 
     Supported functions:
         rank(X)          — cross-sectional percentile rank [0, 1]
@@ -158,7 +158,6 @@ class _FactorExprEvaluator:
         abs(X)           — element-wise absolute value
         log(X)           — element-wise natural log
         sqrt(X)          — element-wise square root (clamped >= 0)
-        forward_returns  — 1-day forward return (precomputed)
 
     Operators: +, -, *, /, ^ (power)
     """
@@ -642,10 +641,12 @@ class FactorBacktester:
             vol_safe = self._data_map['volume'].replace(0, np.nan)
             self._data_map['vwap'] = self._data_map['amount'] / vol_safe
 
-        # ---- Compute forward returns ----
+        # ---- Compute forward returns (used ONLY as the IC / portfolio target) ----
+        # NOTE: forward_returns is deliberately NOT exposed to factor expressions.
+        # It holds the N-day FUTURE return; letting a factor reference it would be
+        # look-ahead bias (the factor would use future prices to predict the future).
+        # It remains available via self.forward_returns for IC scoring (see evaluate()).
         self._forward_returns = self._compute_forward_returns()
-        # Make forward_returns accessible from expressions (docstring promises it)
-        self._data_map['forward_returns'] = self._forward_returns
 
         # ---- Expression evaluator (lazy init) ----
         self._evaluator = None
@@ -1440,7 +1441,6 @@ Supported data sources:
 - pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
 - return / returns (1-day daily return; alias: close.pct_change(1))
 - vwap (volume-weighted average price = amount / volume)
-- forward_returns (N-day forward return, precomputed)
 
 Supported functions (WorldQuant style):
 - rank(X): cross-sectional percentile rank [0, 1]
@@ -1626,7 +1626,6 @@ Supported data sources:
 - pe, pb, ps, roe, market_cap, eps (fundamental data; eps = close / pe)
 - return / returns (1-day daily return; alias: close.pct_change(1))
 - vwap (volume-weighted average price = amount / volume)
-- forward_returns (N-day forward return, precomputed)
 
 Supported functions (WorldQuant style):
 - rank(X): cross-sectional percentile rank [0, 1]

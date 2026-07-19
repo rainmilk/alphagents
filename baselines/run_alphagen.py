@@ -1609,7 +1609,12 @@ def run_alphagen_baseline(
     engine = BacktestEngine(
         commission=0.0003, slippage=0.001, risk_free_rate=0.0, holding_period=holding_period,
     )
-    backtest_metrics = engine.run(portfolios, prices_aligned)
+    run_dir = None
+    if output_dir:
+        _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+        run_dir = os.path.join(output_dir, _date_str)
+        os.makedirs(run_dir, exist_ok=True)
+    backtest_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # ── Step 10: Assemble results ──────────────────────────────────────
     print("\n" + "=" * 60)
@@ -1664,8 +1669,7 @@ def run_alphagen_baseline(
 
     # ── Save results ───────────────────────────────────────────────────
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        result_path = os.path.join(output_dir, 'results_alphagen.json')
+        result_path = os.path.join(run_dir, 'results_alphagen.json')
         # Convert numpy types for JSON
         json_results = {}
         for k, v in results.items():

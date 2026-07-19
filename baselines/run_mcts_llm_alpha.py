@@ -54,6 +54,7 @@ def run_mcts_llm_alpha_baseline(
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
     forward_period: int = 10,
+    holding_period: int = None,  # None -> use mcts_config.holding_period (default 1)
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -76,6 +77,11 @@ def run_mcts_llm_alpha_baseline(
         Dict with metrics: annual_return, sharpe_ratio, max_drawdown, etc.
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # Date-isolated run directory (one subdir per execution, for multiple runs)
+    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+    run_dir = os.path.join(output_dir, _date_str)
+    os.makedirs(run_dir, exist_ok=True)
 
     # ── 1. Load data from main DataLoader ──────────────────────────
     print("=" * 60)
@@ -259,6 +265,7 @@ def run_mcts_llm_alpha_baseline(
         effectiveness_threshold=mcts_config.mcts.effectiveness_threshold,
         diversity_threshold=mcts_config.evaluation.diversity_threshold,
         overall_threshold=mcts_config.evaluation.overall_threshold,
+        output_dir=run_dir,
     )
 
     if has_llm and 'llm_client' in locals():
@@ -350,6 +357,8 @@ def run_mcts_llm_alpha_baseline(
             best_formula, price_midx, test_return_series,
             test_prices_df, start_date, end_date, split_date, alpha_repository,
             selected_params=best_selected_params,
+            save_dir=run_dir,
+            holding_period=holding_period if holding_period is not None else mcts_config.holding_period,
         )
 
     # ── Save results ──────────────────────────────────────────────
@@ -366,13 +375,13 @@ def run_mcts_llm_alpha_baseline(
         'timestamp': datetime.now().isoformat(),
     }
 
-    results_path = os.path.join(output_dir, "mcts_llm_alpha_results.json")
+    results_path = os.path.join(run_dir, "mcts_llm_alpha_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2, default=str, ensure_ascii=False)
 
     # Save alpha repository
     if alpha_repository:
-        repo_path = os.path.join(output_dir, "mcts_alpha_repo.csv")
+        repo_path = os.path.join(run_dir, "mcts_alpha_repo.csv")
         repo_df = pd.DataFrame([{
             'formula': a.get('formula', ''),
             'effectiveness': a.get('scores', {}).get('Effectiveness', 0),
@@ -462,6 +471,8 @@ def compute_portfolio_metrics(
     alpha_repository: list,
     top_n_stocks: int = 30,
     selected_params: Optional[Dict] = None,
+    save_dir: Optional[str] = None,
+    holding_period: int = 1,
 ) -> Dict[str, float]:
     """
     Compute portfolio-level metrics using the unified BacktestEngine.
@@ -566,16 +577,16 @@ def compute_portfolio_metrics(
             commission=0.0003,
             slippage=0.001,
             risk_free_rate=0.0,
-            holding_period=1,
+            holding_period=holding_period,
         )
-        metrics = engine.run(portfolios, prices_aligned)
+        metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
 
         # Add IC info
         mean_ic_val = 0.0
+        daily_ic = []
         try:
             oos_df = pd.concat([factor_series.rename("factor"), return_series], axis=1).dropna()
             oos_df = oos_df[oos_df.index.get_level_values("datetime") >= split_date]
-            daily_ic = []
             for _, group in oos_df.groupby(level="datetime"):
                 if len(group) >= 5:
                     ic = group["factor"].corr(group.iloc[:, -1], method="spearman")
@@ -586,8 +597,25 @@ def compute_portfolio_metrics(
             pass
 
         metrics["mean_ic"] = round(mean_ic_val, 4)
+        # ICIR = mean / std of the daily (test-period) IC series.
+        if len(daily_ic) > 1 and np.std(daily_ic, ddof=1) > 0:
+            metrics["icir"] = round(float(mean_ic_val / np.std(daily_ic, ddof=1)), 4)
+        else:
+            metrics["icir"] = 0.0
         metrics["n_alphas"] = len(alpha_repository)
         metrics["best_formula"] = best_formula
+
+        # ── FINAL RESULTS (test period) ──
+        print("\n" + "=" * 60)
+        print("FINAL RESULTS (Test Period)")
+        print("=" * 60)
+        print(f"  Annual Return:    {metrics.get('annual_return', 0):.4f}")
+        print(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):.4f}")
+        print(f"  Max Drawdown:     {metrics.get('max_drawdown', 0):.4f}")
+        print(f"  Information Ratio:{metrics.get('information_ratio', 0):.4f}")
+        print(f"  Mean IC (test):   {metrics.get('mean_ic', 0):.4f}")
+        print(f"  ICIR (test):      {metrics.get('icir', 0):.4f}")
+        print(f"  Turnover:         {metrics.get('avg_turnover', 0):.4f}")
 
         return metrics
 
@@ -604,6 +632,8 @@ def _get_default_metrics() -> Dict:
         'max_drawdown': 0.0,
         'information_ratio': 0.0,
         'mean_ic': 0.0,
+        'icir': 0.0,
+        'avg_turnover': 0.0,
         'n_alphas': 0,
     }
 
@@ -628,6 +658,8 @@ def parse_args():
                         help='Disable LLM (use simulated formulas)')
     parser.add_argument('--forward-period', type=int, default=10,
                         help='Forward return period in days (default: 10, should match MASE)')
+    parser.add_argument('--holding-period', type=int, default=None,
+                        help='Portfolio holding period in days for backtest (default: config value, 1 = daily rebalance)')
     return parser.parse_args()
 
 
@@ -643,5 +675,6 @@ if __name__ == "__main__":
         train_end_date=args.train_end,
         test_start_date=args.test_start,
         forward_period=args.forward_period,
+        holding_period=args.holding_period,
     )
     print("\nDone!")

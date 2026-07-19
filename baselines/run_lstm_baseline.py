@@ -607,13 +607,18 @@ def run_lstm_baseline(
     prices_aligned = close.loc[portfolios.index]
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
+    # ── Date-isolated run directory (matches MASE: experiments/{base}/{YYYYMMDD}) ──
+    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+    run_dir = os.path.join(output_dir, _date_str)
+    os.makedirs(run_dir, exist_ok=True)
+
     engine = BacktestEngine(
         commission=0.0003,
         slippage=0.001,
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    bt_metrics = engine.run(portfolios, prices_aligned)
+    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")
@@ -687,8 +692,7 @@ def run_lstm_baseline(
 
     # -- Step 10: Save results --
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        result_path = os.path.join(output_dir, 'lstm_results.json')
+        result_path = os.path.join(run_dir, 'lstm_results.json')
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         print(f"\n  Results saved to {result_path}")

@@ -231,7 +231,8 @@ def main():
         effectiveness_threshold=config.mcts.effectiveness_threshold,
         diversity_threshold=config.evaluation.diversity_threshold,
         overall_threshold=config.evaluation.overall_threshold,
-        seed_formula=config.mcts.initial_seed_formula
+        seed_formula=config.mcts.initial_seed_formula,
+        output_dir=os.path.join("experiments", "mcts_llm_alpha", datetime.now().strftime("%Y%m%d")),
     )
     # 设置LLM客户端（用于精炼总结）
     if mcts_llm_client:

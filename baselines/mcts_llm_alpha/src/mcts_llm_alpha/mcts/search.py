@@ -7,6 +7,7 @@
 探索alpha公式的空间。
 """
 
+import os
 import pickle
 import math
 import numpy as np
@@ -40,7 +41,8 @@ class MCTSSearch:
                  effectiveness_threshold: Optional[float] = None,
                  diversity_threshold: Optional[float] = None,
                  overall_threshold: Optional[float] = None,
-                 seed_formula: Optional[str] = None):
+                 seed_formula: Optional[str] = None,
+                 output_dir: Optional[str] = None):
         """
         初始化MCTS搜索。
         
@@ -77,6 +79,7 @@ class MCTSSearch:
         self.diversity_threshold = diversity_threshold or THRESHOLDS['diversity']
         self.overall_threshold = overall_threshold or THRESHOLDS['overall']
         self.seed_formula = seed_formula
+        self.output_dir = output_dir
         
         # 搜索状态
         self.iteration = 0
@@ -772,5 +775,10 @@ class MCTSSearch:
         
         if results:
             df = pd.DataFrame(results)
-            df.to_csv('mcts_results.csv', index=False)
-            print("结果已保存到 mcts_results.csv")
+            if self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
+                out_path = os.path.join(self.output_dir, 'mcts_results.csv')
+            else:
+                out_path = 'mcts_results.csv'
+            df.to_csv(out_path, index=False)
+            print(f"结果已保存到 {out_path}")

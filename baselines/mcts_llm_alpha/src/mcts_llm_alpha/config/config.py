@@ -116,6 +116,7 @@ class Config(BaseModel):
     fsa: FSAConfig = Field(default_factory=FSAConfig)
     formula: FormulaConfig = Field(default_factory=FormulaConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    holding_period: int = Field(1, description="Portfolio holding period (days) for backtest; 1 = daily rebalance")
     
     @validator('data')
     def set_qlib_path(cls, v):

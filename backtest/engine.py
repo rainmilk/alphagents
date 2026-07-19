@@ -17,6 +17,7 @@ from datetime import datetime
 from . import metrics
 import warnings
 warnings.filterwarnings('ignore')
+import os
 
 
 class BacktestEngine:
@@ -65,6 +66,7 @@ class BacktestEngine:
         prices: pd.DataFrame,
         market_cap: Optional[pd.DataFrame] = None,
         holding_period: Optional[int] = None,
+        save_dir: Optional[str] = None,
     ) -> Dict:
         """
         Run backtest simulation.
@@ -185,7 +187,24 @@ class BacktestEngine:
         self.returns = daily_returns_series
         self.positions = positions_list
         self.turnovers = turnovers
-        
+
+        # ── Optional: persist daily returns & portfolio values ──
+        # When save_dir is provided, dump the strategy daily-return series and the
+        # equity curve to CSV. This gives every baseline a uniform, comparable
+        # daily_returns.csv (referenced by our own MASE model's date-isolated layout).
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            if isinstance(self.returns, pd.Series) and len(self.returns) > 0:
+                self.returns.to_csv(
+                    os.path.join(save_dir, "daily_returns.csv"),
+                    header=["daily_return"],
+                )
+            if isinstance(self.portfolio_values, pd.Series) and len(self.portfolio_values) > 0:
+                self.portfolio_values.to_csv(
+                    os.path.join(save_dir, "portfolio_values.csv"),
+                    header=["portfolio_value"],
+                )
+
         return metrics
     
     def _calculate_metrics(

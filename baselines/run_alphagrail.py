@@ -1401,13 +1401,24 @@ def run_alphagrail_baseline(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned)
+    run_dir = None
+    if output_dir:
+        _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+        run_dir = os.path.join(output_dir, _date_str)
+        os.makedirs(run_dir, exist_ok=True)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # ── Step 9: Compute test-period IC for the winning factor ──────────
     test_mask = forward_returns.index >= test_start_ts
     test_returns = forward_returns.loc[test_mask]
     test_factor = factor_library[winner].loc[test_mask]
     test_ic = _compute_rank_ic(test_factor, test_returns)
+    # Also compute test ICIR from the daily Rank-IC series (reported in tables).
+    test_ic_series = _compute_rank_ic_series(test_factor, test_returns)
+    if len(test_ic_series) > 1 and test_ic_series.std(ddof=1) > 0:
+        test_icir = float(test_ic_series.mean() / test_ic_series.std(ddof=1))
+    else:
+        test_icir = 0.0
 
     # ── Step 10: Compile results ───────────────────────────────────────
     results = {
@@ -1421,6 +1432,7 @@ def run_alphagrail_baseline(
         'icir': float(winner_metrics.get('icir', 0)),
         'factor_sharpe_train': float(winner_metrics.get('factor_sharpe', 0)),
         'mean_rank_ic_test': float(test_ic),
+        'icir_test': float(test_icir),
         'annual_return': metrics.get('annual_return', 0.0),
         'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': metrics.get('max_drawdown', 0.0),
@@ -1462,14 +1474,12 @@ def run_alphagrail_baseline(
 
     # ── Step 11: Save results ──────────────────────────────────────────
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-        result_path = os.path.join(output_dir, 'alphagrail_results.json')
+        result_path = os.path.join(run_dir, 'alphagrail_results.json')
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         print(f"\n  Results saved to {result_path}")
 
-        eval_path = os.path.join(output_dir, 'factor_evaluation.csv')
+        eval_path = os.path.join(run_dir, 'factor_evaluation.csv')
         factor_eval.to_csv(eval_path)
         print(f"  Factor evaluation saved to {eval_path}")
 
@@ -1538,5 +1548,6 @@ if __name__ == '__main__':
     print(f"  Information Ratio:{results['information_ratio']:.4f}")
     print(f"  Winning Factor:   {results['winning_factor']}")
     print(f"  Forward Period:   {results['forward_period']}d")
-    print(f"  Mean Rank-IC:     {results['mean_rank_ic_train']:.4f}")
-    print(f"  ICIR:             {results['icir']:.4f}")
+    print(f"  Mean Rank-IC (test): {results['mean_rank_ic_test']:.4f}")
+    print(f"  ICIR (test):         {results['icir_test']:.4f}")
+    print(f"  Turnover:            {results['avg_turnover']:.4f}")

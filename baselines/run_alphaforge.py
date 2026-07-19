@@ -50,7 +50,8 @@ class AlphaForgeConfig:
     window: Union[int, str] = "inf"  # Rolling window for factor evaluation
     top_n_stocks: int = 50  # Number of stocks in portfolio
     forward_period: int = 10  # Forward return period for IC evaluation (must match other baselines)
-    
+    holding_period: int = 1  # Portfolio holding period (days) for backtest; 1 = daily rebalance
+
     def __post_init__(self):
         if self.seeds is None:
             self.seeds = [0, 1, 2, 3, 4]
@@ -1194,6 +1195,7 @@ def stage3_evaluate_results(
     stage2_results: Dict,
     config: AlphaForgeConfig,
     test_start_ts: pd.Timestamp = None,
+    save_dir: Optional[str] = None,
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1314,9 +1316,38 @@ def stage3_evaluate_results(
         commission=0.0003,
         slippage=0.001,
         risk_free_rate=0.0,
-        holding_period=1,
+        holding_period=config.holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
+
+    # ── Compute test-period Mean IC / ICIR ──
+    # Cross-sectional Spearman between the Stage-2 combined factor scores
+    # (test_predictions) and the N-day forward returns on the test close.
+    # This is the number that should appear in the paper tables (test, not IS).
+    fp = config.forward_period
+    fwd_wide = close_test.shift(-fp) / close_test - 1.0
+    _daily_ics = []
+    for _pred, _date in zip(test_predictions, test_pred_dates):
+        if not isinstance(_pred, np.ndarray):
+            continue
+        if _date not in fwd_wide.index:
+            continue
+        _fr = fwd_wide.loc[_date].dropna()
+        _n = min(len(_pred), len(stock_names))
+        _scores = pd.Series(_pred[:_n], index=stock_names[:_n])
+        _common = _scores.index.intersection(_fr.index)
+        if len(_common) >= 5:
+            _rho = _scores[_common].corr(_fr[_common], method='spearman')
+            if not np.isnan(_rho):
+                _daily_ics.append(_rho)
+    if _daily_ics:
+        _mean_ic = float(np.mean(_daily_ics))
+        _std_ic = float(np.std(_daily_ics, ddof=1))
+        _icir = _mean_ic / _std_ic if (len(_daily_ics) > 1 and _std_ic > 0) else 0.0
+    else:
+        _mean_ic, _icir = 0.0, 0.0
+    metrics['mean_ic'] = _mean_ic
+    metrics['icir'] = _icir
 
     print(f"\n  Results (BacktestEngine):")
     print(f"    Annual Return:    {metrics.get('annual_return', 0):.4f}")
@@ -1325,6 +1356,28 @@ def stage3_evaluate_results(
     print(f"    Information Ratio:{metrics.get('information_ratio', 0):.4f}")
     print(f"    Win Rate:         {metrics.get('win_rate', 0):.4f}")
     print(f"    Calmar Ratio:     {metrics.get('calmar_ratio', 0):.4f}")
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        _result = {
+            'method': 'AlphaForge',
+            'mean_ic': metrics.get('mean_ic', 0.0),
+            'icir': metrics.get('icir', 0.0),
+            'annual_return': metrics.get('annual_return', 0.0),
+            'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
+            'max_drawdown': metrics.get('max_drawdown', 0.0),
+            'information_ratio': metrics.get('information_ratio', 0.0),
+            'calmar_ratio': metrics.get('calmar_ratio', 0.0),
+            'win_rate': metrics.get('win_rate', 0.0),
+            'avg_turnover': metrics.get('avg_turnover', 0.0),
+            'total_return': metrics.get('total_return', 0.0),
+            'n_trading_days': metrics.get('n_trading_days', 0),
+            'forward_period': config.forward_period,
+        }
+        _path = os.path.join(save_dir, 'alphaforge_results.json')
+        with open(_path, 'w', encoding='utf-8') as f:
+            json.dump(_result, f, indent=2, default=str)
+        print(f"\n  Results saved to {_path}")
 
     return {
         'metrics': metrics,
@@ -1347,6 +1400,7 @@ def run_alphaforge_baseline(
     verbose: bool = False,
     use_gan: bool = True,
     forward_period: int = 10,
+    holding_period: int = None,  # None -> use AlphaForgeConfig default (1)
     train_end_date: str = None,
     test_start_date: str = None,
     context_days: int = 30,
@@ -1491,16 +1545,22 @@ def run_alphaforge_baseline(
         seeds=seeds or [0],
         top_n_stocks=top_n_stocks,
         forward_period=forward_period,
+        holding_period=holding_period if holding_period is not None else 1,
     )
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    # Date-isolated run directory (one subdir per execution, for multiple runs)
+    _date_str = pd.Timestamp.now().strftime("%Y%m%d")
+    run_dir = os.path.join(output_dir, _date_str)
+    os.makedirs(run_dir, exist_ok=True)
+
     # Stage 1: Mine factors (TRAIN data only — no test data leakage)
     print("\n" + "="*60)
     print("[Stage 1] Mining factors on TRAIN data only")
     print("="*60)
-    stage1_results = stage1_mine_factors(prices_train, config, output_dir, use_gan=use_gan)
+    stage1_results = stage1_mine_factors(prices_train, config, run_dir, use_gan=use_gan)
     
     # Stage 2: Combine factors (ALL data for walk-forward predictions)
     # Factors are fixed from Stage 1; Stage 2 does rolling IC + linear regression
@@ -1508,14 +1568,14 @@ def run_alphaforge_baseline(
     print("\n" + "="*60)
     print("[Stage 2] Walk-forward combination on ALL data")
     print("="*60)
-    stage2_results = stage2_combine_factors(prices, stage1_results, config, output_dir)
+    stage2_results = stage2_combine_factors(prices, stage1_results, config, run_dir)
     
     # Stage 3: Evaluate results (TEST data only)
     # Receives close_test (date×stock DataFrame) and filters predictions to test dates
     print("\n" + "="*60)
     print("[Stage 3] Backtest on TEST data only")
     print("="*60)
-    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts)
+    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir)
     
     return {
         'metrics': stage3_results['metrics'],
@@ -1548,6 +1608,9 @@ if __name__ == "__main__":
     parser.add_argument("--forward-period", type=int, default=10,
                         help="Forward return period in days for IC evaluation "
                              "(default 10, matching other baselines)")
+    parser.add_argument("--holding-period", type=int, default=None,
+                        help="Portfolio holding period in days for backtest "
+                             "(default: config value, 1 = daily rebalance)")
     parser.add_argument("--train-end", type=str, default=None,
                         help="Last date of training period (YYYY-MM-DD). "
                              "Default: read from config or '2023-12-31'")
@@ -1572,6 +1635,7 @@ if __name__ == "__main__":
         verbose=args.verbose,
         use_gan=args.use_gan,
         forward_period=args.forward_period,
+        holding_period=args.holding_period,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
         context_days=args.context_days,
@@ -1584,6 +1648,9 @@ if __name__ == "__main__":
     print(f"Sharpe Ratio: {results['metrics']['sharpe_ratio']:.4f}")
     print(f"Max Drawdown: {results['metrics']['max_drawdown']:.2%}")
     print(f"Information Ratio: {results['metrics']['information_ratio']:.4f}")
+    print(f"Mean IC (test): {results['metrics'].get('mean_ic', 0):.4f}")
+    print(f"ICIR (test):    {results['metrics'].get('icir', 0):.4f}")
+    print(f"Turnover:       {results['metrics'].get('avg_turnover', 0):.4f}")
     print(f"Forward Period:    {results['forward_period']}d")
     print(f"Train End:         {results['train_end']}")
     print(f"Test Start:        {results['test_start']}")
