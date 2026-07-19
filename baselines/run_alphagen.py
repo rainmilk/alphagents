@@ -1335,7 +1335,7 @@ def run_alphagen_baseline(
     n_generate: int = 300,
     pool_capacity: int = 20,
     top_n_stocks: int = 50,
-    holding_period: int = 1,
+    holding_period: Optional[int] = None,
     seed: int = 42,
     output_dir: Optional[str] = None,
     # ── RL method selection ──
@@ -1607,7 +1607,8 @@ def run_alphagen_baseline(
     print(f"\n[Step 8] Running backtest...")
     prices_aligned = close.loc[portfolios.index].reindex(columns=portfolios.columns)
     engine = BacktestEngine(
-        commission=0.0003, slippage=0.001, risk_free_rate=0.0, holding_period=holding_period,
+        commission=0.0003, slippage=0.001, risk_free_rate=0.0,
+        holding_period=holding_period if holding_period is not None else 1,
     )
     run_dir = None
     method_name = "alphagen"
@@ -1746,6 +1747,9 @@ if __name__ == '__main__':
     parser.add_argument('--forward-period', type=int, default=10,
                         help='Forward return period in days for IC evaluation '
                              '(default 10, matching other baselines)')
+    parser.add_argument('--holding-period', type=int, default=None,
+                        help='Rebalance frequency in days (1=daily, 5=weekly, 20=monthly). '
+                             'Defaults to AlphaGenConfig.holding_period (1).')
 
     args = parser.parse_args()
 
@@ -1759,7 +1763,7 @@ if __name__ == '__main__':
         n_generate=args.n_generate,
         pool_capacity=args.pool_capacity,
         top_n_stocks=args.top_n,
-        holding_period=1,
+        holding_period=args.holding_period,
         seed=args.seed,
         output_dir=args.output_dir,
         rl_method=args.rl_method,

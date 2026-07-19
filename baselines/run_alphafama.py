@@ -458,6 +458,7 @@ def run_alphafama_baseline(
     use_llm: bool = True,
     llm_iters: int = 10,
     forward_period: Optional[int] = None,
+    holding_period: Optional[int] = None,
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -507,17 +508,26 @@ def run_alphafama_baseline(
     print(f"  Loaded: {len(price_data['close'].index)} trading days x "
           f"{len(price_data['close'].columns)} stocks")
 
-    # ── Resolve forward_period (align with other baselines) ───────────
-    if forward_period is None:
+    # ── Resolve forward_period & holding_period from config ───────────
+    if forward_period is None or holding_period is None:
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 _cfg = yaml.safe_load(f)
-            forward_period = int(
-                _cfg.get('evolution', {}).get('forward_period', 10)
-            )
+            if forward_period is None:
+                forward_period = int(
+                    _cfg.get('evolution', {}).get('forward_period', 10)
+                )
+            if holding_period is None:
+                holding_period = int(
+                    _cfg.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+                )
         except Exception:
-            forward_period = 10
+            if forward_period is None:
+                forward_period = 10
+            if holding_period is None:
+                holding_period = 1
     print(f"  Forward period (IC horizon): {forward_period}d")
+    print(f"  Holding period (rebalance):  {holding_period}d")
 
     # ── Step 2: Convert to AlphaFAMA format ────────────────────────────
     print("\n[Step 2] Converting data to AlphaFAMA format...")
@@ -708,8 +718,8 @@ def run_alphafama_baseline(
         _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
         _e = end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
         _fp = forward_period if forward_period is not None else 10
-        # AlphaFAMA backtest uses a fixed daily rebalance (holding_period=1)
-        param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-1"
+        _hp = holding_period if holding_period is not None else 1
+        param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
         run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
         os.makedirs(run_dir, exist_ok=True)
 
@@ -721,7 +731,7 @@ def run_alphafama_baseline(
         top_n_factors=top_factors,
         test_start_date=test_start,
         prices=prices,
-        holding_period=1,  # Daily rebalance for fairest comparison
+        holding_period=holding_period,
         save_dir=run_dir,
         method_prefix=method_name,
     )
@@ -960,6 +970,9 @@ if __name__ == '__main__':
     parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return horizon (trading days) for IC evaluation. '
                              'Defaults to config evolution.forward_period (10).')
+    parser.add_argument('--holding-period', type=int, default=None,
+                        help='Rebalance frequency in days (1=daily, 5=weekly, 20=monthly). '
+                             'Defaults to config backtest.trading.holding_period (1).')
 
     args = parser.parse_args()
 
@@ -975,6 +988,7 @@ if __name__ == '__main__':
         use_llm=args.use_llm,
         llm_iters=args.llm_iters,
         forward_period=args.forward_period,
+        holding_period=args.holding_period,
     )
 
     print("\n" + "=" * 60)
