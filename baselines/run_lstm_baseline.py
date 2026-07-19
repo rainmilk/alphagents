@@ -607,9 +607,8 @@ def run_lstm_baseline(
     prices_aligned = close.loc[portfolios.index]
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
-    # ── Date-isolated run directory (matches MASE: experiments/{base}/{YYYYMMDD}) ──
-    # ── Parameter-tagged, date-isolated run directory ──
-    # Layout: experiments/{method}/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{YYYYMMDD}/
+    # ── Parameter-tagged run directory ──
+    # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "lstm"
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
     _s = start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
@@ -617,7 +616,7 @@ def run_lstm_baseline(
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)
 
     engine = BacktestEngine(
@@ -626,7 +625,7 @@ def run_lstm_baseline(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
+    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")

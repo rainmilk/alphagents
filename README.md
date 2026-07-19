@@ -28,14 +28,17 @@ AAAI2027_LLM_MultiFactor/
 │   └── evaluator.py      # Comprehensive metrics
 ├── viz/                   # Visualization tools
 │   └── plotter.py        # Plotting functions (standalone runnable)
-├── experiments/           # Experiment results
-│   ├── results/          # Fixed output directory (portfolios, baselines, etc.)
-│   └── {yyyymmdd}/       # Date-stamped run outputs
-│       ├── self_evolve/  # LLM-generated factors per round
-│       │   ├── round_0/  # Seed factors (generated_factors.json)
-│       │   └── round_N/  # Evolved factors (improved_factors.json)
-│       ├── debate/       # Debate expert opinions (debate_factors_result.json)
-│       └── fusion/       # Final fused factors (final_factors.json)
+├── experiments/           # Experiment results (parameter-tagged root)
+│   └── {universe}_{start}_{end}_forward-{fp}_holding-{hp}/   # e.g. hs300_2019-01-01_2025-12-31_forward-10_holding-1
+│       ├── {yyyymmdd}/    # MASE per-run outputs (date-stamped)
+│       │   └── results/   # performance_metrics.csv, portfolios.csv, evolution_history.json, ...
+│       │       ├── self_evolve/round_0/generated_factors.json   # seed factors
+│       │       ├── debate/debate_factors_result.json            # expert opinions + Chair synthesis
+│       │       └── fusion/final_factors.json                    # final fused factors
+│       ├── alphaagent/    # Baseline outputs (one subdir per method)
+│       ├── alphaforge/    #   each contains daily_returns.csv, portfolio_values.csv, ...
+│       ├── lstm/          #   (9 baselines total, see "Baselines" section below)
+│       └── ...            #   mcts_llm_alpha, alphagen, alphafama, alphagrail, xgboost, xgboost_simple
 ├── paper/                 # Paper-related files
 │   └── figures/          # Generated figures
 ├── main.py                # Main pipeline (argparse CLI + --test mode)
@@ -125,10 +128,10 @@ Load a previously saved `final_factors.json` and run step7+step8 directly on tes
 This reuses trained factor weights without re-running the full pipeline.
 
 ```bash
-# Specify factor file explicitly
-python main.py --test --factor-path experiments/20260601/results/final_factors.json
+# Specify factor file explicitly (path is now under the parameter-tagged root)
+python main.py --test --factor-path experiments/hs300_2019-01-01_2025-12-31_forward-10_holding-1/20260601/results/final_factors.json
 
-# Auto-detect latest final_factors.json under experiments/
+# Auto-detect latest final_factors.json under experiments/{param_dir}/*/results/
 python main.py --test
 
 # With real data and custom date range
@@ -178,11 +181,11 @@ Options:
   --forward-period N       Forward return horizon in trading days (None → config or 20)
   --holding-period N       Backtest holding period: 1=daily, 5=weekly, 20=monthly
   --factor-path PATH       Path to final_factors.json for --test mode
-                           (default: auto-detect from experiments/*/results/)
+                           (default: auto-detect from experiments/{param_dir}/*/results/)
   --context-days N         Context days prepended before test_start_date for
                            rolling-window factors (None → auto-detect from data or config)
   --config PATH            Path to config file (default: config/config.yaml)
-  --output-dir PATH        Output directory (default: experiments/YYYYMMDD/results/)
+  --output-dir PATH        Output directory (default: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{YYYYMMDD}/results/)
 ```
 
 ### Run Experiments
@@ -214,7 +217,7 @@ Implements structured debate among 5 expert agents:
 - Volatility Expert
 - Growth Expert
 
-Each agent evaluates factors independently (Phase 1), then engages in structured debate rounds (Phase 2) with full reproducibility. A Chair Agent (step5b) then performs cross-factor ranking with explicit selection/rejection reasons. All expert opinions — scores, reasoning, concerns, strengths, and per-round consensus — are saved to `experiments/{yyyymmdd}/debate/debate_factors_result.json`.
+Each agent evaluates factors independently (Phase 1), then engages in structured debate rounds (Phase 2) with full reproducibility. A Chair Agent (step5b) then performs cross-factor ranking with explicit selection/rejection reasons. All expert opinions — scores, reasoning, concerns, strengths, and per-round consensus — are saved to `experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{yyyymmdd}/results/debate/debate_factors_result.json`.
 
 ### 2. Self-Evolving Factor Generator (`methods/evolve.py`)
 
@@ -287,22 +290,77 @@ Key active sections:
 
 ## Results
 
-All results are saved under `experiments/`:
+All results are saved under a **parameter-tagged root** `experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/`
+(e.g. `experiments/hs300_2019-01-01_2025-12-31_forward-10_holding-1/`). The universe/start/end are taken from
+`config.yaml`'s `data.universe` (or CLI `--start`/`--end`/`--universe` overrides); `forward`/`holding` come from
+`evolution.forward_period` / `backtest.trading.holding_period` (or `--forward-period` / `--holding-period`).
+MASE and all 9 baselines share this same root, so results are directly comparable in one place.
 
-**`experiments/results/`** — fixed outputs:
-- `performance_metrics.csv`: Main results
+**`experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{yyyymmdd}/results/`** — MASE per-run outputs:
+- `performance_metrics.csv`: Main results. Includes backtest metrics **plus `mean_rank_ic` and `icir`** (test-period Rank-IC of the fused composite factor vs N-day forward returns — added for fair comparison with baselines)
 - `portfolios.csv`: Portfolio weights
 - `evolution_history.json`: Evolution round history (serialized from dataclass)
 - `ablation_studies.json`: Ablation study results
 - `baseline_comparisons.json`: Baseline comparison results
-
-**`experiments/{yyyymmdd}/`** — date-stamped per-run outputs:
 - `self_evolve/round_0/generated_factors.json`: Seed factors (LLM Phase 1)
 - `self_evolve/round_1/generated_factors.json` … `round_N/`: Evolved factors per round (invalid factors with parse errors are excluded)
 - `debate/debate_factors_result.json`: All expert opinions + Chair Agent cross-factor synthesis
 - `fusion/final_factors.json`: Final fused factors with weights, signs, and `n_periods` metadata (invalid factors excluded)
 
+**`experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/`** — Baseline per-method outputs
+(one subdir per baseline, see **Baselines** section below). Common files: `daily_returns.csv`, `portfolio_values.csv`,
+and a `results.json`/`*_results.json` with metrics (incl. `mean_rank_ic`, `icir`, `sharpe_ratio`, etc.).
+
 Train/test data persists as CSVs under `data/train/` and `data/test/` with `data/split_info.json` metadata.
+
+## Baselines
+
+The paper compares MASE against 9 formulaic-alpha LLM baselines. Each baseline is a **standalone runner** under
+`baselines/` (not orchestrated by `main.py`); run them directly.
+
+| # | Method | Runner script | Output subdir |
+|---|--------|---------------|---------------|
+| 1 | AlphaAgent | `baselines/run_alphaagent.py` | `alphaagent/` |
+| 2 | AlphaForge | `baselines/run_alphaforge.py` | `alphaforge/` |
+| 3 | MCTS-LLM | `baselines/run_mcts_llm_alpha.py` | `mcts_llm/` |
+| 4 | AlphaGen | `baselines/run_alphagen.py` | `alphagen/` |
+| 5 | AlphaFAMA | `baselines/run_alphafama.py` | `alphafama/` |
+| 6 | AlphaGrail | `baselines/run_alphagrail.py` | `alphagrail/` |
+| 7 | LSTM | `baselines/run_lstm_baseline.py` | `lstm/` |
+| 8 | XGBoost | `baselines/run_alpha_xgboost.py` | `xgboost/` |
+| 9 | XGBoost (simple) | `baselines/run_xgboost_simple.py` | `xgboost_simple/` |
+
+### Running a baseline
+
+```bash
+# Each baseline reads config.yaml for universe/date/forward/holding defaults
+python baselines/run_alphaagent.py --config-path config/config.yaml
+
+# Override key parameters (consistent across all baselines)
+python baselines/run_alphaforge.py \
+    --config-path config/config.yaml \
+    --start 2022-01-01 --end 2024-06-30 \
+    --forward-period 10 --holding-period 5
+```
+
+Common CLI flags (all baselines): `--config-path`, `--start`, `--end`, `--forward-period`, `--holding-period`,
+`--output-dir`. `holding_period` and `forward_period` default to `config.yaml`
+(`backtest.trading.holding_period` / `evolution.forward_period`) so runs stay aligned with the MASE pipeline.
+
+### Output layout
+
+Every baseline writes its results under the **shared parameter-tagged root** used by MASE:
+
+```
+experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
+├── daily_returns.csv      # strategy daily returns (from unified BacktestEngine)
+├── portfolio_values.csv   # portfolio net-value curve
+├── results.json           # metrics (sharpe_ratio, max_drawdown, mean_rank_ic, icir, ...); filename varies per method
+└── <method-specific>      # e.g. alphaforge: zoo_factors.json, predictions.npy, weights.npy, alphaforge_results.json
+```
+
+> Note: AlphaForge's output root was moved from `results/` to `experiments/` so all 9 baselines (and MASE) share
+> the same `experiments/{param_dir}/` tree — results are directly comparable without manual regrouping.
 
 ## Troubleshooting
 

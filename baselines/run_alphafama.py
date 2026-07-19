@@ -720,7 +720,7 @@ def run_alphafama_baseline(
         _fp = forward_period if forward_period is not None else 10
         _hp = holding_period if holding_period is not None else 1
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-        run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
+        run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
         os.makedirs(run_dir, exist_ok=True)
 
     simulated_metrics = _simulate_portfolio_from_ic(
@@ -733,7 +733,6 @@ def run_alphafama_baseline(
         prices=prices,
         holding_period=holding_period,
         save_dir=run_dir,
-        method_prefix=method_name,
     )
 
     # ── Step 10: Compile results ───────────────────────────────────────
@@ -816,7 +815,6 @@ def _simulate_portfolio_from_ic(
     prices: pd.DataFrame,
     holding_period: int = 1,
     save_dir: Optional[str] = None,
-    method_prefix: Optional[str] = None,
 ) -> Dict:
     """
     Simulate an IC-weighted portfolio using the unified BacktestEngine.
@@ -946,7 +944,7 @@ def _simulate_portfolio_from_ic(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir, method_prefix=method_prefix)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
 
     return metrics
 

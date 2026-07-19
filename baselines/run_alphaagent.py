@@ -1437,8 +1437,8 @@ def run_alphaagent_baseline(
     factor_df = compute_factor_values(formulas, price_midx, return_series)
     print(f"  Shape: {factor_df.shape}")
 
-    # ── Date-isolated run directory (matches MASE: experiments/{base}/{YYYYMMDD}) ──
-    # ── Parameter-tagged, date-isolated run directory ──
+    # ── Parameter-tagged run directory ──
+    # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "alphaagent"
     _u = data_cfg.get('index', 'hs300')
     _s = start_date
@@ -1446,7 +1446,7 @@ def run_alphaagent_baseline(
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)
 
     # Save factor values
@@ -1516,14 +1516,18 @@ def run_alphaagent_baseline(
             holding_period=holding_period if holding_period is not None
             else config.get('backtest', {}).get('holding_period', 1),  # Daily rebalance
         )
-        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
+        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
         # Save portfolio values for analysis
         pv = engine.get_portfolio_values()
         if pv is not None and not pv.empty:
-            pv_path = os.path.join(run_dir, f"{method_name}_portfolio_values.csv")
+            pv_path = os.path.join(run_dir, "portfolio_values.csv")
             pv.to_csv(pv_path, header=['portfolio_value'])
             print(f"  Portfolio values saved to: {pv_path}")
+
+    # Train IC summary values, needed by the results print block below
+    best_ic = float(ic_mean.iloc[0]) if len(ic_mean) > 0 else 0.0
+    avg_ic = float(ic_mean.mean()) if len(ic_mean) > 0 else 0.0
 
     print(f"\n{'=' * 60}")
     print(f"  AlphaAgent Baseline Results ({'LLM' if llm_used else 'Random'})")
@@ -1541,9 +1545,6 @@ def run_alphaagent_baseline(
     print(f"  N Factors:        {len(ic_mean)}")
 
     # ── Build result ───────────────────────────────────────────────
-    best_ic = float(ic_mean.iloc[0]) if len(ic_mean) > 0 else 0.0
-    avg_ic = float(ic_mean.mean()) if len(ic_mean) > 0 else 0.0
-
     result = {
         'metrics': metrics,
         'mean_rank_ic_train': best_ic,

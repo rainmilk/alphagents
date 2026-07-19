@@ -27,6 +27,7 @@ import yaml
 import warnings
 
 from config import config_path
+import config as global_config  # module holding experiment-dir tags (universe/start/end)
 
 warnings.filterwarnings('ignore')
 
@@ -106,6 +107,8 @@ class AAAI2027Pipeline:
         force_refresh: bool = False,
         split_train_end: str = None,
         split_test_start: str = None,
+        forward_period: int = None,
+        holding_period: int = None,
     ):
         """
         Step 1: Load and preprocess data.
@@ -161,7 +164,30 @@ class AAAI2027Pipeline:
         self.data_loader.price_data = self.price_data
         self.data_loader.fundamental_data = self.fundamental_data
         self.data_loader.industry_data = self.industry_data
-        
+
+        # Set global experiment-directory tags so config_path("experiments", ...)
+        # emits the real universe/date range instead of "NA_NA_NA".
+        # Mirrors the side effect of DataLoader.load_data() (dataloader/loader.py
+        # L363-365), which is bypassed here because data is assigned directly.
+        _univ_cfg = self.config['data']['universe']
+        global_config.universe = universe or _univ_cfg.get('index', 'hs300')
+        global_config.start_date = start_date or _univ_cfg.get('start_date', 'na')
+        global_config.end_date = end_date or _univ_cfg.get('end_date', 'na')
+
+        # Forward/holding tags so experiment dirs match the baseline format
+        # experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/...
+        # CLI override (param) takes priority; otherwise fall back to config.yaml.
+        global_config.forward_period = (
+            forward_period
+            if forward_period is not None
+            else self.config.get('evolution', {}).get('forward_period', 10)
+        )
+        global_config.holding_period = (
+            holding_period
+            if holding_period is not None
+            else self.config.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+        )
+
         # Read split config from explicit params, config.yaml, or defaults
         train_end_date = split_train_end or self.config.get('data', {}).get('train_end_date', None)
         test_start_date = split_test_start or self.config.get('data', {}).get('test_start_date', None)
@@ -1110,7 +1136,60 @@ class AAAI2027Pipeline:
                 print("  [✓] Memory bank saved")
             except Exception as e:
                 print(f"  [memory] Save failed: {e}")
-        
+
+    def _compute_composite_test_ic(self, test_data=None):
+        """
+        Compute the MASE composite (fused) factor's test-period Mean Rank-IC
+        and ICIR against N-day forward returns, and attach them to
+        ``self.performance_metrics`` as ``mean_rank_ic`` / ``icir``.
+
+        This mirrors the per-baseline ``mean_rank_ic`` / ``icir`` that the
+        baseline runners report (e.g. run_xgboost_simple.py, run_alphagrail.py),
+        so every method in the paper's experiment table shares the same IC/ICIR
+        column names.
+
+        Must be called AFTER step7 (which sets ``self.test_composite_scores``)
+        and ideally after step8 (which populates ``self.performance_metrics``);
+        the IC/ICIR keys are merged into whatever dict is already present.
+
+        Args:
+            test_data: Test-period data dict. If None, falls back to
+                ``self.test_data`` (same resolution order as step7/step8).
+
+        Returns:
+            bool: True if IC/ICIR were computed and stored, False otherwise.
+        """
+        if self.performance_metrics is None:
+            self.performance_metrics = {}
+        _test = test_data if test_data is not None else getattr(self, 'test_data', None)
+        if not _test:
+            print("  [warn] No test data available for composite IC/ICIR.")
+            return False
+        scores = getattr(self, 'test_composite_scores', None)
+        if scores is None or (hasattr(scores, 'empty') and scores.empty):
+            print("  [warn] No composite test scores available for IC/ICIR.")
+            return False
+        try:
+            from backtest.metrics import factor_ic_metrics
+            _close = _test['price_data']['close']
+            _fp = getattr(self, '_forward_period', None) \
+                or self.config.get('evolution', {}).get('forward_period', 10)
+            _fwd = _close.pct_change(_fp).shift(-_fp)
+            _common = scores.index.intersection(_fwd.index)
+            if len(_common) == 0:
+                print("  [warn] No overlapping dates between composite scores "
+                      "and forward returns.")
+                return False
+            _ic = factor_ic_metrics(scores.loc[_common], _fwd.loc[_common])
+            self.performance_metrics['mean_rank_ic'] = float(_ic['mean_ic'])
+            self.performance_metrics['icir'] = float(_ic['icir'])
+            print(f"  Mean Rank-IC (test): {_ic['mean_ic']:.4f}, "
+                  f"ICIR (test): {_ic['icir']:.4f}")
+            return True
+        except Exception as e:
+            print(f"  [warn] Could not compute composite test IC/ICIR: {e}")
+            return False
+
     def run_full_pipeline(
         self,
         start_date: str = "2021-01-01",
@@ -1163,6 +1242,8 @@ class AAAI2027Pipeline:
             data_source=data_source,
             split_train_end=split_train_end,
             split_test_start=split_test_start,
+            forward_period=forward_period,
+            holding_period=holding_period,
         )
         self.step2_initialize_memory()
         self.step3_generate_factors()
@@ -1173,6 +1254,9 @@ class AAAI2027Pipeline:
         self.step6_fuse_factors()
         self.step7_construct_portfolio(test_data=test_data)
         self.step8_backtest(test_data=test_data)
+        # Compute & persist the composite factor's test-period IC/ICIR so they
+        # appear in the saved performance_metrics.csv (full pipeline path).
+        self._compute_composite_test_ic(test_data)
         self.step9_save_results(output_dir)
         
         print("\n" + "=" * 60)
@@ -1328,24 +1412,11 @@ class AAAI2027Pipeline:
         # ── 7. Run step8 (backtest) ──
         self.step8_backtest(test_data=test_data)
 
-        # ── 8. Compute test-period Mean IC / ICIR for the composite factor ──
+        # ── 8. Compute test-period Mean Rank-IC / ICIR for the composite factor ──
         # Uses the fused test-period factor scores (self.test_composite_scores)
         # vs the N-day forward returns, all on the out-of-sample period.
-        try:
-            from backtest.metrics import factor_ic_metrics
-            _test_close = test_data['price_data']['close']
-            _fp = getattr(self, '_forward_period', None) or self.config.get('evolution', {}).get('forward_period', 10)
-            _fwd = _test_close.pct_change(_fp).shift(-_fp)
-            _scores = getattr(self, 'test_composite_scores', None)
-            if _scores is not None and not _scores.empty:
-                _common = _scores.index.intersection(_fwd.index)
-                if len(_common) > 0:
-                    _ic = factor_ic_metrics(_scores.loc[_common], _fwd.loc[_common])
-                    self.performance_metrics['mean_ic'] = float(_ic['mean_ic'])
-                    self.performance_metrics['icir'] = float(_ic['icir'])
-                    print(f"  Mean IC (test): {_ic['mean_ic']:.4f}, ICIR (test): {_ic['icir']:.4f}")
-        except Exception as e:
-            print(f"  [warn] Could not compute test IC: {e}")
+        # Stored as mean_rank_ic / icir into self.performance_metrics.
+        self._compute_composite_test_ic(test_data)
 
         print("\n" + "=" * 60)
         print("  Test Pipeline Complete!")
@@ -1717,7 +1788,7 @@ Examples:
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
-            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  Mean Rank-IC (test): {metrics.get('mean_rank_ic', 0):.4f}")
             print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
             print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:
@@ -1760,6 +1831,8 @@ Examples:
             use_sample=not args.real,
             data_source=args.source,
             force_refresh=args.force_refresh,
+            forward_period=None,
+            holding_period=args.holding_period,
         )
 
         if pipeline.test_data is None:
@@ -1778,7 +1851,7 @@ Examples:
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
-            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  Mean Rank-IC (test): {metrics.get('mean_rank_ic', 0):.4f}")
             print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
             print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:
@@ -1788,7 +1861,7 @@ Examples:
         metrics = run_demo()
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
-            print(f"  Mean IC (test): {metrics.get('mean_ic', 0):.4f}")
+            print(f"  Mean Rank-IC (test): {metrics.get('mean_rank_ic', 0):.4f}")
             print(f"  ICIR (test):    {metrics.get('icir', 0):.4f}")
             print(f"  Turnover:       {metrics.get('avg_turnover', 0):.4f}")
         else:

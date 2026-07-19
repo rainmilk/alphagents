@@ -1619,9 +1619,9 @@ def run_alphagen_baseline(
         _fp = forward_period if forward_period is not None else 10
         _hp = holding_period if holding_period is not None else 1
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-        run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
+        run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
         os.makedirs(run_dir, exist_ok=True)
-    backtest_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir, method_prefix=method_name)
+    backtest_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # ── Step 10: Assemble results ──────────────────────────────────────
     print("\n" + "=" * 60)

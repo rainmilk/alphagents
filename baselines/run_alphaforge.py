@@ -1196,7 +1196,6 @@ def stage3_evaluate_results(
     config: AlphaForgeConfig,
     test_start_ts: pd.Timestamp = None,
     save_dir: Optional[str] = None,
-    method_prefix: Optional[str] = None,
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1319,7 +1318,7 @@ def stage3_evaluate_results(
         risk_free_rate=0.0,
         holding_period=config.holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir, method_prefix=method_prefix)
+    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
 
     # ── Compute test-period Mean IC / ICIR ──
     # Cross-sectional Spearman between the Stage-2 combined factor scores
@@ -1397,7 +1396,7 @@ def run_alphaforge_baseline(
     n_factors: int = 10,
     zoo_size: int = 50,
     seeds: List[int] = None,
-    output_dir: str = "results/alphaforge",
+    output_dir: str = "experiments/alphaforge",
     verbose: bool = False,
     use_gan: bool = True,
     forward_period: int = 10,
@@ -1561,7 +1560,7 @@ def run_alphaforge_baseline(
     _fp = forward_period
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-    run_dir = os.path.join(os.path.dirname(output_dir), param_dir)
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)
 
     # Stage 1: Mine factors (TRAIN data only — no test data leakage)
@@ -1583,7 +1582,7 @@ def run_alphaforge_baseline(
     print("\n" + "="*60)
     print("[Stage 3] Backtest on TEST data only")
     print("="*60)
-    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir, method_prefix=method_name)
+    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir)
     
     return {
         'metrics': stage3_results['metrics'],
@@ -1609,7 +1608,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-n", type=int, default=None, help="Number of stocks in portfolio (overrides config)")
     parser.add_argument("--n-factors", type=int, default=10, help="Number of factors to combine")
     parser.add_argument("--zoo-size", type=int, default=50, help="Number of factors to mine")
-    parser.add_argument("--output-dir", type=str, default="results/alphaforge", help="Output directory")
+    parser.add_argument("--output-dir", type=str, default="experiments/alphaforge", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--use-gan", action="store_true", default=True, help="Use GAN-based factor mining")
     parser.add_argument("--no-gan", action="store_false", dest="use_gan", help="Use template-based factor generation")
