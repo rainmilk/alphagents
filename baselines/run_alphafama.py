@@ -151,6 +151,33 @@ def _read_llm_config(config_path: str) -> Dict:
     }
 
 
+def _safe_message_text(message) -> str:
+    """Extract usable text from an OpenAI chat-completion message.
+
+    Reasoning models (DeepSeek-R1 / QwQ / o1, …) frequently emit
+    chain-of-thought in a separate ``reasoning_content`` field while leaving
+    ``content`` empty or ``None``. Reading only ``content`` would silently
+    yield '' and poison downstream parsing. Mirror of
+    run_alphaagent._extract_message_text.
+
+    Strategy: prefer ``content``; fall back to ``reasoning_content`` (direct
+    attribute or under ``model_extra`` on pydantic-based SDKs). Returns ''
+    when nothing usable.
+    """
+    content = getattr(message, "content", None)
+    if content:
+        return content
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning:
+        return reasoning
+    extra = getattr(message, "model_extra", None) or {}
+    if isinstance(extra, dict):
+        rc = extra.get("reasoning_content")
+        if rc:
+            return rc
+    return ""
+
+
 def _llm_generate_factor(
     api_key: str,
     base_url: str,
@@ -181,17 +208,44 @@ def _llm_generate_factor(
         chain=" -> ".join(chain_formulas),
     )
 
-    try:
-        resp = client.chat.completions.create(
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    # AlphaFAMA emits a JSON *array* (not an object), so we deliberately do NOT
+    # force response_format={"type": "json_object"} — that mode rejects
+    # top-level arrays. Robustness comes from the fence/substring fallback plus
+    # the retry-on-non-JSON loop below (mirrors run_alphaagent._llm_generate_factors).
+    response = None
+    thinking = True  # attempt enable_thinking=False; self-heal if unsupported
+    idx = 0
+    while idx < 2:
+        call_kwargs = dict(
             model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             temperature=temperature,
-            max_tokens=512,
+            max_tokens=4096,
         )
-        raw = resp.choices[0].message.content.strip()
+        if thinking:
+            # Self-hosted reasoning endpoints (e.g. bailian/deepseek-v4-flash)
+            # may write CoT into content; disable thinking to get clean output.
+            call_kwargs["extra_body"] = {"enable_thinking": False}
+        try:
+            response = client.chat.completions.create(**call_kwargs)
+        except Exception as e:
+            if thinking:
+                thinking = False
+                logger.warning(
+                    "  Provider rejected extra_body (enable_thinking); retrying "
+                    "without thinking control. (%s)",
+                    e,
+                )
+                continue
+            logger.warning(f"LLM API call failed: {e}")
+            return None
+
+        raw = _safe_message_text(response.choices[0].message).strip()
 
         # Strip Markdown code fences if present (case-insensitive, any language tag)
         fence_match = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
@@ -218,12 +272,25 @@ def _llm_generate_factor(
         elif isinstance(gen, str):
             return gen
         else:
-            if gen is None:
-                logger.warning("LLM returned non-JSON output, skipping. raw=%r", raw)
-            return None
-    except Exception as e:
-        logger.warning(f"LLM API call failed: {e}")
-        return None
+            logger.warning(
+                "  LLM factor generation returned non-JSON output (attempt %d); "
+                "retrying with strict JSON-only instruction. raw=%r",
+                idx + 1, raw,
+            )
+            messages = messages + [
+                {"role": "user", "content":
+                 "Your previous reply was not valid JSON. Respond with ONLY a JSON "
+                 "array containing one factor string (no explanations, no markdown, "
+                 "no code fences). Nothing else."},
+            ]
+            idx += 1
+
+    if response is not None:
+        logger.warning(
+            "LLM returned non-JSON output, skipping. raw=%r",
+            _safe_message_text(response.choices[0].message),
+        )
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -768,10 +835,15 @@ def run_alphafama_baseline(
         'train_end': train_end,
         'test_start': test_start,
     }
+    # Mirrors run_alphaagent.final_result.json: keep the chosen factors (here, the
+    # top-|IC| factors with their ICs) alongside the metrics so the run is
+    # reproducible from disk, not just from terminal scrollback.
+    results['factors'] = top_factors_dict
 
     # ── Step 11: Save results ──────────────────────────────────────────
     if output_dir:
-        result_path = os.path.join(run_dir, 'alphafama_results.json')
+        # Unified artifact name across baselines (was alphafama_results.json).
+        result_path = os.path.join(run_dir, 'final_result.json')
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, default=str)
         print(f"\n  Results saved to {result_path}")

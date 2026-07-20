@@ -771,7 +771,7 @@ Respond with ONLY the hypothesis text (2-4 sentences). No JSON, no formatting.""
 
         user_prompt = "\n".join(user_parts)
 
-        response = client.chat.completions.create(
+        call_kwargs = dict(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -780,6 +780,25 @@ Respond with ONLY the hypothesis text (2-4 sentences). No JSON, no formatting.""
             max_tokens=500,
             temperature=0.7,
         )
+        thinking = True
+        while True:
+            if thinking:
+                # Reasoning endpoints may emit CoT in content; disable thinking so
+                # the hypothesis is the actual answer, not the chain-of-thought.
+                call_kwargs["extra_body"] = {"enable_thinking": False}
+            try:
+                response = client.chat.completions.create(**call_kwargs)
+                break
+            except Exception as e:
+                if thinking:
+                    thinking = False
+                    logger.warning(
+                        "  Provider rejected extra_body (enable_thinking); "
+                        "retrying without thinking control. (%s)",
+                        e,
+                    )
+                    continue
+                raise
         content = _extract_message_text(response.choices[0].message)
         hypothesis = content.strip() if content else ""
         if not hypothesis:
@@ -880,6 +899,7 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
         result = None
         response = None
         json_mode = True  # try API-level JSON enforcement; self-heal if unsupported
+        thinking = True   # try disabling thinking; self-heal if unsupported
         # Up to 2 attempts: the normal call, then one correction pass if the
         # model emitted non-JSON (verbose prose / truncated before the JSON).
         # Temperature drops on the correction pass to nudge determinism.
@@ -893,12 +913,24 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
             )
             if json_mode:
                 call_kwargs["response_format"] = {"type": "json_object"}
+            if thinking:
+                # Reasoning endpoints (bailian/deepseek-v4-flash, …) may write
+                # CoT into content; disable thinking for clean JSON.
+                call_kwargs["extra_body"] = {"enable_thinking": False}
             try:
                 response = client.chat.completions.create(**call_kwargs)
             except Exception as e:
                 # Some self-hosted / third-party OpenAI-compatible endpoints
-                # reject `response_format`. Detect and retry without it rather
-                # than failing the whole mining run.
+                # reject `extra_body` / `response_format`. Self-heal rather than
+                # failing the whole mining run.
+                if thinking:
+                    thinking = False
+                    logger.warning(
+                        "  Provider rejected extra_body (enable_thinking); retrying "
+                        "without thinking control. (%s)",
+                        e,
+                    )
+                    continue
                 if json_mode and "response_format" in str(e).lower():
                     json_mode = False
                     logger.warning(
@@ -1675,6 +1707,20 @@ def run_alphaagent_baseline(
     with open(results_path, 'w') as f:
         json.dump(result, f, indent=2, default=float)
     print(f"\n  Results saved to: {results_path}")
+
+    # ── Save consolidated final_result (mirrors the console summary so the
+    #    run is reproducible from disk, not just from terminal scrollback) ──
+    # Includes the metrics/ICs AND the expressions of the factors actually
+    # used (factor_df columns), which results.json alone does not carry.
+    chosen = set(factor_df.columns)
+    final_result = dict(result)
+    final_result['factors'] = {
+        name: expr for name, expr in formulas if name in chosen
+    }
+    final_path = os.path.join(output_dir, "final_result.json")
+    with open(final_path, 'w', encoding='utf-8') as f:
+        json.dump(final_result, f, indent=2, default=float, ensure_ascii=False)
+    print(f"  Final result saved to: {final_path}")
 
     return result
 
