@@ -574,9 +574,16 @@ def _run_llm_mining(
                 factor_values_list = []
                 for ticker, grp in train_df.groupby('ticker'):
                     series = factor_series_fn(grp, new_factor)
-                    series.name = new_factor
+                    # NB: name the per-ticker piece with the expression. The
+                    # cached copy (train_exposure_cache[new_factor]) is later
+                    # pd.concat-ed along axis=1 in Step 6; without a name here
+                    # the columns collapse to positional [0,1,2] and stop
+                    # matching the expression-string factor names used in
+                    # train_ic / top_factor_names → "factors missing from
+                    # train_ic". compute_rankic tolerates a 1-col named
+                    # DataFrame (it indexes .iloc[:,0]), so this is safe.
                     factor_values_list.append(
-                        pd.Series(series.values, index=grp.index)
+                        pd.Series(series.values, index=grp.index, name=new_factor)
                     )
                 factor_series = pd.concat(factor_values_list)
 
