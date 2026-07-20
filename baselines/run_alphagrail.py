@@ -1392,6 +1392,9 @@ def run_alphagrail_baseline(
             'train_end': train_end,
             'test_start': test_start,
             'forward_period': forward_period,
+            'train_start': train_start,
+            'test_end': test_end,
+            'holding_period': holding_period,
         }
 
     print(f"  Portfolios: {portfolios.shape[0]} days x {portfolios.shape[1]} stocks")
@@ -1455,6 +1458,9 @@ def run_alphagrail_baseline(
         'n_trading_days': metrics.get('n_trading_days', 0),
         'train_end': train_end,
         'test_start': test_start,
+        'train_start': train_start,
+        'test_end': test_end,
+        'holding_period': holding_period,
         'use_llm_tournament': use_llm_tournament,
         'llm_model': llm_model if use_llm_tournament else None,
         'tournament_winner_metrics': {

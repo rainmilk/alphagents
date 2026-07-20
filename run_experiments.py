@@ -609,8 +609,8 @@ class ExperimentRunner:
             'sharpe_ratio': results.get('sharpe_ratio', 0.0),
             'max_drawdown': results.get('max_drawdown', 0.0),
             'information_ratio': results.get('information_ratio', 0.0),
-            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
-            'icir': results.get('icir', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_test', results.get('mean_rank_ic', 0.0)),
+            'icir': results.get('icir_test', results.get('test_icir', results.get('icir', 0.0))),
             'winning_factor': results.get('winning_factor', 'N/A'),
             'n_factors': results.get('n_factors', 0),
         }
@@ -652,6 +652,8 @@ class ExperimentRunner:
             'max_drawdown': metrics.get('max_drawdown', 0.0),
             'information_ratio': metrics.get('information_ratio', 0.0),
             'mean_ic': metrics.get('mean_ic', 0.0),
+            'mean_rank_ic': metrics.get('mean_ic', 0.0),
+            'icir': metrics.get('icir', 0.0),
             'n_alphas': metrics.get('n_alphas', 0),
         }
 
@@ -693,8 +695,8 @@ class ExperimentRunner:
             'sharpe_ratio': results.get('sharpe_ratio', 0.0),
             'max_drawdown': results.get('max_drawdown', 0.0),
             'information_ratio': results.get('information_ratio', 0.0),
-            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
-            'icir': results.get('icir', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_test', results.get('mean_rank_ic', 0.0)),
+            'icir': results.get('icir_test', results.get('test_icir', results.get('icir', 0.0))),
             'n_factors': results.get('n_factors', 0),
             'used_llm': results.get('used_llm', False),
             'llm_model': results.get('llm_model', None),
@@ -740,8 +742,8 @@ class ExperimentRunner:
             'sharpe_ratio': results.get('sharpe_ratio', 0.0),
             'max_drawdown': results.get('max_drawdown', 0.0),
             'information_ratio': results.get('information_ratio', 0.0),
-            'mean_rank_ic': results.get('mean_rank_ic_train', 0.0),
-            'icir': results.get('icir', 0.0),
+            'mean_rank_ic': results.get('mean_rank_ic_test', results.get('mean_rank_ic', 0.0)),
+            'icir': results.get('icir_test', results.get('test_icir', results.get('icir', 0.0))),
             'n_factors': results.get('n_factors', 0),
             'used_llm': results.get('used_llm', False),
             'llm_model': results.get('llm_model', None),
@@ -779,6 +781,8 @@ class ExperimentRunner:
                 'sharpe_ratio': results['metrics']['sharpe_ratio'],
                 'max_drawdown': results['metrics']['max_drawdown'],
                 'information_ratio': results['metrics']['information_ratio'],
+                'mean_rank_ic': results['metrics'].get('mean_rank_ic_test', results['metrics'].get('mean_rank_ic', 0.0)),
+                'icir': results['metrics'].get('icir_test', results['metrics'].get('icir', 0.0)),
                 'n_factors': results.get('n_factors', 0),
                 'used_gan': results.get('used_gan', False),
                 'gan_pool_size': results.get('gan_pool_size', 0),
@@ -890,7 +894,8 @@ class ExperimentRunner:
             'sharpe_ratio': results.get('sharpe_ratio', 0.0),
             'max_drawdown': results.get('max_drawdown', 0.0),
             'information_ratio': results.get('information_ratio', 0.0),
-            'test_icir': results.get('test_icir', 0.0),
+            'mean_rank_ic': results.get('test_mean_rank_ic', results.get('mean_rank_ic_test', 0.0)),
+            'icir': results.get('test_icir', results.get('icir_test', 0.0)),
             'pool_size': results.get('pool_size', 0),
             'n_factors': results.get('n_factors', 0),
         }
@@ -1031,9 +1036,61 @@ class ExperimentRunner:
         pass
     
     def _generate_table_3(self):
-        """Generate Table 3: Baseline comparisons."""
-        # Simplified implementation
-        pass
+        """Generate Table 3: Baseline comparisons.
+
+        Renders ``self.results['baseline_comparisons']`` (a name→metrics dict)
+        into a paper-ready DataFrame with a fixed, comparable column schema,
+        writes it to ``<output_dir>/table3_baseline_comparisons.csv``, and
+        prints a readable summary. Row order preserves the baseline ordering
+        defined in ``run_baseline_comparisons``.
+        """
+        baseline_results = self.results.get('baseline_comparisons', {})
+        if not baseline_results:
+            print("  [table3] No baseline_comparisons found; skipping.")
+            return
+
+        # Friendly display names for the paper (falls back to title-cased key)
+        LABELS = {
+            'equal_weight': 'Equal Weight',
+            'ic_weighted': 'IC-Weighted',
+            'mcts_llm_alpha': 'MCTS-LLM-Alpha',
+            'alphafama': 'AlphaFAMA',
+            'alphaagent': 'AlphaAgent',
+            'alphaforge': 'AlphaForge',
+            'alphagrail': 'AlphaGrail',
+            'gpt_factor': 'GPT-Factor (sim)',
+            'xgboost': 'XGBoost',
+            'alphagen': 'AlphaGen',
+        }
+
+        # Fixed, comparable column schema — ICIR/IC are out-of-sample (test).
+        METRIC_COLS = [
+            'annual_return', 'sharpe_ratio', 'max_drawdown',
+            'information_ratio', 'mean_rank_ic', 'icir', 'n_factors',
+        ]
+        FLOAT_COLS = [
+            'annual_return', 'sharpe_ratio', 'max_drawdown',
+            'information_ratio', 'mean_rank_ic', 'icir',
+        ]
+
+        rows = []
+        for name, m in baseline_results.items():
+            row = {'method': LABELS.get(name, name.replace('_', ' ').title())}
+            for col in METRIC_COLS:
+                row[col] = m.get(col, float('nan'))
+            row['error'] = m.get('error', '')
+            rows.append(row)
+
+        df = pd.DataFrame(rows, columns=['method'] + METRIC_COLS + ['error'])
+        df_out = df.copy()
+        df_out[FLOAT_COLS] = df_out[FLOAT_COLS].round(4)
+
+        csv_path = f"{self.output_dir}/table3_baseline_comparisons.csv"
+        df_out.to_csv(csv_path, index=False)
+
+        print(f"\n{'=' * 70}\n  Table 3: Baseline Comparisons\n{'=' * 70}")
+        print(df_out.to_string(index=False))
+        print(f"\nTable 3 saved to {csv_path}")
 
 
 def run_all_experiments(

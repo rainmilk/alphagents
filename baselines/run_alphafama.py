@@ -765,6 +765,15 @@ def run_alphafama_baseline(
     else:
         logical_avg_ic = avg_test_ic
 
+    # ── Test ICIR (out-of-sample) ──
+    # Mirrors the train ICIR formula: mean(per-factor mean IC over test dates)
+    # / std(per-factor mean IC over test dates). Computed over the logical test
+    # period (excluding the context window) for a fair OOS estimate.
+    _ic_for_icir = logical_test_ic if len(logical_test_ic) > 0 else test_ic
+    per_factor_test_ic = _ic_for_icir.mean()   # Series: per-factor mean IC across test dates
+    test_icir = per_factor_test_ic.mean() / per_factor_test_ic.std() if per_factor_test_ic.std() > 0 else 0.0
+    print(f"  ICIR (test): {test_icir:.4f}")
+
     print(f"  Mean Rank-IC (test): {avg_test_ic:.4f}")
     if len(logical_test_ic) > 0:
         print(f"  Mean Rank-IC (test, no context): {logical_avg_ic:.4f}")
@@ -822,7 +831,9 @@ def run_alphafama_baseline(
         'llm_model': llm_model,
         'llm_iters': llm_iters if used_llm else 0,
         'mean_rank_ic_train': float(avg_ic),
-        'icir': float(icir),
+        'icir': float(test_icir),            # TEST (out-of-sample) ICIR — reported metric
+        'icir_train': float(icir),          # preserved in-sample ICIR (for overfit diagnosis)
+        'icir_test': float(test_icir),      # explicit OOS ICIR (parallel to AlphaAgent schema)
         'mean_rank_ic_test': float(logical_avg_ic),
         'top_ic_factors': top_factors_dict,
         'annual_return': simulated_metrics.get('annual_return', 0.0),
@@ -834,6 +845,10 @@ def run_alphafama_baseline(
         'avg_turnover': simulated_metrics.get('avg_turnover', 0.0),
         'train_end': train_end,
         'test_start': test_start,
+        'train_start': train_start,
+        'test_end': test_end,
+        'forward_period': forward_period,
+        'holding_period': holding_period,
     }
     # Mirrors run_alphaagent.final_result.json: keep the chosen factors (here, the
     # top-|IC| factors with their ICs) alongside the metrics so the run is
@@ -1081,6 +1096,6 @@ if __name__ == '__main__':
     print(f"  Win Rate:         {results['win_rate']:.4f}")
     print(f"  Calmar Ratio:     {results['calmar_ratio']:.4f}")
     print(f"  Mean Rank-IC:     {results['mean_rank_ic_train']:.4f}")
-    print(f"  ICIR:             {results['icir']:.4f}")
+    print(f"  ICIR (test):      {results['icir']:.4f}")
     print(f"  Factors:          {results['n_factors']} (Alpha101: {results.get('n_alpha101_factors', 0)}, LLM: {results.get('n_llm_factors', 0)})")
     print(f"  Used LLM:         {results['used_llm']}")

@@ -1508,6 +1508,21 @@ def run_alphaagent_baseline(
     train_end_date = train_end_date or config['data'].get('train_end_date', '2023-12-31')
     test_start_date = test_start_date or config['data'].get('test_start_date', '2024-01-01')
 
+    # ── Unified result directory (computed early so data/ + formula artifacts ──
+    # ── land in the SAME param-tagged dir as factors/IC/portfolio/results) ──
+    # Layout: {output_dir_parent}/hs300_{start}_{end}_forward-{fp}_holding-{hp}/alphaagent/
+    # This matches every other baseline's run_dir convention (dash separators +
+    # {method} subdir), so cross-method comparison globs keep working.
+    method_name = "alphaagent"
+    _u = data_cfg.get('index', 'hs300')
+    _s = train_start_date
+    _e = test_end_date
+    _fp = forward_period if forward_period is not None else 10
+    _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
+    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
+    run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
+    os.makedirs(run_dir, exist_ok=True)
+
     # ── 1. Load data from main DataLoader ───────────────────────────
     print("=" * 60)
     print("[1/6] Loading data from main DataLoader...")
@@ -1539,7 +1554,7 @@ def run_alphaagent_baseline(
 
     # ── 2. Save HDF5 data for AlphaAgent compatibility ─────────────
     print(f"\n[2/6] Generating HDF5 data files...")
-    data_dir = os.path.join(output_dir, "data")
+    data_dir = os.path.join(run_dir, "data")
     # NOTE: $return = DAILY returns, used as a FACTOR FEATURE only.
     # The IC target (forward_return_series) is passed separately to compute_rank_ic below.
     save_data_as_hdf5(price_midx, return_series, data_dir)
@@ -1565,7 +1580,7 @@ def run_alphaagent_baseline(
         print(f"  ... and {len(formulas) - 5} more")
 
     # Save formulas
-    formulas_path = os.path.join(output_dir, "formulas.json")
+    formulas_path = os.path.join(run_dir, "formulas.json")
     with open(formulas_path, 'w') as f:
         json.dump([(n, fm) for n, fm in formulas], f, indent=2)
     print(f"  Saved formulas to: {formulas_path}")
@@ -1577,17 +1592,7 @@ def run_alphaagent_baseline(
     factor_df = compute_factor_values(formulas, price_midx, return_series)
     print(f"  Shape: {factor_df.shape}")
 
-    # ── Parameter-tagged run directory ──
-    # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
-    method_name = "alphaagent"
-    _u = data_cfg.get('index', 'hs300')
-    _s = train_start_date
-    _e = test_end_date
-    _fp = forward_period if forward_period is not None else 10
-    _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
-    param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
-    run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
-    os.makedirs(run_dir, exist_ok=True)
+    # ── Factor values are saved into run_dir (the unified result dir) ──
 
     # Save factor values
     factor_path = os.path.join(run_dir, "factors.csv")
@@ -1694,6 +1699,11 @@ def run_alphaagent_baseline(
         'icir_test': icir_test,
         'n_factors': len(ic_mean),
         'forward_period': forward_period,
+        'train_start': train_start,
+        'train_end': train_end,
+        'test_start': test_start,
+        'test_end': test_end,
+        'holding_period': holding_period,
         'annual_return': metrics.get('annual_return', 0.0),
         'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': metrics.get('max_drawdown', 0.0),
@@ -1703,7 +1713,7 @@ def run_alphaagent_baseline(
     }
 
     # Save full results
-    results_path = os.path.join(output_dir, "results.json")
+    results_path = os.path.join(run_dir, "results.json")
     with open(results_path, 'w') as f:
         json.dump(result, f, indent=2, default=float)
     print(f"\n  Results saved to: {results_path}")
@@ -1717,7 +1727,7 @@ def run_alphaagent_baseline(
     final_result['factors'] = {
         name: expr for name, expr in formulas if name in chosen
     }
-    final_path = os.path.join(output_dir, "final_result.json")
+    final_path = os.path.join(run_dir, "final_result.json")
     with open(final_path, 'w', encoding='utf-8') as f:
         json.dump(final_result, f, indent=2, default=float, ensure_ascii=False)
     print(f"  Final result saved to: {final_path}")
@@ -1734,7 +1744,8 @@ if __name__ == "__main__":
     parser.add_argument("--config-path", default="config/config.yaml",
                         help="Path to main config YAML")
     parser.add_argument("--output-dir", default="experiments/alphaagent",
-                        help="Output directory for results")
+                        help="Base directory; actual results land in "
+                             "{parent}/hs300_{start}_{end}_forward-{fp}_holding-{hp}/alphaagent/")
     parser.add_argument("--n-formulas", type=int, default=50,
                         help="Number of factor formulas to generate")
     parser.add_argument("--seed", type=int, default=42,

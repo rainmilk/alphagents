@@ -361,6 +361,11 @@ def run_mcts_llm_alpha_baseline(
         'best_score': mcts.best_score if hasattr(mcts, 'best_score') else 0,
         'n_alpha_in_repo': len(alpha_repository),
         'forward_period': forward_period,
+        'train_start': train_start,
+        'train_end': train_end,
+        'test_start': test_start,
+        'test_end': test_end,
+        'holding_period': holding_period if holding_period is not None else mcts_config.holding_period,
         'metrics': metrics,
         'timestamp': datetime.now().isoformat(),
     }

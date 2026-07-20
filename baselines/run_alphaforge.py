@@ -1217,6 +1217,11 @@ def stage3_evaluate_results(
     config: AlphaForgeConfig,
     test_start_ts: pd.Timestamp = None,
     save_dir: Optional[str] = None,
+    train_start: Optional[str] = None,
+    train_end: Optional[str] = None,
+    test_start: Optional[str] = None,
+    test_end: Optional[str] = None,
+    holding_period: Optional[int] = None,
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1394,6 +1399,11 @@ def stage3_evaluate_results(
             'total_return': metrics.get('total_return', 0.0),
             'n_trading_days': metrics.get('n_trading_days', 0),
             'forward_period': config.forward_period,
+            'train_start': train_start,
+            'train_end': train_end,
+            'test_start': test_start,
+            'test_end': test_end,
+            'holding_period': holding_period,
         }
         _path = os.path.join(save_dir, 'alphaforge_results.json')
         with open(_path, 'w', encoding='utf-8') as f:
@@ -1611,7 +1621,13 @@ def run_alphaforge_baseline(
     print("\n" + "="*60)
     print("[Stage 3] Backtest on TEST data only")
     print("="*60)
-    stage3_results = stage3_evaluate_results(close_test, stage2_results, config, test_start_ts, save_dir=run_dir)
+    stage3_results = stage3_evaluate_results(
+        close_test, stage2_results, config, test_start_ts,
+        save_dir=run_dir,
+        train_start=train_start, train_end=train_end,
+        test_start=test_start, test_end=test_end,
+        holding_period=holding_period,
+    )
     
     return {
         'metrics': stage3_results['metrics'],
@@ -1621,8 +1637,11 @@ def run_alphaforge_baseline(
         'used_gan': stage1_results.get('used_gan', False),
         'gan_pool_size': stage1_results.get('gan_stats', {}).get('pool_size', 0),
         'forward_period': forward_period,
+        'train_start': train_start,
         'train_end': train_end,
         'test_start': test_start,
+        'test_end': test_end,
+        'holding_period': holding_period,
     }
 
 

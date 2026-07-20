@@ -697,6 +697,9 @@ def run_lstm_baseline(
         'train_end': train_end,
         'test_start': test_start,
         'forward_period': forward_period,
+        'train_start': train_start,
+        'test_end': test_end,
+        'holding_period': holding_period,
     }
 
     # -- Step 10: Save results --
