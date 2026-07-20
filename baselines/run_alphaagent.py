@@ -665,6 +665,67 @@ def _read_llm_config(config_path: str) -> Tuple[str, str, str]:
         return '', '', 'gpt-4o'
 
 
+def _extract_message_text(message) -> str:
+    """Extract usable text from an OpenAI chat completion message.
+
+    Reasoning models (o1, DeepSeek-R1 / deepseek-reasoner, QwQ, ...) frequently
+    emit chain-of-thought in a separate ``reasoning_content`` field while leaving
+    ``content`` empty or ``None``. If we only read ``content``, callers silently
+    receive an empty string — which (before the Stage-1 guard) poisoned Stage 2
+    with an empty hypothesis and now still produces a fake fallback hypothesis.
+
+    Strategy: prefer ``content``; if it is empty/None, fall back to
+    ``reasoning_content`` (exposed directly on some SDKs, or under
+    ``model_extra`` on pydantic-based ones). Returns '' when nothing usable.
+    """
+    content = getattr(message, "content", None)
+    if content:
+        return content
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning:
+        return reasoning
+    # openai>=1.x pydantic models stash unknown fields in model_extra
+    extra = getattr(message, "model_extra", None) or {}
+    if isinstance(extra, dict):
+        rc = extra.get("reasoning_content")
+        if rc:
+            return rc
+    return ""
+
+
+def _parse_factors_json(raw: str):
+    """Best-effort parse of a factor-spec JSON object from LLM output.
+
+    Handles the common failure modes seen in practice:
+      * markdown code fences (```json ... ```, any casing / language tag)
+      * a JSON object embedded in surrounding prose
+      * output truncated before the JSON could be completed
+
+    Returns the dict, or None if no valid JSON object can be recovered.
+    """
+    if not raw:
+        return None
+    # 1) strip code fences if present
+    fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+    candidate = fence.group(1).strip() if fence else raw
+    try:
+        obj = json.loads(candidate)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # 2) fall back to the first {...} substring (e.g. JSON buried in prose)
+    m = re.search(r"(\{[\s\S]*\})", candidate, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def _llm_generate_hypothesis(
     api_key: str,
     base_url: str,
@@ -719,7 +780,13 @@ Respond with ONLY the hypothesis text (2-4 sentences). No JSON, no formatting.""
             max_tokens=500,
             temperature=0.7,
         )
-        hypothesis = response.choices[0].message.content.strip()
+        content = _extract_message_text(response.choices[0].message)
+        hypothesis = content.strip() if content else ""
+        if not hypothesis:
+            # Empty/whitespace response (e.g. reasoning model left `content`
+            # empty and had no usable `reasoning_content`). Treat as failure so
+            # the orchestration fallback fires instead of poisoning Stage 2.
+            return None
         return hypothesis
 
     except Exception as e:
@@ -770,13 +837,9 @@ When constructing factor expressions, you are restricted to utilizing only the f
 
 {FUNCTION_LIB_DESCRIPTION}
 
-Key considerations:
-- Avoid using raw prices directly due to scale differences; use relative changes or standardized data
-- Add small constants (e.g., 1e-8) to denominators to prevent division by zero
-- Apply RANK() or ZSCORE() for cross-sectional comparability
-- Choose suitable window sizes (5, 10, 20, 30, 60 days) for moving averages
+Use relative changes or standardized data (not raw prices), add 1e-8 to denominators, prefer RANK()/ZSCORE(), and window sizes 5/10/20/30/60. Do NOT think step-by-step and do NOT explain — output the JSON object immediately.
 
-The output should follow JSON format without other content. The schema is:
+You MUST output ONLY a single JSON object and nothing else — no explanations, no reasoning, no markdown, no code fences. Your entire response must be valid JSON parseable as an object. The schema is:
 {{
     "factor_name_1": {{
         "description": "description of factor 1",
@@ -788,15 +851,11 @@ The output should follow JSON format without other content. The schema is:
     }}
 }}
 
-Example:
+Example (one factor, terse):
 {{
     "Normalized_Intraday_Range": {{
         "description": "Candlestick body normalized by volatility",
         "expression": "ABS($close - $open) / (TS_STD($close, 10) + 1e-8)"
-    }},
-    "Volume_Price_Correlation": {{
-        "description": "Correlation between price range and volume",
-        "expression": "TS_CORR($high - $low, $volume, 20)"
     }}
 }}
 
@@ -814,37 +873,62 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
 
         user_prompt = "\n".join(user_parts)
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=2000,
-            temperature=0.5,
-        )
-        raw = response.choices[0].message.content.strip()
-
-        # Parse JSON response — robustly strip code fences and extract the object
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         result = None
-        fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        if fence:
-            raw = fence.group(1).strip()
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            # Fallback: extract the first JSON object substring and retry
-            m = re.search(r"\{[\s\S]*\}", raw, re.DOTALL)
-            if m:
-                try:
-                    result = json.loads(m.group(1))
-                except json.JSONDecodeError:
-                    result = None
+        response = None
+        json_mode = True  # try API-level JSON enforcement; self-heal if unsupported
+        # Up to 2 attempts: the normal call, then one correction pass if the
+        # model emitted non-JSON (verbose prose / truncated before the JSON).
+        # Temperature drops on the correction pass to nudge determinism.
+        idx = 0
+        while idx < 2:
+            call_kwargs = dict(
+                model=model,
+                messages=messages,
+                max_tokens=4096,
+                temperature=0.1 if idx > 0 else 0.2,
+            )
+            if json_mode:
+                call_kwargs["response_format"] = {"type": "json_object"}
+            try:
+                response = client.chat.completions.create(**call_kwargs)
+            except Exception as e:
+                # Some self-hosted / third-party OpenAI-compatible endpoints
+                # reject `response_format`. Detect and retry without it rather
+                # than failing the whole mining run.
+                if json_mode and "response_format" in str(e).lower():
+                    json_mode = False
+                    logger.warning(
+                        "  Provider rejected response_format; retrying without "
+                        "JSON mode. (%s)",
+                        e,
+                    )
+                    continue
+                raise
+            raw = _extract_message_text(response.choices[0].message).strip()
+            result = _parse_factors_json(raw)
+            if result is not None:
+                break
+            logger.warning(
+                "  LLM factor generation returned non-JSON output (attempt %d); "
+                "retrying with strict JSON-only instruction. raw=%r",
+                idx + 1, raw,
+            )
+            messages = messages + [
+                {"role": "user", "content":
+                 "Your previous reply was not valid JSON. Respond with ONLY the "
+                 "JSON object (no explanations, no markdown, no code fences). "
+                 "Nothing else."},
+            ]
+            idx += 1
 
         if not isinstance(result, dict):
             logger.warning(
                 "  LLM factor generation returned non-JSON output; skipping. raw=%r",
-                response.choices[0].message.content,
+                _extract_message_text(response.choices[0].message) if response else "",
             )
             return []
 
@@ -934,8 +1018,8 @@ def generate_llm_factors(
             round_idx=round_idx, prev_hypotheses=prev_hypotheses,
         )
 
-        if hypothesis is None:
-            print(f"    Hypothesis generation failed, using fallback direction")
+        if not hypothesis or not hypothesis.strip():
+            print(f"    Hypothesis generation failed/empty, using fallback direction")
             hypothesis = f"Factor based on {direction}"
 
         prev_hypotheses.append(hypothesis)
