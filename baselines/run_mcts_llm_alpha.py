@@ -85,8 +85,8 @@ def run_mcts_llm_alpha_baseline(
 
     method_name = "mcts_llm"
     _u = data_cfg.get('index', 'hs300')  # mcts default universe (not exposed via CLI)
-    _s = train_start_date or data_cfg.get('start_date', 'na')
-    _e = test_end_date or data_cfg.get('end_date', 'na')
+    _s = train_start_date or loader.data_config.get('train_start_date', 'na')
+    _e = test_end_date or loader.data_config.get('test_end_date', 'na')
     _fp = forward_period
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"

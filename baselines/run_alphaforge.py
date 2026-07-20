@@ -1483,9 +1483,9 @@ def run_alphaforge_baseline(
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             if train_start_date is None:
-                train_start_date = config['data']['universe'].get('start_date', '2019-01-01')
+                train_start_date = config['data'].get('train_start_date', '2019-01-01')
             if test_end_date is None:
-                test_end_date = config['data']['universe'].get('end_date', '2025-12-31')
+                test_end_date = config['data'].get('test_end_date', '2025-12-31')
             if instruments is None:
                 instruments = config['data']['universe'].get('name', 'csi300')
             if top_n_stocks is None:
@@ -1594,8 +1594,8 @@ def run_alphaforge_baseline(
     # ── Parameter-tagged, date-isolated run directory ──
     method_name = "alphaforge"
     _u = instruments or _cfg.get('universe', {}).get('index', 'csi300')
-    _s = train_start_date or _cfg.get('universe', {}).get('start_date', 'na')
-    _e = test_end_date or _cfg.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or _cfg.get('train_start_date', 'na')
+    _e = test_end_date or _cfg.get('test_end_date', 'na')
     _fp = forward_period
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"

@@ -1503,8 +1503,8 @@ def run_alphaagent_baseline(
         config = yaml.safe_load(f)
 
     data_cfg = config.get('data', {}).get('universe', {})
-    train_start_date = train_start_date or data_cfg.get('start_date', '2019-01-01')
-    test_end_date = test_end_date or data_cfg.get('end_date', '2025-12-31')
+    train_start_date = train_start_date or config['data'].get('train_start_date', '2019-01-01')
+    test_end_date = test_end_date or config['data'].get('test_end_date', '2025-12-31')
     train_end_date = train_end_date or config['data'].get('train_end_date', '2023-12-31')
     test_start_date = test_start_date or config['data'].get('test_start_date', '2024-01-01')
 

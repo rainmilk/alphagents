@@ -413,8 +413,8 @@ def run_xgboost_simple(
     # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "xgboost_simple"
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-    _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-    _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or loader.data_config.get('train_start_date', 'na')
+    _e = test_end_date or loader.data_config.get('test_end_date', 'na')
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"

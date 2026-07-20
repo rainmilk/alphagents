@@ -583,8 +583,8 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
-        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
-        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        start_date = self.config['data'].get('train_start_date', '2023-01-01')
+        end_date = self.config['data'].get('test_end_date', '2025-06-30')
         universe = self.config['data']['universe'].get('index', 'hs300')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
@@ -669,8 +669,8 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
-        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
-        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        start_date = self.config['data'].get('train_start_date', '2023-01-01')
+        end_date = self.config['data'].get('test_end_date', '2025-06-30')
         universe = self.config['data']['universe'].get('index', 'hs300')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
@@ -719,8 +719,8 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
-        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
-        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        start_date = self.config['data'].get('train_start_date', '2023-01-01')
+        end_date = self.config['data'].get('test_end_date', '2025-06-30')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
@@ -766,8 +766,8 @@ class ExperimentRunner:
         try:
             results = run_alphaforge_baseline(
                 config_path=self.config_path,
-                train_start_date=self.config['data']['universe'].get('start_date', '2019-01-01'),
-                test_end_date=self.config['data']['universe'].get('end_date', '2025-12-31'),
+                train_start_date=self.config['data'].get('train_start_date', '2023-01-01'),
+                test_end_date=self.config['data'].get('test_end_date', '2025-06-30'),
                 instruments=self.config['data']['universe'].get('name', 'csi300'),
                 top_n_stocks=self.config.get('backtest', {}).get('top_n_stocks', 50),
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
@@ -818,8 +818,8 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
-        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
-        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        start_date = self.config['data'].get('train_start_date', '2023-01-01')
+        end_date = self.config['data'].get('test_end_date', '2025-06-30')
         universe = self.config['data']['universe'].get('index', 'hs300')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
@@ -866,8 +866,8 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
-        start_date = self.config['data']['universe'].get('start_date', '2019-01-01')
-        end_date = self.config['data']['universe'].get('end_date', '2025-12-31')
+        start_date = self.config['data'].get('train_start_date', '2023-01-01')
+        end_date = self.config['data'].get('test_end_date', '2025-06-30')
         universe = self.config['data']['universe'].get('index', 'hs300')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')

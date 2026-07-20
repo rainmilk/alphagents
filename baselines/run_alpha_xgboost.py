@@ -221,6 +221,10 @@ def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFram
     Returns:
         DataFrame, MultiIndex (date, stock), column 'target_rank'
     """
+    # Guard: callers/CLI may pass None (or 0); coalesce to the documented default
+    # so the unary-minus shift below never receives a non-int.
+    if not forward_period or forward_period <= 0:
+        forward_period = 10
     forward_ret = close.shift(-forward_period) / close - 1
     # Cross-sectional rank, normalized to [0, 1]
     target_rank = forward_ret.rank(axis=1, pct=True)
@@ -476,6 +480,12 @@ def run_xgboost_baseline(
     print(f"  Backend: {_MODEL_BACKEND}")
     print("=" * 60)
 
+    # -- Guard: forward_period must be a positive int --
+    # A caller (CLI, orchestrator) may pass None/0; fall back to the documented
+    # default so downstream target/feature alignment stays consistent.
+    if not forward_period or forward_period <= 0:
+        forward_period = 10
+
     # -- Step 1: Load data via main DataLoader --
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
@@ -557,8 +567,8 @@ def run_xgboost_baseline(
     # Layout: experiments/{universe}_{start}_{end}_forward-{fp}_holding-{hp}/{method}/
     method_name = "alpha_xgboost"
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
-    _s = train_start_date or loader.data_config.get('universe', {}).get('start_date', 'na')
-    _e = test_end_date or loader.data_config.get('universe', {}).get('end_date', 'na')
+    _s = train_start_date or loader.data_config.get('train_start_date', 'na')
+    _e = test_end_date or loader.data_config.get('test_end_date', 'na')
     _fp = forward_period if forward_period is not None else 10
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
