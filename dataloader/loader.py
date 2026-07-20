@@ -1603,6 +1603,10 @@ class DataLoader:
         test_end = test_end or d.get('test_end_date', full_end)
 
         print(f"[loader] Retrieving local dataset: {universe}")
+        print(
+            f"[loader]   train_start={train_start}  train_end={train_end}  "
+            f"test_start={test_start}  test_end={test_end}"
+        )
 
         bundle = retrieve_dataset(
             universe, train_start, train_end, test_start, test_end, full_start, full_end

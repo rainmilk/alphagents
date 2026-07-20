@@ -32,5 +32,5 @@ def scale(series: pd.Series) -> pd.Series:
     return (series - series.mean()) / series.std(ddof=0)
 
 def sign(series: pd.Series) -> pd.Series:
-    """Sign of each element: +1, 0, or -1."""
-    return series.apply(np.sign)
+    """Sign of each element: +1, 0, or -1 (vectorized)."""
+    return np.sign(series)

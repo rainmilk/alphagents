@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local pre-fetched dataset store (populated by load_datasets.py)
+datasets/

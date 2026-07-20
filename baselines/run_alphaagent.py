@@ -697,32 +697,54 @@ def _parse_factors_json(raw: str):
     """Best-effort parse of a factor-spec JSON object from LLM output.
 
     Handles the common failure modes seen in practice:
+      * reasoning-model chain-of-thought wrapped in <think>...</think>
       * markdown code fences (```json ... ```, any casing / language tag)
-      * a JSON object embedded in surrounding prose
+      * a JSON object embedded in / wrapped by surrounding prose
       * output truncated before the JSON could be completed
+
+    Uses bracket-balanced substring extraction (not a greedy regex) so that
+    explanatory prose containing stray braces can't swallow the real payload.
 
     Returns the dict, or None if no valid JSON object can be recovered.
     """
     if not raw:
         return None
-    # 1) strip code fences if present
-    fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-    candidate = fence.group(1).strip() if fence else raw
+    # 1) drop any <think>...</think> CoT block, then strip code fences
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = cleaned.strip()
+    fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    candidate = fence.group(1).strip() if fence else cleaned
     try:
         obj = json.loads(candidate)
         if isinstance(obj, dict):
             return obj
     except json.JSONDecodeError:
         pass
-    # 2) fall back to the first {...} substring (e.g. JSON buried in prose)
-    m = re.search(r"(\{[\s\S]*\})", candidate, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
+    # 2) bracket-balanced extraction: try every '{' as a candidate start and
+    #    match it to its *corresponding* '}', returning the first span that
+    #    parses to a dict. (The old greedy regex grabbed first '{'..last '}',
+    #    which broke whenever prose itself contained braces.)
+    start = cleaned.find("{")
+    while start != -1:
+        depth = 0
+        matched = -1
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                depth += 1
+            elif cleaned[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    matched = i
+                    break
+        if matched != -1:
+            cand = cleaned[start:matched + 1]
+            try:
+                obj = json.loads(cand)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+        start = cleaned.find("{", start + 1)
     return None
 
 
@@ -1517,8 +1539,18 @@ def run_alphaagent_baseline(
     _u = data_cfg.get('index', 'hs300')
     _s = train_start_date
     _e = test_end_date
-    _fp = forward_period if (forward_period is not None and forward_period > 0) else config.get('evolution', {}).get('forward_period', 10)
-    _hp = holding_period if (holding_period is not None and holding_period > 0) else config.get('backtest', {}).get('holding_period', 1)
+    # Resolve forward/holding periods: honor explicit args, else fall back to
+    # config so BOTH the orchestrator path and the standalone CLI follow
+    # config['evolution']['forward_period'] / config['backtest']['trading']['holding_period'].
+    # IMPORTANT: reassign the resolved value back into forward_period/holding_period
+    # so it flows into compute_forward_returns() below (the raw parameter must NOT
+    # be used directly — otherwise a None/empty arg silently breaks IC computation).
+    if not forward_period or forward_period <= 0:
+        forward_period = config.get('evolution', {}).get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = config.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+    _fp = forward_period
+    _hp = holding_period
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
     run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)

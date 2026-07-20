@@ -36,6 +36,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
 import numpy as np
@@ -108,7 +109,7 @@ You are an alpha generator. You should follow the following rules:
    required to output a new alpha factor that is generated from the fusion of
    these factors, and your factor must be different from the input factor.
 2. Do not repeat example answer.
-3. You should return new different factors in a json array.
+3. You should return the new factor as a JSON object with a single key "factor".
 4. The specific function is defined as follows:
 {function_definition}
 5. Follow the path in "improve_path". -> Indicates that the following factors have
@@ -121,12 +122,14 @@ generate_factor_num: 1
 improve_path: {chain}
 
 Output Example
-["rank(correlation(open, volume, 10) / rank(open))"]
+{{"factor": "rank(correlation(open, volume, 10) / rank(open))"}}
 """
 
 SYSTEM_PROMPT = (
     "You are an alpha-mining agent implementing the FAMA (FActor Mining Agent) framework. "
     "Generate a new, interpretable financial alpha factor expression as JSON. "
+    "Respond with a JSON object of the form {\"factor\": \"<expression>\"}. "
+    "Do NOT wrap it in an array. "
     "The expression should use the Alpha101 function library and standard arithmetic operators. "
     "Only use the functions and data columns listed in the function definition."
 )
@@ -178,6 +181,52 @@ def _safe_message_text(message) -> str:
     return ""
 
 
+def _robust_json_load(raw: str):
+    """Parse a JSON array/object out of arbitrary LLM output.
+
+    Models routinely wrap the payload in Markdown fences, chain-of-thought
+    (``<think>...</think>``), or explanatory prose. We therefore:
+      1. drop any ``<think>`` CoT block,
+      2. try a direct ``json.loads``,
+      3. otherwise locate the *first* opening bracket and match it to its
+         *balanced* closing bracket (so stray brackets in the prose can't
+         swallow the real payload — the previous greedy regex did exactly that).
+    Returns the parsed Python object, or ``None`` if nothing parseable.
+    """
+    if not raw:
+        return None
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    for open_c, close_c in (("[", "]"), ("{", "}")):
+        # Try EVERY opening bracket as a candidate start. Reasoning/prose often
+        # contains brackets (e.g. "[alpha1, alpha2] as reference"); the first one
+        # may not be the payload, so we keep scanning until one parses.
+        start = cleaned.find(open_c)
+        while start != -1:
+            depth = 0
+            matched = -1
+            for i in range(start, len(cleaned)):
+                if cleaned[i] == open_c:
+                    depth += 1
+                elif cleaned[i] == close_c:
+                    depth -= 1
+                    if depth == 0:
+                        matched = i
+                        break
+            if matched != -1:
+                cand = cleaned[start:matched + 1]
+                try:
+                    return json.loads(cand)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            start = cleaned.find(open_c, start + 1)
+    return None
+
+
 def _llm_generate_factor(
     api_key: str,
     base_url: str,
@@ -213,14 +262,17 @@ def _llm_generate_factor(
         {"role": "user", "content": prompt},
     ]
 
-    # AlphaFAMA emits a JSON *array* (not an object), so we deliberately do NOT
-    # force response_format={"type": "json_object"} — that mode rejects
-    # top-level arrays. Robustness comes from the fence/substring fallback plus
-    # the retry-on-non-JSON loop below (mirrors run_alphaagent._llm_generate_factors).
+    # We now ask the model for a JSON *object* {"factor": "..."} (not a
+    # top-level array). That lets us use the OpenAI "json_object" response mode
+    # on endpoints that support it, which is the single most reliable way to
+    # avoid non-JSON output. Endpoints that reject response_format are handled
+    # by the self-heal below (fall back to prompt-only + _robust_json_load,
+    # which still copes with fences / CoT / prose-wrapped payloads).
     response = None
     thinking = True  # attempt enable_thinking=False; self-heal if unsupported
+    json_mode = True  # attempt response_format=json_object; self-heal if unsupported
     idx = 0
-    while idx < 2:
+    while idx < 3:
         call_kwargs = dict(
             model=model,
             messages=messages,
@@ -231,15 +283,24 @@ def _llm_generate_factor(
             # Self-hosted reasoning endpoints (e.g. bailian/deepseek-v4-flash)
             # may write CoT into content; disable thinking to get clean output.
             call_kwargs["extra_body"] = {"enable_thinking": False}
+        if json_mode:
+            call_kwargs["response_format"] = {"type": "json_object"}
         try:
             response = client.chat.completions.create(**call_kwargs)
         except Exception as e:
+            # self-heal: drop the unsupported knob, one at a time, and retry
+            if json_mode:
+                json_mode = False
+                logger.warning(
+                    "  Provider rejected response_format (json_object); retrying "
+                    "without it. (%s)", e,
+                )
+                continue
             if thinking:
                 thinking = False
                 logger.warning(
                     "  Provider rejected extra_body (enable_thinking); retrying "
-                    "without thinking control. (%s)",
-                    e,
+                    "without thinking control. (%s)", e,
                 )
                 continue
             logger.warning(f"LLM API call failed: {e}")
@@ -247,30 +308,39 @@ def _llm_generate_factor(
 
         raw = _safe_message_text(response.choices[0].message).strip()
 
-        # Strip Markdown code fences if present (case-insensitive, any language tag)
-        fence_match = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        if fence_match:
-            raw = fence_match.group(1).strip()
+        # Robust JSON extraction: handles Markdown fences, CoT (<think>...</think>),
+        # and prose wrapped around the JSON (e.g. "Here is your factor: [...]").
+        # Uses bracket-balanced substring extraction instead of a greedy regex so
+        # that explanatory text containing stray brackets can't break parsing.
+        gen = _robust_json_load(raw)
 
-        # Parse JSON array (with fallback for prose-wrapped output)
-        gen = None
-        try:
-            gen = json.loads(raw)
-        except json.JSONDecodeError:
-            # Fallback: extract the first JSON-ish array/object substring.
-            # Handles cases where the model returns explanatory text around the JSON
-            # (e.g. "Here is your factor: [...]") or uses an unhandled fence variant.
-            m = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", raw, re.DOTALL)
-            if m:
-                try:
-                    gen = json.loads(m.group(1))
-                except json.JSONDecodeError:
-                    gen = None
-
-        if isinstance(gen, list) and len(gen) > 0:
-            return gen[0]
-        elif isinstance(gen, str):
-            return gen
+        if isinstance(gen, dict):
+            # Preferred JSON-object mode: {"factor": "..."} (or common aliases).
+            factor = (
+                gen.get("factor") or gen.get("expression")
+                or gen.get("alpha") or gen.get("formula")
+            )
+            if isinstance(factor, str) and factor.strip():
+                return factor.strip()
+            # Fall back to the first string value under any other key.
+            for v in gen.values():
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            logger.warning(
+                "  LLM returned a JSON object without a usable factor string; "
+                "retrying. raw=%r", raw,
+            )
+        elif isinstance(gen, list) and len(gen) > 0:
+            # Legacy/array fallback (in case json_object mode was unavailable).
+            for item in gen:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+            logger.warning(
+                "  LLM returned a JSON array but no usable string factor; "
+                "retrying. raw=%r", raw,
+            )
+        elif isinstance(gen, str) and gen.strip():
+            return gen.strip()
         else:
             logger.warning(
                 "  LLM factor generation returned non-JSON output (attempt %d); "
@@ -280,8 +350,8 @@ def _llm_generate_factor(
             messages = messages + [
                 {"role": "user", "content":
                  "Your previous reply was not valid JSON. Respond with ONLY a JSON "
-                 "array containing one factor string (no explanations, no markdown, "
-                 "no code fences). Nothing else."},
+                 "object of the form {\"factor\": \"<expression>\"} (no explanations, "
+                 "no markdown, no code fences). Nothing else."},
             ]
             idx += 1
 
@@ -371,6 +441,44 @@ def _build_cluster_chains(
     return chains
 
 
+def _seed_clusters_from_formula_map(
+    formula_map: Dict[str, str],
+    n_clusters: int = 8,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Build seed clusters + placeholder mean-IC from the base Alpha101 formula
+    library.
+
+    Used when Alpha101 factor *exposures* are disabled (``use_alpha101=False``):
+    instead of clustering the (empty) Alpha101 IC matrix, we seed the LLM
+    mining chains directly from the 101 handcrafted *formulas* in
+    ``FORMULA_MAP``. This gives the LLM real expressions to evolve without
+    ever computing the 101 factor exposures (the single most expensive step in
+    the original pipeline).
+
+    Args:
+        formula_map: Dict mapping alphaXXX -> formula expression string.
+        n_clusters: Number of seed clusters to spread the formulas across
+            (round-robin, deterministic).
+
+    Returns:
+        Tuple of (clusters, mean_ic):
+          - clusters: Series mapping alphaXXX name -> cluster label.
+          - mean_ic:  Series mapping alphaXXX name -> 0.0 placeholder. The
+            seeds' |IC| only affects initial chain ordering (irrelevant when
+            uniform); LLM-generated factors get their real Rank-IC later.
+    """
+    names = list(formula_map.keys())
+    if not names:
+        return pd.Series(dtype=int), pd.Series(dtype=float)
+
+    k = max(1, min(n_clusters, len(names)))
+    labels = [i % k for i in range(len(names))]
+    clusters = pd.Series(labels, index=names, name="cluster")
+    mean_ic = pd.Series(0.0, index=names, name="ic")
+    return clusters, mean_ic
+
+
 def _run_llm_mining(
     train_df: pd.DataFrame,
     clusters: pd.Series,
@@ -399,7 +507,9 @@ def _run_llm_mining(
         max_chain_len: Max chain length per cluster
 
     Returns:
-        Tuple of (list of LLM-generated factor expressions, dict of factor -> Rank IC)
+        Tuple of (list of LLM-generated factor expressions, dict of factor ->
+        Rank IC, dict of factor -> per-ticker train exposure Series). The third
+        element lets Step 6 reuse the train exposures instead of recomputing.
     """
     api_key = llm_config.get('api_key', '')
     base_url = llm_config.get('base_url', '')
@@ -418,6 +528,11 @@ def _run_llm_mining(
         rankic[formula] = float(ic_val)
 
     generated_factors = []
+    # Cache of per-ticker train exposures for each successfully mined factor.
+    # Step 6 reuses these (they are computed on the same train_df) instead of
+    # re-evaluating every LLM expression a second time on the training data —
+    # that second pass was the bulk of Step 6's cost.
+    train_exposure_cache = {}
     returns_col = train_df['returns']
 
     print(f"\n  LLM Mining: {len(chains)} clusters, {n_iters} iterations")
@@ -430,13 +545,25 @@ def _run_llm_mining(
                 continue
 
             # LLM generates a new factor
-            new_factor = _llm_generate_factor(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                chain_formulas=chain[:5],  # Send top-5 as context
-                temperature=temperature,
-            )
+            # Per-iteration guard: a single malformed/garbage LLM payload
+            # (e.g. a JSON object keyed by something other than "factor") must
+            # NOT abort the whole mining run — only this iteration is skipped.
+            # This is what kept Alpha101-OFF runs from collapsing to zero
+            # factors (and thus a zeroed backtest) on one bad generation.
+            try:
+                new_factor = _llm_generate_factor(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    chain_formulas=chain[:5],  # Send top-5 as context
+                    temperature=temperature,
+                )
+            except Exception as e:
+                logger.warning(
+                    "  [Iter %d %s] LLM generation raised %s; skipping this "
+                    "iteration.", iteration, cid, e,
+                )
+                continue
 
             if new_factor is None:
                 continue
@@ -465,6 +592,7 @@ def _run_llm_mining(
             # Add to results
             rankic[new_factor] = ric
             generated_factors.append(new_factor)
+            train_exposure_cache[new_factor] = factor_series
             new_factors_this_iter += 1
 
             # Update chain: add new factor, keep top by |IC|
@@ -483,40 +611,66 @@ def _run_llm_mining(
     generated_factors = list(dict.fromkeys(generated_factors))
     print(f"\n  LLM Mining complete: {len(generated_factors)} unique factors generated")
 
-    return generated_factors, rankic
+    return generated_factors, rankic, train_exposure_cache
+
+
+def _eval_ticker_factors(ticker_group, factor_expressions):
+    """Evaluate every expression for a single ticker (serial, GIL-bound safe).
+
+    Mirrors one iteration of the original serial loop.
+    """
+    ticker, grp = ticker_group
+    ticker_factors = {}
+    for expr in factor_expressions:
+        try:
+            series = factor_series_fn(grp, expr)
+            ticker_factors[expr] = series.values
+        except Exception:
+            ticker_factors[expr] = np.nan
+    return pd.DataFrame(ticker_factors, index=grp.index)
 
 
 def _compute_llm_factor_exposures(
     df: pd.DataFrame,
     factor_expressions: List[str],
+    n_jobs: int = None,
 ) -> pd.DataFrame:
     """
     Compute factor exposures for LLM-generated expressions.
 
-    Evaluates each expression per-ticker using factor_series_fn.
+    Evaluates each expression per-ticker using factor_series_fn. This is a
+    **serial** implementation — deliberately so. Two parallelism attempts were
+    benchmarked and both *lost* to serial for this workload:
+
+      * ProcessPoolExecutor: ~6 s of Windows ``spawn`` re-import cost (it drags
+        in the heavy AlphaFactory chain) + pickling every ticker slice to the
+        workers, which dominates the small LLM-factor compute.
+      * ThreadPoolExecutor: the per-call cost is GIL-bound Python inside
+        ``factor_series_fn`` (expression compile + namespace build), so threads
+        serialize *and* add overhead.
+
+    The real speedups come from (a) the compile cache in ``factor_series_fn``
+    and (b) Step 6 reusing the train exposures already computed during Step 5
+    mining (see ``_run_llm_mining``'s returned cache) instead of re-evaluating
+    them. ``n_jobs`` is accepted for API symmetry with ``_compute_factors`` but
+    is currently unused.
 
     Args:
         df: AlphaFAMA-format DataFrame (MultiIndex date, ticker)
         factor_expressions: List of factor expression strings
+        n_jobs: accepted for API symmetry; currently unused (see note above).
 
     Returns:
         DataFrame with MultiIndex (date, ticker) and one column per factor
     """
-    ex_list = []
-    for ticker, grp in df.groupby('ticker'):
-        ticker_factors = {}
-        for expr in factor_expressions:
-            try:
-                series = factor_series_fn(grp, expr)
-                ticker_factors[expr] = series.values
-            except Exception:
-                ticker_factors[expr] = np.nan
-        ex_list.append(
-            pd.DataFrame(ticker_factors, index=grp.index)
-        )
+    if not factor_expressions:
+        return pd.DataFrame(index=df.index)
 
-    exposures = pd.concat(ex_list)
-    return exposures
+    ex_list = [
+        _eval_ticker_factors(g, factor_expressions)
+        for g in df.groupby("ticker")
+    ]
+    return pd.concat(ex_list) if ex_list else pd.DataFrame(index=df.index)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -533,9 +687,11 @@ def run_alphafama_baseline(
     context_days: int = 30,
     output_dir: Optional[str] = None,
     use_llm: bool = True,
+    use_alpha101: bool = False,
     llm_iters: int = 10,
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
+    n_jobs: Optional[int] = None,
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -556,6 +712,13 @@ def run_alphafama_baseline(
         context_days: Context window for factor calculation.
         output_dir: Directory for saving results.
         use_llm: Whether to run LLM alpha-mining (default True).
+        use_alpha101: Whether to pre-compute the 101 handcrafted Alpha101
+            factor exposures as the starting factor pool (default False).
+            When False, Step 4 skips the (expensive) all-Alpha101 computation
+            and the factor pool is LLM-generated only — seeded from the base
+            Alpha101 *formula library* (FORMULA_MAP) instead of from the
+            pre-computed factor ICs. Set True to reproduce the original
+            AlphaFAMA behaviour (Alpha101 factors + LLM fusion).
         llm_iters: Number of LLM mining iterations (default 10).
         forward_period: Forward return horizon (trading days) for IC evaluation.
             Defaults to config['evolution']['forward_period'] (10). Must match the
@@ -571,6 +734,7 @@ def run_alphafama_baseline(
     print("  AlphaFAMA Baseline — A-Share (via Main DataLoader)")
     if use_llm:
         print("  + FAMA LLM Alpha-Mining Pipeline")
+    print(f"  Alpha101 factor library: {'ENABLED' if use_alpha101 else 'DISABLED (LLM-only seeds)'}")
     print("=" * 60)
 
     # ── Step 1: Load data via main DataLoader ──────────────────────────
@@ -585,6 +749,36 @@ def run_alphafama_baseline(
     train_price, train_fund, train_ind = bundle.train
     test_price, test_fund, test_ind = bundle.test
     price_data = bundle.full[0]  # FULL span (kept for backtest prices + logging)
+
+    # ── Guard: clamp requested windows to the cached data range ─────────
+    # If config's default train_end/test_end (or CLI args) fall outside the
+    # locally cached archive, the slice comes back EMPTY and the run later
+    # degenerates or crashes ("报一堆错误" with no explicit args). Detect that
+    # and fall back to an 80/20 split of the ACTUAL available data so the
+    # baseline always produces results instead of failing on out-of-range
+    # config dates.
+    _avail = loader.price_data['close'].index
+    if len(train_price['close']) < 5 or len(test_price['close']) < 5:
+        _af, _al = _avail[0], _avail[-1]
+        print(
+            f"  WARNING: requested window [{train_start}..{train_end} / "
+            f"{test_start}..{test_end}] has insufficient data in the local "
+            f"cache (available {_af.date()}..{_al.date()}). Falling back to an "
+            f"80/20 train/test split of the available data."
+        )
+        _n = len(_avail)
+        _split = max(1, int(_n * 0.8))
+        train_start = str(_avail[0].date())
+        train_end = str(_avail[_split - 1].date())
+        test_start = str(_avail[_split].date())
+        test_end = str(_avail[-1].date())
+        bundle = loader.load_data(
+            universe=universe, train_start=train_start, train_end=train_end,
+            test_start=test_start, test_end=test_end,
+        )
+        train_price, train_fund, train_ind = bundle.train
+        test_price, test_fund, test_ind = bundle.test
+        price_data = bundle.full[0]
 
     print(f"  Loaded: {len(price_data['close'].index)} trading days x "
           f"{len(price_data['close'].columns)} stocks")
@@ -626,26 +820,58 @@ def run_alphafama_baseline(
           f"MultiIndex (date, ticker)")
 
     # ── Step 4: Generate Alpha101 factors ──────────────────────────────
-    print("\n[Step 4] Generating Alpha101 factors...")
-    train_exposures, train_returns = _compute_factors(train_df)
-    test_exposures, test_returns = _compute_factors(test_df)
+    if use_alpha101:
+        print("\n[Step 4] Generating Alpha101 factors...")
+        train_exposures, train_returns = _compute_factors(train_df, n_jobs=n_jobs)
+        test_exposures, test_returns = _compute_factors(test_df, n_jobs=n_jobs)
 
-    n_factors = len(train_exposures.columns)
-    print(f"  Generated {n_factors} factors")
+        n_factors = len(train_exposures.columns)
+        print(f"  Generated {n_factors} factors")
+    else:
+        print("\n[Step 4] Alpha101 factors DISABLED — skipping all-Alpha101 "
+              "computation (LLM will seed from the base formula library).")
+        # Empty exposure frames keep the downstream merge / IC logic uniform.
+        # Returns are computed regardless (they only depend on price, not on
+        # Alpha101) so LLM-generated factors still have a valid IC target.
+        train_exposures = pd.DataFrame(index=train_df.index)
+        test_exposures = pd.DataFrame(index=test_df.index)
+        train_returns = _compute_returns(train_df)
+        test_returns = _compute_returns(test_df)
+        n_factors = 0
 
     # ── Step 5: Compute Rank-IC on training data ───────────────────────
     print("\n[Step 5] Computing Rank-IC on training data...")
-    train_ic = compute_ic_matrix(train_exposures, train_returns)
+    if n_factors > 0:
+        train_ic = compute_ic_matrix(train_exposures, train_returns, n_jobs=n_jobs)
+        test_ic = compute_ic_matrix(test_exposures, test_returns, n_jobs=n_jobs)
+    else:
+        # No Alpha101 factors → no IC matrix to compute. Use empty frames
+        # whose index is a *single-level date axis* (matching
+        # compute_ic_matrix's contract), NOT the (date, ticker) MultiIndex of
+        # train_df/test_df. Otherwise:
+        #   - Step 7's `test_ic.index >= test_start_ts` filter raises TypeError
+        #     (you can't compare a MultiIndex to a scalar Timestamp); and
+        #   - Step 6's `test_ic[col] = llm_test_ic[col]` mis-aligns (different
+        #     index types → all-NaN merge).
+        # This keeps the OFF path byte-for-byte consistent with the ON path.
+        _train_dates = train_df.index.get_level_values("date").unique()
+        _test_dates = test_df.index.get_level_values("date").unique()
+        train_ic = pd.DataFrame(
+            index=pd.Index(_train_dates, name="date")
+        )
+        test_ic = pd.DataFrame(
+            index=pd.Index(_test_dates, name="date")
+        )
+
     mean_train_ic = train_ic.mean()
-    avg_ic = mean_train_ic.mean()
-    ic_std = mean_train_ic.std()
+    avg_ic = mean_train_ic.mean() if n_factors > 0 else 0.0
+    ic_std = mean_train_ic.std() if n_factors > 0 else 0.0
     icir = avg_ic / ic_std if ic_std > 0 else 0.0
 
     print(f"  Mean Rank-IC (train): {avg_ic:.4f}, ICIR: {icir:.4f}")
 
     # Also compute test_ic for evaluation in Step 7
-    test_ic = compute_ic_matrix(test_exposures, test_returns)
-    avg_test_ic_early = test_ic.mean().mean()
+    avg_test_ic_early = test_ic.mean().mean() if n_factors > 0 else 0.0
     print(f"  Mean Rank-IC (test, Alpha101): {avg_test_ic_early:.4f}")
 
     # ── Step 5b: LLM Alpha-Mining ──────────────────────────────────────
@@ -666,18 +892,34 @@ def run_alphafama_baseline(
             llm_model = llm_config['model']
             print(f"  LLM model: {llm_model}")
 
-            # Cluster factors by IC profiles
-            n_clusters = min(8, n_factors)
-            clusters = _cluster_factors(train_ic, n_clusters=n_clusters)
-            print(f"  Clustered {len(clusters)} factors into {n_clusters} clusters")
+            # Build seed clusters for the LLM chains.
+            # - Alpha101 ON:  cluster the pre-computed Alpha101 IC matrix and
+            #   use those factors (and their ICs) as seeds.
+            # - Alpha101 OFF: there is no IC matrix, so seed directly from the
+            #   base 101 *formula library* (FORMULA_MAP). This still gives the
+            #   LLM real expressions to evolve without ever computing the 101
+            #   factor exposures — and is what makes the Alpha101-OFF mode
+            #   produce factors at all.
+            if use_alpha101 and n_factors > 0:
+                n_clusters = min(8, n_factors)
+                clusters = _cluster_factors(train_ic, n_clusters=n_clusters)
+                mining_mean_ic = mean_train_ic
+                print(f"  Clustered {len(clusters)} factors into {n_clusters} clusters")
+            else:
+                _seed_n = min(8, len(FORMULA_MAP))
+                clusters, mining_mean_ic = _seed_clusters_from_formula_map(
+                    FORMULA_MAP, n_clusters=_seed_n
+                )
+                print(f"  Alpha101 OFF → seeded {len(clusters)} LLM chains from "
+                      f"{len(FORMULA_MAP)} base formulas")
 
             # Run LLM mining
             try:
-                llm_factor_expressions, llm_rankic = _run_llm_mining(
+                llm_factor_expressions, llm_rankic, llm_train_exposure_cache = _run_llm_mining(
                     train_df=train_df,
                     clusters=clusters,
                     formula_map=FORMULA_MAP,
-                    mean_ic=mean_train_ic,
+                    mean_ic=mining_mean_ic,
                     llm_config=llm_config,
                     n_iters=llm_iters,
                     max_chain_len=15,
@@ -709,9 +951,9 @@ def run_alphafama_baseline(
         try:
             # ── Test side ──
             llm_test_exposures = _compute_llm_factor_exposures(
-                test_df, llm_factor_expressions
+                test_df, llm_factor_expressions, n_jobs=n_jobs
             )
-            llm_test_ic = compute_ic_matrix(llm_test_exposures, test_returns)
+            llm_test_ic = compute_ic_matrix(llm_test_exposures, test_returns, n_jobs=n_jobs)
 
             # Merge test exposures: original Alpha101 + LLM-generated
             test_exposures_merged = pd.concat([test_exposures, llm_test_exposures], axis=1)
@@ -724,14 +966,29 @@ def run_alphafama_baseline(
                     test_ic[col] = llm_test_ic[col]
 
             # ── Train side ──
-            # Compute LLM factor exposures and IC on training data so that
-            # train_ic has columns for LLM factors. Without this, the later
-            # train_ic[top_factor_names] lookup (in _simulate_portfolio_from_ic)
-            # raises KeyError when top_factor_names includes LLM expressions.
-            llm_train_exposures = _compute_llm_factor_exposures(
-                train_df, llm_factor_expressions
+            # Reuse the per-ticker train exposures already computed during LLM
+            # mining (_run_llm_mining returns them keyed by expression). The
+            # mining ran on this same train_df, so re-evaluating here would be
+            # a redundant second pass over every LLM expression — previously
+            # the dominant cost of Step 6. We only fall back to recomputation
+            # for any expression missing from the cache (defensive; should not
+            # happen since every generated factor was evaluated in mining).
+            _cached = [e for e in llm_factor_expressions
+                       if e in llm_train_exposure_cache]
+            _missing = [e for e in llm_factor_expressions
+                        if e not in llm_train_exposure_cache]
+            _train_parts = [llm_train_exposure_cache[e] for e in _cached]
+            if _missing:
+                print(f"  [Step 6] {len(_missing)} LLM factors not in mining "
+                      f"cache; recomputing on train.")
+                _train_parts.append(
+                    _compute_llm_factor_exposures(train_df, _missing, n_jobs=n_jobs)
+                )
+            llm_train_exposures = (
+                pd.concat(_train_parts, axis=1) if _train_parts
+                else pd.DataFrame(index=train_df.index)
             )
-            llm_train_ic = compute_ic_matrix(llm_train_exposures, train_returns)
+            llm_train_ic = compute_ic_matrix(llm_train_exposures, train_returns, n_jobs=n_jobs)
 
             for col in llm_train_ic.columns:
                 if col not in train_ic.columns:
@@ -751,6 +1008,15 @@ def run_alphafama_baseline(
         except Exception as e:
             print(f"  WARNING: Failed to compute LLM factor exposures: {e}")
             print("  Falling back to Alpha101-only factors")
+
+    # ── Guard: no factors at all ───────────────────────────────────────
+    # Happens only when Alpha101 is disabled AND LLM produced nothing (no
+    # api_key / mining failed / zero usable factors). The downstream sim
+    # returns zeroed metrics, but flag it loudly so the empty run is obvious.
+    if test_exposures.shape[1] == 0:
+        print("\n  WARNING: zero factors produced "
+              "(Alpha101 disabled and no LLM factors). "
+              "Backtest will report zeroed metrics.")
 
     # ── Step 7: Evaluate on test data ──────────────────────────────────
     print("\n[Step 7] Evaluating on test data...")
@@ -827,6 +1093,7 @@ def run_alphafama_baseline(
         'n_factors': total_factors,
         'n_alpha101_factors': n_factors,
         'n_llm_factors': n_llm_factors,
+        'use_alpha101': use_alpha101,
         'used_llm': used_llm,
         'llm_model': llm_model,
         'llm_iters': llm_iters if used_llm else 0,
@@ -870,35 +1137,85 @@ def run_alphafama_baseline(
     return results
 
 
-def _compute_factors(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+# Worker lives in a separate module so Windows 'spawn' children import only
+# that lightweight module (not this __main__ script) — avoids the classic
+# re-execution / freeze_support recursion. See baselines/alphafama_parallel.py.
+from baselines.alphafama_parallel import _compute_factors_chunk
+
+
+def _compute_factors(
+    df: pd.DataFrame,
+    n_jobs: int = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute Alpha101 factor exposures for each ticker.
 
+    Each ticker's factor computation is fully independent, so we distribute
+    tickers across worker processes for a near-linear speedup while keeping the
+    numerical results *bit-identical* to the serial loop (the per-ticker
+    computation is unchanged; only the scheduling differs). Falls back to the
+    serial loop when parallelism is disabled or unavailable.
+
     Args:
         df: AlphaFAMA-format DataFrame with MultiIndex (date, ticker).
+        n_jobs: number of worker processes. ``None`` → auto (``cpu_count()-1``,
+            min 1). Set to 1 to force serial. Override via env
+            ``ALPHAFAMA_N_JOBS``.
 
     Returns:
         Tuple of (exposures_df, returns_df) with MultiIndex (date, ticker).
     """
-    ex_list, ret_list = [], []
-    for ticker, grp in df.groupby("ticker"):
-        alphas = AlphaFactory.all_alphas(grp)
-        ex_list.append(
-            pd.DataFrame(alphas, index=grp.index).assign(ticker=ticker)
-        )
-        # IC TARGET must be the forward-period return so AlphaFAMA's Rank-IC is
-        # comparable to the other baselines. We keep the daily `returns` column
-        # intact for the Alpha101 feature inputs and use `forward_return` here.
-        # Rename to 'returns' so compute_ic_matrix (which reads ['returns']) works.
-        ret_list.append(
-            grp[["forward_return"]]
-            .rename(columns={"forward_return": "returns"})
-            .assign(ticker=ticker)
-        )
+    groups = list(df.groupby("ticker"))
+
+    # Resolve worker count (env override → auto → serial).
+    if n_jobs is None:
+        n_jobs = int(os.environ.get(
+            "ALPHAFAMA_N_JOBS", max(1, (os.cpu_count() or 1) - 1)
+        ))
+
+    # Serial path: explicitly disabled, single ticker, or nothing to split.
+    if n_jobs <= 1 or len(groups) <= 1:
+        ex_list, ret_list = _compute_factors_chunk(groups)
+    else:
+        n_workers = max(1, min(n_jobs, len(groups)))
+        # Contiguous chunks preserve ticker order across the final concat, so
+        # the output is identical to the serial loop's row order.
+        chunk_size = max(1, (len(groups) + n_workers - 1) // n_workers)
+        chunks = [groups[i:i + chunk_size]
+                  for i in range(0, len(groups), chunk_size)]
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                results = list(ex.map(_compute_factors_chunk, chunks))
+            ex_list, ret_list = [], []
+            for cel, crl in results:
+                ex_list.extend(cel)
+                ret_list.extend(crl)
+        except Exception as e:  # pragma: no cover - pool fallback safety
+            logger.warning(
+                f"_compute_factors: parallel path failed ({e}); "
+                f"falling back to serial."
+            )
+            ex_list, ret_list = _compute_factors_chunk(groups)
 
     exposures = pd.concat(ex_list)
     returns = pd.concat(ret_list)
     return exposures, returns
+
+
+def _compute_returns(df: pd.DataFrame) -> pd.DataFrame:
+    """Extract the forward-return IC target as a (date, ticker) frame.
+
+    Mirrors the returns slice produced inside ``_compute_factors_chunk`` but
+    without any Alpha101 factor computation. Used when Alpha101 factors are
+    disabled so the LLM-generated factors still have a valid Rank-IC target.
+    """
+    ret_list = []
+    for _ticker, grp in df.groupby("ticker"):
+        ret_list.append(
+            grp[["forward_return"]]
+            .rename(columns={"forward_return": "returns"})
+        )
+    return pd.concat(ret_list)
 
 
 def _simulate_portfolio_from_ic(
@@ -1059,6 +1376,12 @@ if __name__ == '__main__':
                         help='Enable LLM alpha-mining (default: enabled)')
     parser.add_argument('--no-llm', action='store_false', dest='use_llm',
                         help='Disable LLM alpha-mining')
+    parser.add_argument('--use-alpha101', action='store_true', default=False,
+                        help='Enable the 101 handcrafted Alpha101 factor '
+                             'exposures as the starting pool (default: OFF — '
+                             'LLM seeds from the base formula library only)')
+    parser.add_argument('--no-alpha101', action='store_false', dest='use_alpha101',
+                        help='Disable Alpha101 factors (default)')
     parser.add_argument('--llm-iters', type=int, default=10,
                         help='Number of LLM mining iterations (default: 10)')
     parser.add_argument('--forward-period', type=int, default=None,
@@ -1067,6 +1390,10 @@ if __name__ == '__main__':
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Rebalance frequency in days (1=daily, 5=weekly, 20=monthly). '
                              'Defaults to config backtest.trading.holding_period (1).')
+    parser.add_argument('--n-jobs', type=int, default=None,
+                        help='Worker processes for Alpha101 factor computation '
+                             '(step 4). None=auto (cpu_count-1). 1=serial. '
+                             'Env override: ALPHAFAMA_N_JOBS.')
 
     args = parser.parse_args()
 
@@ -1080,9 +1407,11 @@ if __name__ == '__main__':
         context_days=args.context_days,
         output_dir=args.output_dir,
         use_llm=args.use_llm,
+        use_alpha101=args.use_alpha101,
         llm_iters=args.llm_iters,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
+        n_jobs=args.n_jobs,
     )
 
     print("\n" + "=" * 60)

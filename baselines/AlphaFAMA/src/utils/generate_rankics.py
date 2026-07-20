@@ -50,6 +50,21 @@ def write_rankic_jsons(ic_df: pd.DataFrame, formula_map: dict, out_dir: Path):
     print("Wrote", out_dir / "formula_rankic.json")
 
 
+# Cache compiled expression code objects so repeated evaluation of the same
+# expression across tickers (and across the Step-5 mining / Step-6 merge passes)
+# doesn't re-parse the string thousands of times. eval() of a code object is
+# dramatically cheaper than eval() of a raw string.
+_EXPR_COMPILE_CACHE = {}
+
+
+def _compile_expr(expr: str):
+    code = _EXPR_COMPILE_CACHE.get(expr)
+    if code is None:
+        code = compile(expr, "<llm_expr>", "eval")
+        _EXPR_COMPILE_CACHE[expr] = code
+    return code
+
+
 def factor_series_fn(df: pd.DataFrame, expr: str) -> pd.Series:
     """
     Evaluate an Alpha101 expression or factory method name against df.
@@ -76,9 +91,9 @@ def factor_series_fn(df: pd.DataFrame, expr: str) -> pd.Series:
     for w in adv_windows:
         local_ns[f"adv{w}"] = df["volume"].rolling(w).mean()
 
-    # 3) evaluate
+    # 3) evaluate (using the cached compiled code object)
     try:
-        result = eval(expr, func_ns, local_ns)
+        result = eval(_compile_expr(expr), func_ns, local_ns)
     except NameError as e:
         raise ValueError(f"Unknown name in expression {expr!r}: {e}")
     except Exception as e:

@@ -400,6 +400,7 @@ class AAAI2027Pipeline:
             improve_temperature=evo_cfg.get('improve_temperature', 0.3),
             elitism_carry=evo_cfg.get('elitism_carry', 2),
             seed_hypothesis_driven=evo_cfg.get('seed_hypothesis_driven', False),
+            seed_hypothesis_ratio=evo_cfg.get('seed_hypothesis_ratio', 1.0),
         )
         
         # Generate seed factors
@@ -958,15 +959,33 @@ class AAAI2027Pipeline:
             print("  [warn] No industry_data available — "
                   "industry-neutral normalization will be skipped")
 
-        # ── 4c. Encode market state from TRAIN data (avoid lookahead) ──
+        # ── 4c. Encode market state for regime tilt ──
+        # Source window: when val_ratio>0 we re-carve the SAME validation tail
+        # that step4 used for factor SELECTION, and encode the market state from
+        # THAT boundary window (closest to the upcoming test distribution). This
+        # makes the regime tilt reflect the "current" regime at the train/test
+        # boundary instead of being smoothed across the whole training history.
+        # When val_ratio=0 (default) we fall back to the full train span — i.e.
+        # exactly the previous behaviour. Test data is NEVER touched (no lookahead);
+        # factor VALUES and IC/ICIR weights below still come from the full train.
         market_state = None
         try:
-            train_close = train_price.get('close')
-            if train_close is not None and isinstance(train_close, pd.DataFrame):
-                # Use the shared helper so corr_matrix is computed from actual
-                # pairwise return correlations (rather than defaulting to MEDIUM).
-                market_state = self._build_market_state(train_close)
-                print(f"  Market state (from TRAIN): {market_state.to_string() if market_state else 'None'}")
+            _ms_source = "TRAIN"
+            _ms_close = train_price.get('close')
+            _val_ratio = float(self.config.get('evolution', {}).get('val_ratio', 0.0) or 0.0)
+            if _val_ratio > 0 and self.train_data:
+                _split = self._split_train_val(self.train_data, _val_ratio)
+                if _split is not None:
+                    _val_close = _split[1].get('price_data', {}).get('close')
+                    if isinstance(_val_close, pd.DataFrame) and len(_val_close) > 0:
+                        _ms_close = _val_close
+                        _ms_source = "VAL-tail (boundary)"
+            if _ms_close is not None and isinstance(_ms_close, pd.DataFrame):
+                # Shared helper → corr_matrix from actual pairwise return corr,
+                # now computed over the chosen boundary window, not full history.
+                market_state = self._build_market_state(_ms_close)
+                print(f"  Market state (from {_ms_source}): "
+                      f"{market_state.to_string() if market_state else 'None'}")
         except Exception as e:
             print(f"  [warn] Could not encode market state: {e}")
 
