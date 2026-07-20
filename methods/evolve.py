@@ -14,6 +14,8 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, asdict
 import re
+import ast
+import difflib
 import warnings
 import os
 import json
@@ -56,8 +58,12 @@ class CandidateFactor:
     sharpe: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
+    val_ic: float = 0.0            # Validation-period Rank-IC (set only when a val_backtester is supplied). Used for final selection + early-stop to combat train overfitting.
+    val_icir: float = 0.0
     is_valid: bool = True          # False when evaluation raises ValueError (parse error)
     parse_error: str = ""          # stores error message for debugging / reflection
+    originality_ok: bool = True    # False when the AST originality gate rejects the factor
+    gate_reason: str = ""          # reason recorded by the originality gate
     
     
 @dataclass
@@ -77,6 +83,204 @@ class EvolutionResult:
     total_rounds: int
     
     
+# ---------------------------------------------------------------------------
+# AST-based originality gate (ported spirit of AlphaAgent's OriginalityRegulator)
+# ---------------------------------------------------------------------------
+
+# MASE factor DSL: canonical function names accepted by the evaluator.
+_GATE_ALLOWED_FUNCS = {
+    'rank', 'ts_rank', 'ts_corr', 'ts_cov', 'ts_mean', 'ts_std', 'ts_var',
+    'ts_skew', 'ts_kurt', 'ts_min', 'ts_max', 'ts_sum', 'ts_delta',
+    'ts_zscore', 'ts_decay', 'delay', 'sign', 'abs', 'log', 'sqrt', 'if',
+    'ts_pct_change',
+}
+# LLM-frequent aliases → canonical (mirrors _FactorExprEvaluator._FUNC_ALIASES)
+_GATE_FUNC_ALIASES = {
+    'ts_stddev': 'ts_std', 'ts_std_dev': 'ts_std', 'stddev': 'ts_std',
+    'ts_average': 'ts_mean', 'ts_avg': 'ts_mean', 'ts_median': 'ts_mean',
+    'ts_diff': 'ts_delta', 'ts_delay': 'delay', 'ts_lag': 'delay', 'lag': 'delay',
+    'cov': 'ts_cov', 'skew': 'ts_skew', 'kurt': 'ts_kurt', 'kurtosis': 'ts_kurt',
+    'max': 'ts_max', 'min': 'ts_min', 'mean': 'ts_mean', 'sum': 'ts_sum',
+    'ts_pctchange': 'ts_pct_change', 'pct_change': 'ts_pct_change',
+    'ts_pctchg': 'ts_pct_change',
+}
+# AST node types that count toward "structural size" (excludes Expression/Load
+# and bare operator singletons like ast.Add).
+_GATE_MEANINGFUL = (ast.Name, ast.Call, ast.Constant, ast.BinOp,
+                    ast.Compare, ast.IfExp, ast.UnaryOp)
+
+
+class FactorOriginalityGate:
+    """
+    Static AST gate that runs independently of (and cheaper than) backtesting.
+
+    Three checks — mirrors the intent of AlphaAgent's OriginalityRegulator:
+      1. Syntax     — expression must parse as a Python-evaluable factor.
+      2. Semantics  — every called function must be in MASE's function library.
+      3. Originality— reject (a) structural near-duplicates of an already
+         accepted factor, and (b) degenerate factors (no data dependency,
+         single token, or constant-dominated).
+
+    CALIBRATION NOTE: AlphaAgent computes constant/var RATIOS against its
+    pyparsing node count. Replicating that exactly on MASE's AST would reject
+    legitimate factors such as `rank(close - open)` (vars would be >= half the
+    nodes). We therefore use MASE-calibrated heuristics (see _is_trivial) that
+    keep genuine factors while still killing `close`, `5`, `rank(5)`, and
+    structurally near-identical variants. Variable NAMES are preserved in the
+    canonical signature (only constants are normalized to '#') so economically
+    distinct but structurally-identical factors (e.g. `close-open` vs `high-low`)
+    are NOT falsely collapsed.
+    """
+
+    def __init__(self, enabled: bool = True, duplication_threshold: int = 8,
+                 dedup_similarity: float = 0.90):
+        self.enabled = enabled
+        # duplication_threshold retained for API parity / future subtree sizing
+        self.duplication_threshold = duplication_threshold
+        self.dedup_similarity = dedup_similarity
+        self.zoo: List[str] = []        # canonical signatures of accepted factors
+        self.zoo_exprs: List[str] = []  # original expressions (for reporting)
+
+    # -- preprocessing so the MASE DSL parses as a Python AST ---------------
+    @staticmethod
+    def _preprocess(expr: str) -> str:
+        # MASE uses '^' for power; Python uses '**'
+        e = expr.replace('^', '**')
+        # MASE 'if(cond,a,b)' is a function; 'if' is a Python keyword → rename
+        e = re.sub(r'\bif\s*\(', '_if(', e, flags=re.IGNORECASE)
+        return e
+
+    def _parse(self, expr: str):
+        return ast.parse(self._preprocess(expr), mode='eval')
+
+    @staticmethod
+    def _canon_name(name: str) -> str:
+        return 'if' if name == '_if' else name
+
+    def _canonical(self, node) -> str:
+        """Canonical signature: keeps variable names, normalizes constants to '#'."""
+        if isinstance(node, ast.Expression):
+            return self._canonical(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return '#'
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            sign = '-' if isinstance(node.op, ast.USub) else '+'
+            return f'{sign}{self._canonical(node.operand)}'
+        if isinstance(node, ast.Name):
+            return self._canon_name(node.id)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                fname = _GATE_FUNC_ALIASES.get(func.id, func.id)
+                fname = self._canon_name(fname)
+            else:
+                fname = '?'
+            args = [self._canonical(a) for a in node.args]
+            if fname in ('+', '*') and len(args) == 2:
+                args = sorted(args)
+            return f'{fname}({",".join(args)})'
+        if isinstance(node, ast.BinOp):
+            opmap = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*',
+                     ast.Div: '/', ast.Pow: '^'}
+            sym = opmap.get(type(node.op), type(node.op).__name__)
+            l, r = self._canonical(node.left), self._canonical(node.right)
+            if sym in ('+', '*'):
+                l, r = sorted([l, r])
+            return f'({l}{sym}{r})'
+        if isinstance(node, ast.Compare):
+            parts = [self._canonical(node.left)]
+            for op, comp in zip(node.ops, node.comparators):
+                parts.append(type(op).__name__)
+                parts.append(self._canonical(comp))
+            return f'cmp({",".join(parts)})'
+        if isinstance(node, ast.IfExp):
+            return (f'if({self._canonical(node.body)},'
+                    f'{self._canonical(node.test)},{self._canonical(node.orelse)})')
+        return type(node).__name__
+
+    @staticmethod
+    def _count_constants(node) -> int:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return 1
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return FactorOriginalityGate._count_constants(node.operand)
+        return 0
+
+    def _analyze(self, expr: str):
+        tree = self._parse(expr)
+        num_all = sum(1 for n in ast.walk(tree) if isinstance(n, _GATE_MEANINGFUL))
+        num_const = sum(self._count_constants(n) for n in ast.walk(tree))
+        # Collect all function-call names so we can exclude them from the
+        # variable set (otherwise `rank(5)` would count `rank` as a "variable").
+        call_names = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                call_names.add(self._canon_name(n.func.id))
+        varset = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name):
+                canon = self._canon_name(n.id)
+                if canon not in call_names:
+                    varset.add(canon)
+        canon = self._canonical(tree)
+        return canon, num_const, len(varset), num_all
+
+    @staticmethod
+    def _is_trivial(num_const: int, num_vars: int, num_all: int) -> Optional[str]:
+        if num_vars < 1:
+            return "no data dependency (constant factor)"
+        if num_all < 2:
+            return "single-token expression (too trivial)"
+        if num_const > num_vars * 3:
+            return f"constant-dominated (const={num_const}, vars={num_vars})"
+        return None
+
+    def validate(self, expr: str) -> Tuple[bool, str]:
+        """
+        Returns (accepted, reason). On accept, the expression is recorded in the
+        zoo so subsequent near-duplicates are rejected.
+        """
+        if not self.enabled:
+            return True, ""
+        if not expr or not expr.strip():
+            return False, "empty expression"
+        # 1) syntax
+        try:
+            tree = self._parse(expr)
+        except SyntaxError as e:
+            return False, f"syntax error: {e}"
+        except Exception as e:  # pragma: no cover - defensive
+            return False, f"unparseable: {e}"
+        # 2) semantics: unknown function
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                func = n.func
+                if isinstance(func, ast.Name):
+                    raw = func.id
+                    fname = _GATE_FUNC_ALIASES.get(raw, raw)
+                    fname = self._canon_name(fname)   # _if → if (post-preprocessing)
+                    if fname not in _GATE_ALLOWED_FUNCS:
+                        return False, f"unknown function '{raw}()'"
+        # 3) originality: dedup + triviality
+        try:
+            canon, num_const, num_vars, num_all = self._analyze(expr)
+        except Exception as e:  # pragma: no cover - defensive
+            return False, f"analysis error: {e}"
+        for zexpr, zcanon in zip(self.zoo_exprs, self.zoo):
+            if zcanon == canon:
+                return False, f"duplicate of existing factor: {zexpr[:60]}"
+            sim = difflib.SequenceMatcher(None, canon, zcanon).ratio()
+            if sim >= self.dedup_similarity:
+                return False, f"near-duplicate (similarity={sim:.2f}) of: {zexpr[:60]}"
+        trivial = self._is_trivial(num_const, num_vars, num_all)
+        if trivial:
+            return False, trivial
+        # accept → record in zoo
+        self.zoo.append(canon)
+        self.zoo_exprs.append(expr)
+        return True, "accepted"
+
+
 # ---------------------------------------------------------------------------
 # Factor expression evaluator (recursive-descent parser)
 # ---------------------------------------------------------------------------
@@ -151,6 +355,7 @@ class _FactorExprEvaluator:
         ts_max(X, w)     — rolling maximum
         ts_sum(X, w)     — rolling sum
         ts_delta(X, w)   — X - delay(X, w)
+        ts_pct_change(X, w) — (X - delay(X, w)) / delay(X, w)  [alias: ts_pctchange, pct_change]
         ts_zscore(X, w)  — rolling z-score
         ts_decay(X, w)   — exponential weighted moving average (EWMA)
         delay(X, d)      — lag by d periods
@@ -323,8 +528,12 @@ class _FactorExprEvaluator:
         return self._dispatch_func(name, args)
 
     def _lookup_data(self, name: str) -> pd.DataFrame:
-        """Look up a named data field."""
+        """Look up a named data field. Case-insensitive: LLMs often emit
+        uppercase (ROE/PE) while the data map uses lowercase keys."""
         if name not in self._data:
+            name_lower = name.lower()
+            if name_lower in self._data:
+                return self._data[name_lower]
             raise ValueError(
                 f"Unknown identifier '{name}'. "
                 f"Available: {list(self._data.keys())}"
@@ -355,6 +564,10 @@ class _FactorExprEvaluator:
         'min':        'ts_min',
         'mean':       'ts_mean',
         'sum':        'ts_sum',
+        # percentage-change family
+        'ts_pctchange': 'ts_pct_change',   # AlphaForge canonical spelling
+        'pct_change':   'ts_pct_change',   # pandas naming
+        'ts_pctchg':    'ts_pct_change',
     }
 
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
@@ -378,6 +591,7 @@ class _FactorExprEvaluator:
             'ts_max':     (2, 2),
             'ts_sum':     (2, 2),
             'ts_delta':   (2, 2),
+            'ts_pct_change': (2, 2),
             'ts_zscore':  (2, 2),
             'ts_decay':   (2, 2),
             'delay':      (2, 2),
@@ -505,6 +719,17 @@ class _FactorExprEvaluator:
     def _fn_ts_delta(x: pd.DataFrame, window) -> pd.DataFrame:
         w = _FactorExprEvaluator._safe_int(window)
         return x - x.shift(w)
+
+    @staticmethod
+    def _fn_ts_pct_change(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling percentage change over window w: (X - X.shift(w)) / X.shift(w).
+        Mirrors AlphaForge's ts_pctchange. Zero/NaN denominators → NaN (meaningful)."""
+        w = _FactorExprEvaluator._safe_int(window)
+        prev = x.shift(w)
+        prev = prev.replace(0, np.nan)   # avoid div-by-zero noise; 0 → NaN is informative
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pct = (x - prev) / prev
+        return pct
 
     @staticmethod
     def _fn_ts_zscore(x: pd.DataFrame, window) -> pd.DataFrame:
@@ -921,9 +1146,19 @@ class FactorBacktester:
             return 0.0, 0.5, 0.0, pd.Series(dtype=float)
 
         ls_series = pd.Series(long_short_rets, name='long_short')
-        sharpe = annualized_sharpe(ls_series)
+        # Annualize using the ACTUAL holding period, not daily. ls_series
+        # entries are forward_period-day returns (sampled daily), so the
+        # annualization factor must be sqrt(252 / forward_period). Using the
+        # daily factor sqrt(252) overstated Sharpe by ~sqrt(forward_period).
+        periods_per_year = 252.0 / self.forward_period
+        sharpe = annualized_sharpe(ls_series, periods_per_year=periods_per_year)
         win_rate = float((ls_series > 0).mean())
-        max_dd = max_drawdown(ls_series)
+        # Use simple (non-compounding) drawdown — ls_series contains
+        # forward_period-day long-short returns sampled daily. Compounding
+        # these overlapping observations via cumprod falsely amplifies
+        # drawdown by ~√forward_period (same over-counting bug that the
+        # Sharpe annualization fix addressed).
+        max_dd = max_drawdown(ls_series, method='simple')
 
         return sharpe, win_rate, max_dd, ls_series
 
@@ -964,8 +1199,14 @@ class SelfEvolvingGenerator:
         convergence_window: int = 2,
         patience: int = 3,
         min_ic: float = 0.02,
-        min_sharpe: float = 0.5,
-        max_drawdown: float = -0.20,
+        min_sharpe: float = 0.0,
+        max_drawdown: float = -1.0,
+        min_val_ic: float = 0.01,
+        originality_gate: bool = True,
+        dedup_similarity: float = 0.90,
+        improve_temperature: float = 0.3,
+        elitism_carry: int = 2,
+        seed_hypothesis_driven: bool = False,
         parallel: bool = True,
         api_key: str = "",
         base_url: str = "http://180.163.156.38:53000/v1",
@@ -983,8 +1224,31 @@ class SelfEvolvingGenerator:
             convergence_window: Number of recent rounds to check for convergence
             patience: Max consecutive non-improving rounds before early stop
             min_ic: Minimum IC threshold for quality filtering
-            min_sharpe: Minimum Sharpe ratio threshold for quality filtering
-            max_drawdown: Maximum drawdown threshold (negative, e.g. -0.20)
+            min_sharpe: Soft floor on Sharpe ratio (default 0.0 = drop only
+                clearly negative Sharpe). NOTE: f.sharpe is distorted by
+                overlapping-window annualization, so keep this a soft guard.
+            max_drawdown: Maximum drawdown threshold (negative, e.g. -1.0)
+            min_val_ic: Minimum validation-IC threshold (val-mode only). The honest
+                overfit gate: drop factors with a negative signal on the holdout split.
+            originality_gate: Enable the AST-based originality gate (syntax check +
+                function whitelist + structural dedup + trivial detection).
+            dedup_similarity: Canonical-signature similarity threshold for
+                near-duplicate rejection (0.0 = off, 1.0 = only exact).
+            improve_temperature: LLM sampling temperature during factor IMPROVEMENT
+                (NOT seed generation). Low (0.3) = focused refinement of input;
+                high (>0.7) = near-random re-sampling that collapses diversity.
+            elitism_carry: Number of top factors carried forward unmutated from the
+                previous round. Prevents "full replacement" collapse where the
+                entire pool re-converges to a single direction each round.
+            seed_hypothesis_driven: Enable Stage1→Stage2 hypothesis-driven seed
+                generation. Stage1 generates 3-5 market hypotheses; Stage2 builds
+                factors expressing them. Falls back to old single-stage prompt if
+                disabled or Stage1 fails.
+            parallel: If False, evaluate factors serially (easier to debug)
+            originality_gate: Enable the static AST originality gate (structural
+                dedup + triviality/semantics checks) before factors enter the pool.
+            dedup_similarity: Canonical-signature similarity (0-1) above which a
+                factor is treated as a near-duplicate of an accepted one.
             parallel: If False, evaluate factors serially (easier to debug)
             api_key: API key for LLM service. If empty, reads from config or env.
             base_url: API base URL
@@ -1000,7 +1264,17 @@ class SelfEvolvingGenerator:
         self.min_ic = min_ic
         self.min_sharpe = min_sharpe
         self.max_drawdown = max_drawdown
+        self.min_val_ic = min_val_ic
+        self.improve_temperature = improve_temperature
+        self.elitism_carry = elitism_carry
+        self.seed_hypothesis_driven = seed_hypothesis_driven
         self.parallel = parallel
+
+        # Static AST originality gate (structural dedup + triviality + semantics)
+        self.gate = FactorOriginalityGate(
+            enabled=originality_gate,
+            dedup_similarity=dedup_similarity,
+        )
         
         # Initialize OpenAI client for LLM calls
         self.client = None
@@ -1392,44 +1666,134 @@ class SelfEvolvingGenerator:
         
         return "\n".join(lines)
 
+    def _llm_generate_hypotheses(self, n_hypotheses: int = 4) -> List[str]:
+        """
+        Stage 1 of hypothesis-driven factor generation.
+
+        Ask the LLM to propose N distinct, testable market hypotheses for A-share
+        stock selection. Each hypothesis should cover a different angle (momentum,
+        value, quality, liquidity, growth, behavioural, etc.).
+
+        Returns a list of hypothesis strings; empty list on failure.
+        """
+        system_prompt = (
+            "You are a quantitative finance researcher generating market hypotheses "
+            "for alpha factor mining in the Chinese A-share market.\n\n"
+            "Each hypothesis should:\n"
+            "1. Be grounded in financial theory or observed market behaviour\n"
+            "2. Be specific enough to guide mathematical factor construction\n"
+            "3. Cover a different angle from the others (e.g. momentum vs value vs quality)\n"
+            "4. Mention concrete data fields (price, volume, fundamentals) when possible\n\n"
+            "Return ONLY a JSON array of strings. No explanations, no markdown, no code fences."
+        )
+
+        user_prompt = (
+            f"Generate {n_hypotheses} distinct, testable market hypotheses for A-share "
+            f"stock selection. Each should be a complete sentence (2-4 sentences). "
+            f"Cover different investment angles. Return as JSON array of strings. "
+            f"Example format: [\"Hypothesis 1 text...\", \"Hypothesis 2 text...\", ...]"
+        )
+
+        try:
+            raw = self._call_llm(system_prompt, user_prompt,
+                                 temperature=0.6, expect_json=True)
+            parsed = json.loads(raw)
+            # Robustness: LLMs sometimes return {"hypotheses": [...]} or even
+            # {"factors": ["H1...", "H2..."]} (confusing Stage1 with Stage2 output format).
+            if isinstance(parsed, dict):
+                candidates = parsed.get("hypotheses", None)
+                if candidates is None:
+                    candidates = parsed.get("factors", None)
+                if isinstance(candidates, list):
+                    parsed = candidates
+            if isinstance(parsed, list) and all(isinstance(h, str) for h in parsed):
+                hypotheses = [h.strip() for h in parsed if h.strip()]
+                if hypotheses:
+                    print(f"  [hypothesis] Generated {len(hypotheses)} market hypotheses:")
+                    for i, h in enumerate(hypotheses):
+                        print(f"    {i+1}. {h[:120]}{'...' if len(h) > 120 else ''}")
+                    return hypotheses
+            print(f"  [hypothesis] Unexpected LLM response format: {type(parsed).__name__}")
+            return []
+        except Exception as e:
+            print(f"  [hypothesis] LLM hypothesis generation failed: {e}")
+            return []
+
     def generate_seed_factors(self) -> List['CandidateFactor']:
         """
-        Generate seed factors using LLM.
-        
-        Uses self.n_seeds (set at construction time) as the target count.
-            
-        Returns:
-            List of seed factors
+        Generate seed factors using LLM with hypothesis-driven generation.
+
+        Stage 1: LLM proposes 3-5 distinct market hypotheses.
+        Stage 2: LLM generates factors that express those hypotheses (replaces
+        the old "撒网式覆盖五大类" prompt with thesis-driven factor construction).
+        Falls back to the old single-stage prompt if Stage 1 fails.
+        Falls back to rule-based generation if LLM is unavailable.
         """
         n_factors = self.n_seeds
         print(f"Generating {n_factors} seed factors...")
-        
-        # Try to use LLM to generate factors
+
         if self.use_llm and self.client:
+            if self.seed_hypothesis_driven:
+                # ── Stage 1: Generate market hypotheses ──
+                hypotheses = self._llm_generate_hypotheses(
+                    n_hypotheses=min(5, max(3, n_factors // 3)),
+                )
+
+                if hypotheses:
+                    # ── Stage 2: Generate factors per hypothesis ──
+                    factors_per_hypothesis = max(2, n_factors // len(hypotheses))
+                    all_factors: List[CandidateFactor] = []
+                    for i, h in enumerate(hypotheses):
+                        try:
+                            batch = self._generate_factors_via_llm(
+                                factors_per_hypothesis, hypothesis=h,
+                            )
+                            if batch:
+                                # Tag description with hypothesis index for traceability
+                                for f in batch:
+                                    if not f.description.startswith(f"[H{i+1}]"):
+                                        f.description = f"[H{i+1}] {f.description}"
+                                all_factors.extend(batch)
+                        except Exception as e:
+                            print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
+
+                    if all_factors:
+                        result = all_factors[:n_factors]
+                        print(f"Generated {len(result)} seed factors via hypothesis-driven pipeline "
+                              f"({len(hypotheses)} hypotheses, {len(all_factors)} raw)")
+                        return result
+
+                print("  [hypothesis] Stage 1 failed or produced no usable factors; "
+                      "falling back to single-stage seed generation.")
+
+            # ── Single-stage generation ──
+            # Runs as the primary path when hypothesis-driven is OFF, or as the
+            # fallback when Stage 1/2 produced nothing usable.
             try:
                 seed_factors = self._generate_factors_via_llm(n_factors)
                 if seed_factors and len(seed_factors) >= 1:
                     result = seed_factors[:n_factors]
-                    print(f"Generated {len(result)} seed factors via LLM")
-                    # self._save_factors_to_file(result, round_id=0)
+                    print(f"Generated {len(result)} seed factors via LLM (single-stage)")
                     return result
             except Exception as e:
                 print(f"  [evolve] LLM factor generation failed: {e}")
-                print(f"  [evolve] Falling back to rule-based generation.")
-        
-        # Fallback: rule-based generation
+
+        # ── Fallback: rule-based generation ──
         print(f"  [evolve] Using rule-based factor generation.")
-        fallback_factors = self._generate_factors_rule_based(n_factors)
-        # self._save_factors_to_file(fallback_factors, round_id=0)
-        return fallback_factors
+        return self._generate_factors_rule_based(n_factors)
     
-    def _generate_factors_via_llm(self, n_factors: int) -> List[CandidateFactor]:
+    def _generate_factors_via_llm(self, n_factors: int, hypothesis: Optional[str] = None) -> List[CandidateFactor]:
         """
         Generate factors using LLM.
-        
+
+        When *hypothesis* is provided (Stage 2 of hypothesis-driven generation),
+        the prompt directs the LLM to construct factors that EXPRESS that
+        specific market hypothesis, rather than just covering generic categories.
+
         Args:
             n_factors: Number of factors to generate
-            
+            hypothesis: Optional market hypothesis to guide factor construction
+
         Returns:
             List of candidate factors
         """
@@ -1456,6 +1820,7 @@ Supported functions (WorldQuant style):
 - ts_max(X, w): rolling maximum over window w
 - ts_sum(X, w): rolling sum over window w
 - ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
+- ts_pct_change(X, w): (X - delay(X, w)) / delay(X, w) (alias: ts_pctchange, pct_change)
 - ts_zscore(X, w): rolling z-score over window w
 - delay(X, d): lag by d periods (alias: ts_lag, lag)
 - sign(X): element-wise sign
@@ -1463,20 +1828,10 @@ Supported functions (WorldQuant style):
 - log(X): element-wise natural log
 - sqrt(X): element-wise square root
 
-Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, cov, skew, kurt/kurtosis are accepted as aliases.
-Supported operators: +, -, *, /, ^
+Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, cov, skew, kurt/kurtosis, ts_pctchange/pct_change are accepted as aliases.
+Supported operators: +, -, *, /, ^"""
 
-Factor categories to cover:
-1. Momentum: price trend, volume confirmation, reversal
-2. Value: valuation ratios, mean reversion
-3. Quality: profitability, earnings quality, balance sheet strength
-4. Liquidity: trading volume, turnover, bid-ask spread
-5. Growth: earnings growth, revenue growth, analyst revisions
-
-Return a JSON array of objects, each with "expression" and "description" keys.
-Ensure expressions are valid and can be evaluated by the factor engine."""
-
-        # Build user_prompt with valid JSON example (avoid f-string escaping issues)
+        # Build JSON example once (shared by both branches)
         json_example = json.dumps({
             "factors": [
                 {"expression": "rank(ts_corr(close, volume, 20))", "description": "Price-volume correlation momentum"},
@@ -1485,20 +1840,37 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             ]
         }, ensure_ascii=False)
 
-        user_prompt = (
-            f"Please generate {n_factors} diverse factor expressions for A-share stock selection.\n"
-            + "Requirements:\n"
-            + "1. Factors should be diverse and cover different categories (momentum, value, quality, liquidity, growth)\n"
-            + "2. Expressions must be valid and use only supported functions and data sources\n"
-            + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
-            + "4. Each factor should have economic intuition\n"
-            + "5. You MUST return exactly " + str(n_factors) + " factors\n"
-            + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
-            + "\n"
-            + "Example (valid JSON object with \"factors\" key):\n"
-            + json_example + "\n\n"
-            + f"Please generate {n_factors} factors now. Return only the JSON object."
-        )
+        if hypothesis:
+            user_prompt = (
+                f"Generate {n_factors} factor expressions that capture the following market hypothesis:\n\n"
+                f"  \"{hypothesis}\"\n\n"
+                + "Requirements:\n"
+                + "1. Each factor should directly or indirectly express the hypothesis above\n"
+                + "2. Expressions must be valid and use only supported functions and data sources\n"
+                + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
+                + "4. Each factor should have economic intuition tied to the hypothesis\n"
+                + "5. You MUST return exactly " + str(n_factors) + " factors\n"
+                + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
+                + "\n"
+                + "Example (valid JSON object with \"factors\" key):\n"
+                + json_example + "\n\n"
+                + f"Please generate {n_factors} factors now. Return only the JSON object."
+            )
+        else:
+            user_prompt = (
+                f"Please generate {n_factors} diverse factor expressions for A-share stock selection.\n"
+                + "Requirements:\n"
+                + "1. Factors should be diverse and cover different categories (momentum, value, quality, liquidity, growth)\n"
+                + "2. Expressions must be valid and use only supported functions and data sources\n"
+                + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
+                + "4. Each factor should have economic intuition\n"
+                + "5. You MUST return exactly " + str(n_factors) + " factors\n"
+                + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
+                + "\n"
+                + "Example (valid JSON object with \"factors\" key):\n"
+                + json_example + "\n\n"
+                + f"Please generate {n_factors} factors now. Return only the JSON object."
+            )
 
         try:
             raw = self._call_llm(system_prompt, user_prompt, temperature=0.7, expect_json=True)
@@ -1637,6 +2009,7 @@ Supported functions (WorldQuant style):
 - ts_max(X, w): rolling maximum over window w
 - ts_sum(X, w): rolling sum over window w
 - ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
+- ts_pct_change(X, w): (X - delay(X, w)) / delay(X, w) (alias: ts_pctchange, pct_change)
 - ts_zscore(X, w): rolling z-score over window w
 - delay(X, d): lag by d periods (alias: ts_lag, lag)
 - sign(X): element-wise sign
@@ -1644,7 +2017,7 @@ Supported functions (WorldQuant style):
 - log(X): element-wise natural log
 - sqrt(X): element-wise square root
 
-Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag are accepted as aliases.
+Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, ts_pctchange/pct_change are accepted as aliases.
 
 Supported operators: +, -, *, /, ^
 
@@ -1681,29 +2054,68 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         factors = self._generate_factors_rule_based(n_factors)
         return [{"expression": f.expression, "description": f.description} for f in factors]
 
+    def _apply_originality_gate(self, factor: 'CandidateFactor') -> None:
+        """
+        Run the static AST originality gate on an already-backtested factor.
+
+        Only runs when the factor passed parse + backtest (factor.is_valid). On
+        rejection we set factor.originality_ok=False and record the reason in
+        factor.gate_reason. We deliberately leave factor.is_valid=True so the
+        existing selection fallback can still recover a survivor set if the gate
+        (over-)rejects the entire pool.
+        """
+        gate = getattr(self, 'gate', None)
+        if gate is None or not gate.enabled:
+            return
+        ok, reason = gate.validate(factor.expression)
+        if not ok:
+            factor.originality_ok = False
+            factor.gate_reason = reason
+            logger.info(
+                "Originality gate rejected '%s': %s",
+                factor.expression, reason,
+            )
+
     def evolve(
         self,
         seed_factors: List[CandidateFactor],
         backtester: FactorBacktester,
         n_rounds: int = 10,
+        val_backtester: Optional['FactorBacktester'] = None,
     ) -> EvolutionResult:
         """
         Evolve factors through iterative improvement.
-        
+
         Args:
             seed_factors: Seed factors to evolve
-            backtester: Backtester for evaluation
+            backtester: Backtester for evaluation (TRAIN period)
             n_rounds: Number of evolution rounds
-            
+            val_backtester: Optional backtester on a held-out VALIDATION period.
+                When supplied, evolution is *driven* by train IC (so the LLM
+                keeps exploiting the training signal) but factors are finally
+                *ranked* and *early-stopped* on validation IC — the standard
+                anti-overfitting recipe. When None, behaviour is unchanged
+                (selection/early-stop use train IC).
+
         Returns:
             Evolution result
         """
-        print(f"\nStarting evolution ({n_rounds} rounds)...")
-        
+        val_mode = val_backtester is not None
+
+        def _ic_key(f: CandidateFactor) -> float:
+            """Sort key: validation IC when available, else train IC."""
+            if val_mode and f.val_ic is not None and not np.isnan(f.val_ic):
+                return f.val_ic
+            return f.ic if f.ic is not None and not np.isnan(f.ic) else float('-inf')
+
+        print(f"\nStarting evolution ({n_rounds} rounds)..."
+              f"{' [train-driven, val-selected]' if val_mode else ''}")
+
         evolution_history = []
         current_factors = seed_factors
-        
+
         best_ic = 0.0
+        best_val_ic = 0.0
         all_evaluated_factors: List[CandidateFactor] = []  # accumulates IC-evaluated factors from every round
         no_improvement_count = 0  # for patience-based early stop
         
@@ -1714,7 +2126,19 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             mode = "parallel" if self.parallel else "serial"
             print(f"  Evaluating {len(current_factors)} factors ({mode})...")
             metrics_list = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
-            
+
+            # Validation evaluation. We evaluate on *independent probe* factors
+            # (same expression, fresh objects) so the validation pass cannot
+            # clobber the train IC/Sharpe already written onto the originals by
+            # the train backtester. We only read the returned metrics dict.
+            val_metrics_list = None
+            if val_mode:
+                val_probes = [CandidateFactor(id=f.id, expression=f.expression,
+                                          description=f.description or "")
+                              for f in current_factors]
+                val_metrics_list = val_backtester.evaluate_batch(
+                    val_probes, max_workers=4, parallel=self.parallel)
+
             evaluated_factors = []
             for i, factor in enumerate(current_factors):
                 metrics = metrics_list[i]
@@ -1731,6 +2155,19 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                         "Excluding invalid factor '%s' from candidate set: %s",
                         factor.expression, factor.parse_error,
                     )
+                else:
+                    # Originality gate: structural dedup + triviality + semantics.
+                    # Runs only on parse/backtest-valid factors; on rejection it
+                    # sets originality_ok=False (is_valid stays True for fallback).
+                    self._apply_originality_gate(factor)
+                # Attach validation-period IC (read from the probe's returned metrics)
+                if val_mode and val_metrics_list is not None:
+                    vmetrics = val_metrics_list[i]
+                    if vmetrics.get('is_valid', True):
+                        factor.val_ic = vmetrics.get('ic', float('nan'))
+                        factor.val_icir = vmetrics.get('icir', float('nan'))
+                    else:
+                        factor.val_ic = float('nan')
                 evaluated_factors.append(factor)
 
                 # Only update best_ic with valid factors that have a real IC value
@@ -1739,8 +2176,9 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
 
             self._save_factors_to_file(current_factors, round_id, filename="improved_factors.json")
 
-            # Select top factors — exclude parse-failed factors before sorting
-            valid_evaluated = [f for f in evaluated_factors if f.is_valid and not np.isnan(f.ic)]
+            # Select top factors — exclude parse-failed AND gate-rejected factors
+            valid_evaluated = [f for f in evaluated_factors
+                               if f.is_valid and f.originality_ok and not np.isnan(f.ic)]
             top_factors = sorted(valid_evaluated, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
             
             # Generate reflection based on backtest results
@@ -1763,7 +2201,16 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 improved_factors = self._generate_improvements_rule_based(top_factors)
 
             # Record evolution round (store evaluated factors only)
-            round_best_ic = max(f.ic for f in evaluated_factors) if evaluated_factors else 0.0
+            round_best_ic = max((f.ic for f in evaluated_factors if not np.isnan(f.ic)),
+                                default=0.0)
+            if val_mode:
+                round_best_val_ic = max(
+                    (f.val_ic for f in evaluated_factors
+                     if f.is_valid and f.val_ic is not None and not np.isnan(f.val_ic)),
+                    default=0.0,
+                )
+            else:
+                round_best_val_ic = 0.0
             round_record = EvolutionRound(
                 round_id=round_id,
                 factors=evaluated_factors,
@@ -1772,8 +2219,32 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             )
             evolution_history.append(round_record)
             
-            # Update current factors
-            current_factors = improved_factors
+            # Elitism: carry top-N unmutated factors into the next round to
+            # prevent diversity collapse. Without this, the entire pool is
+            # replaced every round and can converge to a single direction.
+            elite_factors: List[CandidateFactor] = []
+            if self.elitism_carry > 0 and top_factors:
+                elite_factors = sorted(
+                    top_factors, key=_ic_key, reverse=True
+                )[:self.elitism_carry]
+                # Deep-copy the expressions so the elite originals stay intact
+                # even if improved_factors accidentally mutate the same objects.
+                elite_factors = [
+                    CandidateFactor(
+                        id=f"elite_r{round_id}_{f.id}",
+                        expression=f.expression,
+                        description=f.description,
+                        parent_id=f.id,
+                        generation=f.generation,
+                    )
+                    for f in elite_factors
+                ]
+                if elite_factors:
+                    print(f"  [elitism] Carried {len(elite_factors)} elite factors "
+                          f"(IC: {[f'{f.id[-8:]}:{_ic_key(f):.3f}' for f in elite_factors]})")
+
+            # Update current factors for next round (elites + improved)
+            current_factors = elite_factors + improved_factors
             
             # Keep a running list of all evaluated factors (with real IC values)
             # evaluated_factors holds the assessed batch for this round
@@ -1781,28 +2252,55 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
 
             print(f"  Best IC: {best_ic:.4f}")
             print(f"  Avg IC (top {self.n_best_factors}): {round_record.avg_ic:.4f}")
-            
-            # Track patience: consecutive rounds without IC improvement
-            if round_best_ic >= best_ic:
+            if val_mode:
+                print(f"  Best val IC: {best_val_ic:.4f} (round best: {round_best_val_ic:.4f})")
+
+            # Track patience: consecutive rounds without improvement.
+            # In val mode the early-stop signal is VALIDATION IC — this is the
+            # actual guard against train overfitting (a train-IC plateau that
+            # keeps climbing while val IC collapses must stop the search).
+            if val_mode:
+                ref_signal = round_best_val_ic
+                ref_best = best_val_ic
+            else:
+                ref_signal = round_best_ic
+                ref_best = best_ic
+
+            if ref_signal >= ref_best:
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
-            
+
+            # Update best trackers
+            if round_best_ic > best_ic:
+                best_ic = round_best_ic
+            if val_mode and round_best_val_ic > best_val_ic:
+                best_val_ic = round_best_val_ic
+
             # Check convergence
             if self._check_convergence(evolution_history):
                 print("\nConvergence reached!")
                 break
-            
+
             # Check patience: early stop if no improvement for N consecutive rounds
+            _early_msg = ("no val-IC improvement" if val_mode else "no IC improvement")
             if no_improvement_count >= self.patience:
-                print(f"\nEarly stop: no IC improvement for {self.patience} consecutive rounds (patience={self.patience})")
+                print(f"\nEarly stop: {_early_msg} for {self.patience} consecutive rounds (patience={self.patience})")
                 break
         
         # Evaluate the final round's improved_factors — they were generated but never assessed
         if current_factors:
             print(f"\n[evolve] Evaluating final improved factors ({len(current_factors)})...")
             final_metrics = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
-            for factor, metrics in zip(current_factors, final_metrics):
+            val_final_metrics = None
+            if val_mode:
+                val_probes = [CandidateFactor(id=f.id, expression=f.expression,
+                                          description=f.description or "")
+                              for f in current_factors]
+                val_final_metrics = val_backtester.evaluate_batch(
+                    val_probes, max_workers=4, parallel=self.parallel)
+            for i, factor in enumerate(current_factors):
+                metrics = final_metrics[i]
                 factor.ic = metrics.get('ic', float('nan'))
                 factor.icir = metrics.get('icir', float('nan'))
                 factor.sharpe = metrics.get('sharpe', 0.0)
@@ -1811,22 +2309,62 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 factor.is_valid = metrics.get('is_valid', True)
                 if not factor.is_valid:
                     factor.parse_error = metrics.get('parse_error', '')
+                else:
+                    # Originality gate (see per-round eval block for rationale)
+                    self._apply_originality_gate(factor)
+                if val_mode and val_final_metrics is not None:
+                    vmetrics = val_final_metrics[i]
+                    if vmetrics.get('is_valid', True):
+                        factor.val_ic = vmetrics.get('ic', float('nan'))
+                        factor.val_icir = vmetrics.get('icir', float('nan'))
+                    else:
+                        factor.val_ic = float('nan')
                 if factor.is_valid and not np.isnan(factor.ic) and factor.ic > best_ic:
                     best_ic = factor.ic
             # Save improved factors with real IC/Sharpe/win_rate after backtest evaluation
             self._save_factors_to_file(current_factors, len(evolution_history), filename="improved_factors.json")
             all_evaluated_factors.extend(current_factors)
 
-        # Select best factors from all evaluated factors across all rounds
-        # Exclude parse-failed factors (is_valid=False / ic=nan) before sorting
-        valid_all = [f for f in all_evaluated_factors if f.is_valid and not np.isnan(f.ic)]
-        best_factors = sorted(valid_all, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
-        
-        # Quality filter: remove factors that don't meet minimum thresholds
+        # Select best factors from all evaluated factors across all rounds.
+        # In val mode we rank by VALIDATION IC (the out-of-sample signal) so the
+        # survivor set is robust to train overfitting; otherwise by train IC.
+        # Factors rejected by the originality gate are excluded here.
+        valid_all = [f for f in all_evaluated_factors
+                     if f.is_valid and f.originality_ok and not np.isnan(f.ic)
+                     and (not val_mode or (f.val_ic is not None and not np.isnan(f.val_ic)))]
+
+        # Safety net: if the originality gate (over-)rejected the entire pool,
+        # fall back to ignoring it so the pipeline still yields a survivor set
+        # instead of returning an empty result. The mis-tuning is logged loudly.
+        if not valid_all:
+            parse_valid = [f for f in all_evaluated_factors
+                           if f.is_valid and not np.isnan(f.ic)
+                           and (not val_mode or (f.val_ic is not None and not np.isnan(f.val_ic)))]
+            if parse_valid:
+                print(f"  [originality] Warning: gate rejected ALL candidates; "
+                      f"falling back to ignoring originality (keeping parse-valid factors).")
+                valid_all = parse_valid
+
+        best_factors = sorted(valid_all, key=_ic_key, reverse=True)[:self.n_best_factors]
+
+        # Quality filter: remove factors that don't meet minimum thresholds.
+        # In val_mode the PRIMARY gate is validation IC (the honest, holdout
+        # signal introduced for anti-overfitting): a factor with a negative val IC
+        # is exactly the overfit signature we want to keep out of the pool.
+        # min_ic / max_drawdown / min_sharpe are secondary guards. NOTE: f.sharpe
+        # is distorted by overlapping-window annualization (daily-sampled 10d
+        # forward returns * sqrt(252)), so it is a soft floor, not a hard gate.
+        # The degenerate fallback must NOT silently return a wall of junk factors:
+        # if every factor fails the gate we keep only the single best by the
+        # honest ranking key, so the pipeline survives and the mis-tuning is loud.
         quality_filtered = []
         for f in best_factors:
-            if not f.is_valid or np.isnan(f.ic):
+            if not f.is_valid or not f.originality_ok or np.isnan(f.ic):
                 continue
+            if val_mode:
+                # Honest gate: require a non-negative signal on the validation split.
+                if f.val_ic is None or np.isnan(f.val_ic) or f.val_ic < self.min_val_ic:
+                    continue
             if f.ic < self.min_ic:
                 continue
             if f.sharpe < self.min_sharpe:
@@ -1834,17 +2372,23 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             if f.max_drawdown < self.max_drawdown:
                 continue
             quality_filtered.append(f)
-        
+
         n_before = len(best_factors)
         n_after = len(quality_filtered)
         if n_after < n_before:
             print(f"\n  [quality] Filtered {n_before - n_after} factors below threshold "
-                  f"(min_ic={self.min_ic}, min_sharpe={self.min_sharpe}, max_drawdown={self.max_drawdown})")
-        
-        # If quality filter removed everything, keep the original list (better than empty)
+                  f"(min_ic={self.min_ic}, min_sharpe={self.min_sharpe}, "
+                  f"max_drawdown={self.max_drawdown}, min_val_ic={self.min_val_ic})")
+
+        # Degenerate fallback: thresholds too strict (or genuinely no usable
+        # factor). Keep only the single best by the honest ranking key instead of
+        # returning the full unfiltered list (which would re-admit junk factors).
         if not quality_filtered:
-            print(f"  [quality] Warning: all factors failed quality filter — keeping unfiltered best factors")
-            quality_filtered = best_factors
+            print(f"  [quality] Warning: ALL factors failed quality filter "
+                  f"(min_ic={self.min_ic}, min_sharpe={self.min_sharpe}, "
+                  f"max_drawdown={self.max_drawdown}, min_val_ic={self.min_val_ic}). "
+                  f"Keeping the single best by {'val_' if val_mode else ''}IC.")
+            quality_filtered = [best_factors[0]] if best_factors else []
         
         return EvolutionResult(
             best_factors=quality_filtered,
@@ -1888,8 +2432,8 @@ Guidelines:
         # Build reflection section
         reflection_section = ""
         if reflection_notes:
-            # Truncate to avoid prompt overflow (keep last 1500 chars)
-            notes_truncated = reflection_notes[-1500:] if len(reflection_notes) > 1500 else reflection_notes
+            # Truncate to avoid prompt overflow (keep last 3000 chars)
+            notes_truncated = reflection_notes[-3000:] if len(reflection_notes) > 3000 else reflection_notes
             reflection_section = f"""
 === Reflection Notes from Previous Round ===
 {notes_truncated}
@@ -1929,7 +2473,7 @@ Example format:
 Please generate improved factors now. Return only the JSON object, no other text."""
 
         try:
-            raw = self._call_llm(system_prompt, user_prompt, temperature=0.8, expect_json=True)
+            raw = self._call_llm(system_prompt, user_prompt, temperature=self.improve_temperature, expect_json=True)
             factors_json = self._parse_llm_json(raw)
 
             improved_factors = []

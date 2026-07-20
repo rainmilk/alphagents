@@ -392,8 +392,14 @@ class AAAI2027Pipeline:
             convergence_window=evo_cfg.get('convergence_window', 2),
             patience=evo_cfg.get('patience', 3),
             min_ic=evo_cfg.get('min_ic', 0.02),
-            min_sharpe=evo_cfg.get('min_sharpe', 0.5),
-            max_drawdown=evo_cfg.get('max_drawdown', -0.20),
+            min_sharpe=evo_cfg.get('min_sharpe', 0.0),
+            max_drawdown=evo_cfg.get('max_drawdown', -1.0),
+            min_val_ic=evo_cfg.get('min_val_ic', 0.0),
+            originality_gate=evo_cfg.get('originality_gate', True),
+            dedup_similarity=evo_cfg.get('dedup_similarity', 0.90),
+            improve_temperature=evo_cfg.get('improve_temperature', 0.3),
+            elitism_carry=evo_cfg.get('elitism_carry', 2),
+            seed_hypothesis_driven=evo_cfg.get('seed_hypothesis_driven', False),
         )
         
         # Generate seed factors
@@ -447,6 +453,52 @@ class AAAI2027Pipeline:
         print(f"  Generated {len(seed_factors)} seed factors")
         print("  [✓] Factor generation complete")
         
+    def _split_train_val(self, train_data: dict, val_ratio: float):
+        """Carve a hold-out validation window from the END of the train period.
+
+        Returns ``(train_sub, val_sub)`` dicts mirroring ``train_data``'s
+        structure, or ``None`` if a clean split isn't possible (no price data,
+        degenerate window, etc.).
+
+        The validation window is the most-recent ``val_ratio`` fraction of the
+        train dates (closest to the test distribution); the earlier portion
+        drives evolution. The true test set in ``self.test_data`` is NEVER
+        touched here — this is purely for in-sample model *selection*.
+        """
+        price = train_data.get('price_data', {})
+        close = price.get('close')
+        if close is None or len(close) < 20:
+            return None
+        n = len(close)
+        split_idx = int(n * (1.0 - val_ratio))
+        if split_idx <= 0 or split_idx >= n:
+            return None
+        val_start = close.index[split_idx]
+
+        def _slice(d):
+            if isinstance(d, pd.DataFrame):
+                return d.iloc[:split_idx], d.iloc[split_idx:]
+            return d, d
+
+        train_sub, val_sub = {}, {}
+        for key in ('price_data', 'fundamental_data'):
+            src = train_data.get(key, {}) or {}
+            ts, vs = {}, {}
+            for name, df in src.items():
+                a, b = _slice(df)
+                ts[name] = a
+                vs[name] = b
+            train_sub[key] = ts
+            val_sub[key] = vs
+        # Cross-sectional / metadata pass-through (not time series)
+        for key in ('industry_data', '_meta'):
+            if key in train_data:
+                train_sub[key] = train_data[key]
+                val_sub[key] = train_data[key]
+        val_sub['_meta'] = dict(train_data.get('_meta', {}))
+        val_sub['_meta']['val_start'] = str(pd.Timestamp(val_start).date())
+        return train_sub, val_sub
+
     def step4_evolve_factors(self, n_rounds: int = 5, forward_period: int = None):
         """
         Step 4: Self-evolve seed factors through iterative improvement.
@@ -467,12 +519,46 @@ class AAAI2027Pipeline:
             forward_period = self.config.get('evolution', {}).get('forward_period', 10)
         
         print(f"\n[Step 4] Evolving factors ({n_rounds} rounds, forward={forward_period}d)...")
-        
+
+        # --- Train / validation split (anti-overfitting lever) ---
+        # Evolution is DRIVEN by train IC but factors are finally RANKED and
+        # EARLY-STOPPED on validation IC. The validation window is carved from
+        # the most-recent tail of the train period; the true test set is never
+        # touched here. val_ratio=0 → train-only selection (original behaviour).
+        val_ratio = float(self.config.get('evolution', {}).get('val_ratio', 0.0) or 0.0)
+        val_backtester = None
+        train_price = self.train_data['price_data']
+        train_fund = self.train_data.get('fundamental_data', {})
+
+        if val_ratio > 0 and self.train_data:
+            split = self._split_train_val(self.train_data, val_ratio)
+            if split is not None:
+                train_sub, val_sub = split
+                train_price = train_sub['price_data']
+                train_fund = train_sub.get('fundamental_data', {})
+                try:
+                    val_backtester = FactorBacktester(
+                        prices=val_sub['price_data'],
+                        fundamentals=val_sub.get('fundamental_data', {}),
+                        forward_period=forward_period,
+                    )
+                    vstart = val_sub['_meta'].get('val_start', '?')
+                    print(f"  [evolution] Validation holdout ENABLED (val_ratio={val_ratio}):")
+                    print(f"    train window: {self._train_start_date} → {vstart}")
+                    print(f"    val   window: {vstart} → {self._train_end_date}")
+                except Exception as e:
+                    print(f"  [evolution] Warning: failed to build val backtester ({e}); "
+                          f"falling back to train-only selection.")
+                    val_backtester = None
+            else:
+                print(f"  [evolution] Warning: train period too small to carve "
+                      f"val_ratio={val_ratio}; using train-only selection.")
+
         # Initialize backtester for evolution — USE TRAINING DATA ONLY
         # Critical: factors must NOT see test data during evolution
         backtester = FactorBacktester(
-            prices=self.train_data['price_data'],
-            fundamentals=self.train_data['fundamental_data'],
+            prices=train_price,
+            fundamentals=train_fund,
             forward_period=forward_period,
         )
         print(f"  [evolution] Using TRAIN data only: {self._train_end_date}")
@@ -480,15 +566,19 @@ class AAAI2027Pipeline:
             seed_factors=self.generated_factors,
             backtester=backtester,
             n_rounds=n_rounds,
+            val_backtester=val_backtester,
         )
-        
+
         self.evolution_history = evolution_result.evolution_history
         self.best_factors = evolution_result.best_factors
         self._forward_period = forward_period   # persist for step6/_calculate_factor_values
 
         print(f"  Evolution complete: {len(self.best_factors)} best factors")
-        best_ic = self.best_factors[0].ic if self.best_factors else 0.0
-        print(f"  Best IC: {best_ic:.4f}")
+        sel_mode = "validation" if val_backtester else "train"
+        print(f"  Selection mode: {sel_mode}-IC")
+        for rank, f in enumerate(self.best_factors, 1):
+            vic = f.val_ic if (val_backtester and not np.isnan(f.val_ic)) else float('nan')
+            print(f"    #{rank}: train_IC={f.ic:.4f}  val_IC={vic:.4f}  {f.expression}")
         print("  [✓] Factor evolution complete")
 
     def step4b_retrieve_from_memory(self):

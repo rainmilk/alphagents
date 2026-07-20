@@ -14,48 +14,62 @@ import pandas as pd
 from typing import List, Tuple, Optional
 
 
-def max_drawdown(returns: pd.Series) -> float:
+def max_drawdown(returns: pd.Series, method: str = 'compound') -> float:
     """
     Compute maximum drawdown from a return series.
 
     Returns a negative number (e.g., -0.15 = 15% drawdown).
 
     Args:
-        returns: Series of periodic returns (typically daily).
+        returns: Series of periodic returns.
+        method: 'compound' (default) — geometric compounding, correct for
+            sequential portfolio returns.  'simple' — arithmetic summation,
+            appropriate when *returns* are overlapping forward-period
+            observations (e.g. daily-sampled 10 d long‑short spreads) where
+            cumprod would massively overstate drawdown.
 
     Returns:
         Minimum drawdown as a negative float; 0.0 if insufficient data.
     """
     if len(returns) < 2:
         return 0.0
-    cumulative = (1 + returns).cumprod()
+    if method == 'simple':
+        cumulative = 1.0 + returns.cumsum()
+    else:
+        cumulative = (1 + returns).cumprod()
     peak = cumulative.cummax()
     drawdown = (cumulative - peak) / peak
     return float(drawdown.min())
 
 
-def annualized_sharpe(returns: pd.Series, rf: float = 0.02) -> float:
+def annualized_sharpe(returns: pd.Series, rf: float = 0.02, periods_per_year: float = 252) -> float:
     """
     Compute annualized Sharpe ratio from periodic returns.
 
     Uses the standard definition:
-        Sharpe = (mean(excess) / std(excess)) * sqrt(252)
+        Sharpe = (mean(excess) / std(excess)) * sqrt(periods_per_year)
 
     Args:
-        returns: Series of periodic returns (assumed daily).
-        rf: Annual risk-free rate (default 2%).
+        returns: Series of periodic returns.
+        rf: Annual risk-free rate (default 2%). It is scaled to the return
+            period as rf / periods_per_year before being subtracted.
+        periods_per_year: Number of return periods per year. Defaults to 252
+            (daily returns). For H-day holding-period returns pass 252 / H so
+            the annualization matches the actual holding period — otherwise
+            Sharpe is overstated by a factor of sqrt(H).
 
     Returns:
         Annualized Sharpe ratio; 0.0 if std is zero or data insufficient.
     """
     if len(returns) < 2:
         return 0.0
-    excess = returns - rf / 252.0
+    rf_period = rf / periods_per_year
+    excess = returns - rf_period
     mean_ret = float(excess.mean())
     std_ret = float(excess.std(ddof=1))
     if std_ret == 0:
         return 0.0
-    return (mean_ret / std_ret) * np.sqrt(252)
+    return (mean_ret / std_ret) * np.sqrt(periods_per_year)
 
 
 def total_return(portfolio_values: pd.Series) -> float:

@@ -1529,7 +1529,7 @@ def run_alphaagent_baseline(
     prices = price_data.get('close')
     if prices is None:
         raise ValueError("Missing 'close' price data for backtest")
-    prices = prices.loc[train_start_date:test_end_date]
+    prices = prices.loc[train_start:test_end]
 
     n_dates = len(price_midx.get('close').index.get_level_values('datetime').unique())
     n_stocks = len(price_midx.get('close').index.get_level_values('instrument').unique())
