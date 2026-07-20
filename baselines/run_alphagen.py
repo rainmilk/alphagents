@@ -1352,7 +1352,7 @@ def run_alphagen_baseline(
     gamma: float = 1.0,
     ent_coef: float = 0.01,
     device: str = 'cpu',
-    forward_period: int = 10,
+    forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
 ) -> Dict:
     """
     Run AlphaGen baseline — RL-based token factor generation.
@@ -1412,6 +1412,15 @@ def run_alphagen_baseline(
     # ── Step 1: Load data ──────────────────────────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
+
+    # ── Resolve forward_period / holding_period from config ──────────
+    # explicit arg > config.yaml > default, so standalone runs also honor config.
+    _ev_cfg = loader.config.get('evolution', {})
+    _bt_cfg = loader.config.get('backtest', {}).get('trading', {})
+    if not forward_period or forward_period <= 0:
+        forward_period = _ev_cfg.get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = _bt_cfg.get('holding_period', 1)
     train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
     test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
@@ -1751,9 +1760,9 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cpu',
                         choices=['cpu', 'cuda', 'auto'],
                         help='Device for RL training')
-    parser.add_argument('--forward-period', type=int, default=10,
+    parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return period in days for IC evaluation '
-                             '(default 10, matching other baselines)')
+                             '(default: config evolution.forward_period, 10)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Rebalance frequency in days (1=daily, 5=weekly, 20=monthly). '
                              'Defaults to AlphaGenConfig.holding_period (1).')

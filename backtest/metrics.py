@@ -150,20 +150,43 @@ def win_rate(returns: pd.Series) -> float:
     return float((returns > 0).sum() / len(returns))
 
 
-def information_ratio(excess_returns: pd.Series) -> float:
+def information_ratio(
+    returns: pd.Series,
+    benchmark_returns: Optional[pd.Series] = None,
+) -> float:
     """
     Compute annualized Information Ratio.
 
+    IR measures risk-adjusted *excess* return over a benchmark:
+        IR = mean(returns - benchmark) / std(returns - benchmark) * sqrt(252)
+
     Args:
-        excess_returns: Series of excess returns vs. benchmark (or zero).
+        returns: Series of strategy (daily) returns, indexed by date.
+        benchmark_returns: Optional Series of benchmark (daily) returns,
+            **indexed by the same "from" date** as ``returns`` (i.e. the
+            return realised over [t, t+1] is labelled at t). When omitted,
+            the benchmark is treated as a constant 0, which makes IR
+            degenerate to the (annualized) Sharpe ratio — the previous
+            behaviour, kept for backward compatibility with baselines that
+            do not supply a benchmark.
 
     Returns:
-        Annualized Information Ratio.
+        Annualized Information Ratio; 0.0 if undefined.
     """
-    if len(excess_returns) < 2:
+    if len(returns) < 2:
         return 0.0
-    mean_excess = float(excess_returns.mean())
-    std_excess = float(excess_returns.std(ddof=1))
+
+    if benchmark_returns is None:
+        # Legacy path: input already represents excess-vs-0 → equals Sharpe.
+        excess = returns
+    else:
+        common_idx = returns.index.intersection(benchmark_returns.index)
+        if len(common_idx) < 2:
+            return 0.0
+        excess = returns.loc[common_idx] - benchmark_returns.loc[common_idx]
+
+    mean_excess = float(excess.mean())
+    std_excess = float(excess.std(ddof=1))
     if std_excess == 0:
         return 0.0
     return (mean_excess / std_excess) * np.sqrt(252)

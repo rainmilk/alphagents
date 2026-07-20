@@ -1207,9 +1207,18 @@ class AAAI2027Pipeline:
         
         # Run backtest on TEST data (out-of-sample)
         # Critical: this must use test_data, NOT the full price_data
+        # Build an equal-weight universe benchmark (market proxy) from the test
+        # close prices so Information Ratio reflects *excess* vs the market
+        # instead of degenerating to the Sharpe ratio (benchmark=0).
+        # bm[t] = equal-weight mean of stock returns over [t, t+1], aligned to
+        # the same "from" date labels the engine uses for strategy returns.
+        _test_close = _test['price_data']['close']
+        _bm = _test_close.pct_change().shift(-1).mean(axis=1).dropna()
+        _bm.name = 'benchmark_return'
         self.performance_metrics = self.backtest_engine.run(
             portfolios=self.portfolios,
             prices=_test['price_data']['close'],
+            benchmark_returns=_bm,
         )
         
         print(f"\n  [backtest] Out-of-sample results (test period: {getattr(self, '_test_start_date', 'unknown')})")

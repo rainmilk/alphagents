@@ -53,8 +53,8 @@ def run_mcts_llm_alpha_baseline(
     train_end_date: Optional[str] = None,
     test_start_date: Optional[str] = None,
     test_end_date: str = "2023-12-31",
-    forward_period: int = 10,
-    holding_period: int = None,  # None -> use mcts_config.holding_period (default 1)
+    forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
+    holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -82,6 +82,15 @@ def run_mcts_llm_alpha_baseline(
     # ── Parameter-tagged, date-isolated run directory ──
     loader = DataLoader(config_path=config_path)
     data_cfg = loader.data_config.get('universe', {})
+
+    # ── Resolve forward_period / holding_period from config ──────────
+    # explicit arg > config.yaml > default, so standalone runs also honor config.
+    _ev_cfg = loader.config.get('evolution', {})
+    _bt_cfg = loader.config.get('backtest', {}).get('trading', {})
+    if not forward_period or forward_period <= 0:
+        forward_period = _ev_cfg.get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = _bt_cfg.get('holding_period', 1)
 
     method_name = "mcts_llm"
     _u = data_cfg.get('index', 'hs300')  # mcts default universe (not exposed via CLI)
@@ -651,8 +660,8 @@ def parse_args():
                         help='First test (OOS) date YYYY-MM-DD (default: config test_start_date)')
     parser.add_argument('--no-llm', action='store_true', default=False,
                         help='Disable LLM (use simulated formulas)')
-    parser.add_argument('--forward-period', type=int, default=10,
-                        help='Forward return period in days (default: 10, should match MASE)')
+    parser.add_argument('--forward-period', type=int, default=None,
+                        help='Forward return period in days (default: config evolution.forward_period, 10)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Portfolio holding period in days for backtest (default: config value, 1 = daily rebalance)')
     return parser.parse_args()

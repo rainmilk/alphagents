@@ -1195,9 +1195,9 @@ def run_alphagrail_baseline(
     test_end_date: Optional[str] = None,
     universe: Optional[str] = None,
     top_n_stocks: int = 50,
-    holding_period: int = 1,
+    holding_period: Optional[int] = None,
     use_llm_tournament: bool = False,
-    forward_period: int = 10,
+    forward_period: Optional[int] = None,
     n_quantiles: int = 5,
     use_neutralization: bool = False,
     output_dir: Optional[str] = None,
@@ -1240,11 +1240,21 @@ def run_alphagrail_baseline(
     print("=" * 60)
     print("  AlphaGrail Baseline — LLM-Driven Alpha Selection (via Main DataLoader)")
     print("=" * 60)
-    print(f"  Forward period: {forward_period}d | Quantiles: {n_quantiles} | Neutralize: {use_neutralization}")
+    print(f"  Quantiles: {n_quantiles} | Neutralize: {use_neutralization}")
 
     # ── Step 1: Load data via main DataLoader ──────────────────────────
     print("\n[Step 1] Loading data via main DataLoader...")
     loader = DataLoader(config_path=config_path)
+
+    # ── Resolve forward_period / holding_period from config ──────────
+    # explicit arg > config.yaml > default, so standalone runs also honor config.
+    _ev_cfg = loader.config.get('evolution', {})
+    _bt_cfg = loader.config.get('backtest', {}).get('trading', {})
+    if not forward_period or forward_period <= 0:
+        forward_period = _ev_cfg.get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = _bt_cfg.get('holding_period', 1)
+    print(f"  Forward period: {forward_period}d | Holding period: {holding_period}d")
     train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
     test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')

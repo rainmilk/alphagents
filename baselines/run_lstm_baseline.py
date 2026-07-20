@@ -506,8 +506,8 @@ def run_lstm_baseline(
     epochs: int = 50,
     batch_size: int = 2048,
     learning_rate: float = 0.001,
-    holding_period: int = 1,
-    forward_period: int = 10,
+    holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
+    forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     output_dir: Optional[str] = None,
 ) -> Dict:
     """
@@ -531,6 +531,15 @@ def run_lstm_baseline(
     # The full data span is now provided by the DataLoader/DatasetBundle
     # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
+
+    # ── Resolve forward_period / holding_period from config ──────────
+    # explicit arg > config.yaml > default, so standalone runs also honor config.
+    _ev_cfg = loader.config.get('evolution', {})
+    _bt_cfg = loader.config.get('backtest', {}).get('trading', {})
+    if not forward_period or forward_period <= 0:
+        forward_period = _ev_cfg.get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = _bt_cfg.get('holding_period', 1)
 
     # -- Step 2: Determine train/test split (config-backed) --
     train_start = train_start_date or loader.data_config.get(
@@ -753,8 +762,8 @@ if __name__ == '__main__':
                         help='Learning rate')
     parser.add_argument('--holding-period', type=int, default=1,
                         help='Holding period (1=daily, 5=weekly)')
-    parser.add_argument('--forward-period', type=int, default=10,
-                        help='Forward return period in days (must align with other baselines)')
+    parser.add_argument('--forward-period', type=int, default=None,
+                        help='Forward return period in days (default: config evolution.forward_period, 10)')
     parser.add_argument('--output-dir', default='experiments/lstm',
                         help='Output directory')
 

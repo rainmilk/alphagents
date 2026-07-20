@@ -1464,8 +1464,8 @@ def run_alphaagent_baseline(
     test_start_date: str = None,
     test_end_date: str = None,
     use_llm: bool = True,
-    forward_period: int = 10,
-    holding_period: int = None,  # None -> config['backtest']['holding_period'] or 1
+    forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
+    holding_period: Optional[int] = None,  # None -> config['backtest']['holding_period'] or 1
 ) -> Dict:
     """
     Run AlphaAgent baseline using the main project's DataLoader.
@@ -1517,8 +1517,8 @@ def run_alphaagent_baseline(
     _u = data_cfg.get('index', 'hs300')
     _s = train_start_date
     _e = test_end_date
-    _fp = forward_period if forward_period is not None else 10
-    _hp = holding_period if holding_period is not None else config.get('backtest', {}).get('holding_period', 1)
+    _fp = forward_period if (forward_period is not None and forward_period > 0) else config.get('evolution', {}).get('forward_period', 10)
+    _hp = holding_period if (holding_period is not None and holding_period > 0) else config.get('backtest', {}).get('holding_period', 1)
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
     run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -1762,9 +1762,9 @@ if __name__ == "__main__":
                         help="Use LLM to generate factors (default: True)")
     parser.add_argument("--no-llm", action="store_true", default=False,
                         help="Disable LLM, use random factor generation")
-    parser.add_argument("--forward-period", type=int, default=10,
+    parser.add_argument("--forward-period", type=int, default=None,
                         help="Forward return period in days for IC evaluation "
-                             "(default 10, matching other baselines)")
+                             "(default: config['evolution']['forward_period'], 10)")
     parser.add_argument("--holding-period", type=int, default=None,
                         help="Portfolio holding period in days for backtest "
                              "(default: config['backtest']['holding_period'], 1 = daily rebalance)")

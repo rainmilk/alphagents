@@ -595,6 +595,9 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
+        # forward_period is config-driven (evolution.forward_period), NOT the
+        # baseline's hardcoded default of 10, so all baselines stay aligned.
+        forward_period = self.config['evolution'].get('forward_period', 10)
         # holding_period is config-driven (backtest.trading.holding_period),
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
@@ -609,6 +612,7 @@ class ExperimentRunner:
             test_start_date=test_start,
             top_n_stocks=50,
             holding_period=holding_period,
+            forward_period=forward_period,
             use_llm_tournament=False,
             output_dir=output_dir,
         )
@@ -645,6 +649,12 @@ class ExperimentRunner:
         Returns:
             Dict with performance metrics.
         """
+        # forward_period is config-driven (evolution.forward_period), NOT the
+        # baseline's hardcoded default of 10.
+        forward_period = self.config['evolution'].get('forward_period', 10)
+        # holding_period is config-driven (backtest.trading.holding_period), NOT the
+        # baseline's hardcoded default of 1.
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/mcts_llm_alpha"
 
         results = run_mcts_llm_alpha_baseline(
@@ -652,6 +662,8 @@ class ExperimentRunner:
             output_dir=output_dir,
             iterations=20,
             use_llm=False,  # No LLM by default for reproducible baseline
+            forward_period=forward_period,
+            holding_period=holding_period,
         )
 
         metrics = results.get('metrics', {})
@@ -684,9 +696,13 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
         context_days = self.config['data'].get('context_days', 30)
-        
+        # forward_period / holding_period config-driven (evolution.forward_period,
+        # backtest.trading.holding_period) so AlphaFAMA stays aligned with the others.
+        forward_period = self.config['evolution'].get('forward_period', 10)
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
+
         output_dir = f"{self.output_dir}/alphafama"
-        
+
         results = run_alphafama_baseline(
             config_path="config/config.yaml",
             train_start_date=start_date,
@@ -695,6 +711,8 @@ class ExperimentRunner:
             train_end_date=train_end,
             test_start_date=test_start,
             context_days=context_days,
+            forward_period=forward_period,
+            holding_period=holding_period,
             output_dir=output_dir,
         )
         
@@ -733,6 +751,10 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
+        # forward_period / holding_period config-driven
+        forward_period = self.config['evolution'].get('forward_period', 10)
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
+
         output_dir = f"{self.output_dir}/alphaagent"
 
         results = run_alphaagent_baseline(
@@ -744,6 +766,8 @@ class ExperimentRunner:
             test_end_date=end_date,
             train_end_date=train_end,
             test_start_date=test_start,
+            forward_period=forward_period,
+            holding_period=holding_period,
         )
 
         return {
@@ -773,6 +797,9 @@ class ExperimentRunner:
         print(f"\n[Baseline] AlphaForge (AFF) - Using config: {self.config_path}")
 
         try:
+            # forward_period / holding_period config-driven
+            forward_period = self.config['evolution'].get('forward_period', 10)
+            holding_period = self.config['backtest']['trading'].get('holding_period', 1)
             results = run_alphaforge_baseline(
                 config_path=self.config_path,
                 train_start_date=self.config['data'].get('train_start_date', '2023-01-01'),
@@ -783,6 +810,8 @@ class ExperimentRunner:
                 output_dir=f"{self.output_dir}/alphaforge",
                 verbose=True,
                 use_gan=True,
+                forward_period=forward_period,
+                holding_period=holding_period,
             )
 
             return {
@@ -888,6 +917,9 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
+        # forward_period is config-driven (evolution.forward_period), NOT the
+        # baseline's hardcoded default of 10, so all baselines stay aligned.
+        forward_period = self.config['evolution'].get('forward_period', 10)
         # holding_period is config-driven (backtest.trading.holding_period),
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
@@ -904,6 +936,7 @@ class ExperimentRunner:
             pool_capacity=20,
             top_n_stocks=50,
             holding_period=holding_period,
+            forward_period=forward_period,
             seed=42,
             output_dir=output_dir,
         )

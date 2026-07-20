@@ -183,7 +183,7 @@ backtest:
   trading:
     commission: 0.0003     # [ACTIVE] 0.03% per trade
     slippage: 0.001        # [ACTIVE] 0.1% per trade
-    holding_period: 1      # [ACTIVE] days between rebalances: 1=daily, 5=weekly, 20=monthly
+    holding_period: 5      # [ACTIVE] days between rebalances: 1=daily, 5=weekly, 20=monthly
 
     # --- Unused keys ---
     frequency: "daily"     # [UNUSED] rebalance is controlled solely by holding_period above

@@ -71,6 +71,7 @@ class BacktestEngine:
         holding_period: Optional[int] = None,
         save_dir: Optional[str] = None,
         method_prefix: Optional[str] = None,
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> Dict:
         """
         Run backtest simulation.
@@ -84,6 +85,11 @@ class BacktestEngine:
                             5 = weekly, 20 = monthly.
                             On non-rebalance days, positions drift with price changes;
                             no transaction costs are incurred.
+            benchmark_returns: Optional Series of benchmark (daily) returns, indexed
+                            by the same "from" date as the strategy's daily returns
+                            (return over [t, t+1] labelled at t). When supplied,
+                            information_ratio is computed as excess-vs-benchmark;
+                            when omitted, IR degenerates to the Sharpe ratio.
             
         Returns:
             Dict with performance metrics
@@ -186,6 +192,7 @@ class BacktestEngine:
             portfolio_values_series,
             daily_returns_series,
             turnovers,
+            benchmark_returns=benchmark_returns,
         )
         
         # Store results
@@ -222,6 +229,7 @@ class BacktestEngine:
         portfolio_values: pd.Series,
         daily_returns: pd.Series,
         turnovers: List[float],
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> Dict:
         """
         Calculate performance metrics.
@@ -246,8 +254,8 @@ class BacktestEngine:
         calmar = metrics.calmar_ratio(annual_ret, max_dd)
         wr = metrics.win_rate(daily_returns)
         avg_turn = metrics.avg_turnover(turnovers)
-        # For simplicity, assume benchmark return = 0
-        ir = metrics.information_ratio(daily_returns)
+        # IR: excess vs benchmark when available, else degenerates to Sharpe (benchmark=0).
+        ir = metrics.information_ratio(daily_returns, benchmark_returns=benchmark_returns)
         
         return {
             'total_return': total_ret,

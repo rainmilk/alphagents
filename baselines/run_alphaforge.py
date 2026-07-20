@@ -1432,8 +1432,8 @@ def run_alphaforge_baseline(
     output_dir: str = "experiments/alphaforge",
     verbose: bool = False,
     use_gan: bool = True,
-    forward_period: int = 10,
-    holding_period: int = None,  # None -> use AlphaForgeConfig default (1)
+    forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
+    holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     context_days: int = 30,
 ) -> Dict:
     """
@@ -1577,6 +1577,15 @@ def run_alphaforge_baseline(
     print(f"  Train prices: {len(prices_train)} records, All prices: {len(prices)} records")
     
     # Create config
+    # ── Resolve forward_period / holding_period from config ──────────
+    # explicit arg > config.yaml > default, so standalone runs also honor config.
+    _ev_cfg = loader.config.get('evolution', {}) if loader is not None else {}
+    _bt_cfg = loader.config.get('backtest', {}).get('trading', {}) if loader is not None else {}
+    if not forward_period or forward_period <= 0:
+        forward_period = _ev_cfg.get('forward_period', 10)
+    if not holding_period or holding_period <= 0:
+        holding_period = _bt_cfg.get('holding_period', 1)
+
     config = AlphaForgeConfig(
         instruments=instruments,
         n_factors=n_factors,
@@ -1660,9 +1669,9 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--use-gan", action="store_true", default=True, help="Use GAN-based factor mining")
     parser.add_argument("--no-gan", action="store_false", dest="use_gan", help="Use template-based factor generation")
-    parser.add_argument("--forward-period", type=int, default=10,
+    parser.add_argument("--forward-period", type=int, default=None,
                         help="Forward return period in days for IC evaluation "
-                             "(default 10, matching other baselines)")
+                             "(default: config evolution.forward_period, 10)")
     parser.add_argument("--holding-period", type=int, default=None,
                         help="Portfolio holding period in days for backtest "
                              "(default: config value, 1 = daily rebalance)")
