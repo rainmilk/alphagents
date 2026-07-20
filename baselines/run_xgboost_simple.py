@@ -329,6 +329,10 @@ def run_xgboost_simple(
     # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
 
+    # -- Resolve forward_period: explicit arg > config.yaml > default 10 --
+    if not forward_period or forward_period <= 0:
+        forward_period = loader.config.get('evolution', {}).get('forward_period', 10)
+
     # -- Step 2: Determine train/test split (config-backed) --
     train_start = train_start_date or loader.data_config.get(
         'train_start_date', '2023-01-01')
@@ -415,7 +419,7 @@ def run_xgboost_simple(
     _u = universe or loader.data_config.get('universe', {}).get('index', 'hs300')
     _s = train_start_date or loader.data_config.get('train_start_date', 'na')
     _e = test_end_date or loader.data_config.get('test_end_date', 'na')
-    _fp = forward_period if forward_period is not None else 10
+    _fp = forward_period if forward_period is not None else loader.config.get('evolution', {}).get('forward_period', 10)
     _hp = holding_period if holding_period is not None else 1
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
     run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
@@ -509,6 +513,19 @@ def run_xgboost_simple(
 # ===========================================================================
 
 if __name__ == '__main__':
+    # Seed CLI defaults from config.yaml so --forward-period / --holding-period
+    # track evolution.forward_period / backtest.trading.holding_period unless
+    # explicitly overridden on the command line.
+    _cli_cfg = {}
+    try:
+        import yaml
+        with open('config/config.yaml', encoding='utf-8') as _f:
+            _cli_cfg = yaml.safe_load(_f) or {}
+    except Exception:
+        pass
+    _ev = _cli_cfg.get('evolution', {})
+    _bt = _cli_cfg.get('backtest', {}).get('trading', {})
+
     parser = argparse.ArgumentParser(
         description='Run simplified XGBoost baseline (close-price-only) with main DataLoader')
     parser.add_argument('--config', default='config/config.yaml',
@@ -531,10 +548,12 @@ if __name__ == '__main__':
                         help='Max tree depth')
     parser.add_argument('--learning-rate', type=float, default=0.05,
                         help='Learning rate')
-    parser.add_argument('--holding-period', type=int, default=1,
-                        help='Holding period (1=daily, 5=weekly)')
-    parser.add_argument('--forward-period', type=int, default=10,
-                        help='Forward return period in days (must align with other baselines)')
+    parser.add_argument('--holding-period', type=int,
+                        default=_bt.get('holding_period', 1),
+                        help='Holding period (config: backtest.trading.holding_period)')
+    parser.add_argument('--forward-period', type=int,
+                        default=_ev.get('forward_period', 10),
+                        help='Forward return period in days (config: evolution.forward_period)')
     parser.add_argument('--output-dir', default='experiments/xgboost_simple',
                         help='Output directory')
 

@@ -52,7 +52,10 @@ class BacktestEngine:
         self.slippage = slippage
         self.benchmark = benchmark
         self.risk_free_rate = risk_free_rate
-        self.holding_period = holding_period
+        # Coerce None -> 1 so a standalone baseline that never went through
+        # main.py (where global_config.holding_period gets populated) cannot
+        # later crash engine.run() with `max(1, None)`.
+        self.holding_period = holding_period if holding_period is not None else 1
         
         # Performance tracking
         self.portfolio_values = []
@@ -87,6 +90,8 @@ class BacktestEngine:
         """
         # Resolve holding_period
         hp = holding_period if holding_period is not None else self.holding_period
+        if hp is None:
+            hp = 1  # fallback: daily rebalance
         hp = max(1, hp)  # Minimum 1 day
         
         print(f"Running backtest (holding_period={hp}d)...")

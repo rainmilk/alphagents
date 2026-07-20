@@ -10,6 +10,12 @@ Date: 2026-06-07
 """
 
 import os
+# Workaround for "OMP: Error #15: ... libiomp5md.dll already initialized" on Windows.
+# torch / xgboost / scikit-learn each ship their own copy of the OpenMP runtime;
+# loading more than one in a single process triggers the conflict. Setting this
+# lets the duplicate runtime initialize harmlessly. setdefault keeps any explicit
+# user-supplied value intact.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
@@ -589,6 +595,9 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
+        # holding_period is config-driven (backtest.trading.holding_period),
+        # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagrail"
 
         results = run_alphagrail_baseline(
@@ -599,7 +608,7 @@ class ExperimentRunner:
             train_end_date=train_end,
             test_start_date=test_start,
             top_n_stocks=50,
-            holding_period=1,
+            holding_period=holding_period,
             use_llm_tournament=False,
             output_dir=output_dir,
         )
@@ -823,6 +832,12 @@ class ExperimentRunner:
         universe = self.config['data']['universe'].get('index', 'hs300')
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
+        # forward_period is config-driven (evolution.forward_period), NOT the
+        # baseline's hardcoded default of 10, so all baselines stay aligned.
+        forward_period = self.config['evolution'].get('forward_period', 10)
+        # holding_period is config-driven (backtest.trading.holding_period), NOT the
+        # baseline's hardcoded default of 1, so all baselines stay aligned.
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
 
         output_dir = f"{self.output_dir}/xgboost"
 
@@ -839,7 +854,8 @@ class ExperimentRunner:
             n_estimators=200,
             max_depth=5,
             learning_rate=0.05,
-            holding_period=1,
+            holding_period=holding_period,
+            forward_period=forward_period,
             output_dir=output_dir,
         )
 
@@ -872,6 +888,9 @@ class ExperimentRunner:
         train_end = self.config['data'].get('train_end_date', '2023-12-31')
         test_start = self.config['data'].get('test_start_date', '2024-01-01')
 
+        # holding_period is config-driven (backtest.trading.holding_period),
+        # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
+        holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagen"
 
         results = run_alphagen_baseline(
@@ -884,7 +903,7 @@ class ExperimentRunner:
             n_generate=300,
             pool_capacity=20,
             top_n_stocks=50,
-            holding_period=1,
+            holding_period=holding_period,
             seed=42,
             output_dir=output_dir,
         )
