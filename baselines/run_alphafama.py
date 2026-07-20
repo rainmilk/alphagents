@@ -193,23 +193,34 @@ def _llm_generate_factor(
         )
         raw = resp.choices[0].message.content.strip()
 
-        # Strip Markdown code fences if present
-        fence_match = re.match(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+        # Strip Markdown code fences if present (case-insensitive, any language tag)
+        fence_match = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
         if fence_match:
             raw = fence_match.group(1).strip()
 
-        # Parse JSON array
-        gen = json.loads(raw)
+        # Parse JSON array (with fallback for prose-wrapped output)
+        gen = None
+        try:
+            gen = json.loads(raw)
+        except json.JSONDecodeError:
+            # Fallback: extract the first JSON-ish array/object substring.
+            # Handles cases where the model returns explanatory text around the JSON
+            # (e.g. "Here is your factor: [...]") or uses an unhandled fence variant.
+            m = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", raw, re.DOTALL)
+            if m:
+                try:
+                    gen = json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    gen = None
+
         if isinstance(gen, list) and len(gen) > 0:
             return gen[0]
         elif isinstance(gen, str):
             return gen
         else:
+            if gen is None:
+                logger.warning("LLM returned non-JSON output, skipping. raw=%r", raw)
             return None
-
-    except json.JSONDecodeError:
-        logger.warning("LLM returned non-JSON output, skipping")
-        return None
     except Exception as e:
         logger.warning(f"LLM API call failed: {e}")
         return None

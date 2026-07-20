@@ -28,6 +28,7 @@ Usage:
 import sys
 import os
 import json
+import re
 import argparse
 import logging
 import importlib.util
@@ -824,8 +825,29 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
         )
         raw = response.choices[0].message.content.strip()
 
-        # Parse JSON response
-        result = json.loads(raw)
+        # Parse JSON response — robustly strip code fences and extract the object
+        result = None
+        fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+        if fence:
+            raw = fence.group(1).strip()
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            # Fallback: extract the first JSON object substring and retry
+            m = re.search(r"\{[\s\S]*\}", raw, re.DOTALL)
+            if m:
+                try:
+                    result = json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    result = None
+
+        if not isinstance(result, dict):
+            logger.warning(
+                "  LLM factor generation returned non-JSON output; skipping. raw=%r",
+                response.choices[0].message.content,
+            )
+            return []
+
         factors = []
         for name, info in result.items():
             expr = info.get('expression', '').strip()

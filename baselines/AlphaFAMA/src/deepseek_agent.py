@@ -83,18 +83,31 @@ def one_iteration(
             HumanMessage(content=prompt)
         ])
 
-        raw = resp.content
-        # ── strip Markdown code fences (```json … ```) if present ──
-        fence = re.match(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+        raw_content = resp.content
+        print(f"[Cluster {cid}] LLM output (raw):\n{raw_content}")
+
+        raw = raw_content if isinstance(raw_content, str) else ""
+        # ── robustly strip Markdown code fences (```json / ```JSON / ```python / ``` …) ──
+        fence = re.match(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
         if fence:
             raw = fence.group(1).strip()
-        print(f"[Cluster {cid}] LLM output:\n{raw}")
 
         try:
             gen = json.loads(raw)
-            factor = gen[0] if isinstance(gen, list) else gen
         except json.JSONDecodeError:
-            print(f"[Cluster {cid}] ❌ JSON parse error, skipping.")
+            # Fallback: extract the first JSON array/object substring and retry
+            gen = None
+            m = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", raw, re.DOTALL)
+            if m:
+                try:
+                    gen = json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    gen = None
+
+        if isinstance(gen, (list, dict)):
+            factor = gen[0] if isinstance(gen, list) else gen
+        else:
+            print(f"[Cluster {cid}] ❌ JSON parse error, skipping. raw={raw_content!r}")
             new_chains[cid] = chain
             continue
 
