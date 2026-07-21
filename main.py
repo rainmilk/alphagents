@@ -730,6 +730,10 @@ class AAAI2027Pipeline:
             chair_api_key=chair_api_key,
             chair_base_url=chair_cfg.get('base_url', ''),
             chair_temperature=chair_cfg.get('temperature', 0.2),
+            # Chair synthesis prompt bounding / timeout (fixes [Step 5b] APITimeoutError)
+            request_timeout=chair_cfg.get('request_timeout', 120.0),
+            synthesis_top_n=chair_cfg.get('synthesis_top_n', 50),
+            chair_max_tokens=chair_cfg.get('max_tokens', 4096),
             # Parallel: 5 agents evaluate the same factor concurrently (I/O-bound API calls)
             parallel_eval=eval_cfg.get('parallel_eval', True),
         )

@@ -175,6 +175,9 @@ class DebateEvaluator:
         parallel_eval: bool = True,
         request_timeout: float = 120.0,
         max_retries: int = 3,
+        # --- Chair synthesis prompt bounding (prevents 120s timeouts on huge pools) ---
+        synthesis_top_n: int = 50,
+        chair_max_tokens: int = 4096,
     ):
         """
         Initialize debate evaluator.
@@ -208,6 +211,8 @@ class DebateEvaluator:
         self.parallel_eval = parallel_eval
         self.request_timeout = request_timeout
         self.max_retries = max(1, int(max_retries))
+        self.synthesis_top_n = max(1, int(synthesis_top_n))
+        self.chair_max_tokens = max(1, int(chair_max_tokens))
 
         # Initialize OpenAI client for EXPERT agents
         self.client = None
@@ -403,10 +408,12 @@ class DebateEvaluator:
         )
 
     def _call_chair_llm(self, system_prompt: str, user_prompt: str,
-                         temperature: float = None, expect_json: bool = True) -> str:
+                         temperature: float = None, expect_json: bool = True,
+                         max_tokens: int = None) -> str:
         """Call CHAIR LLM (separate model, typically stronger) and return response content.
 
         Falls back to expert client if chair client is unavailable.
+        max_tokens defaults to self.chair_max_tokens when not explicitly given.
         """
         client = self.chair_client or self.client
         model = self.chair_model if self.chair_client else self.llm_model
@@ -416,11 +423,12 @@ class DebateEvaluator:
         return self._call_llm_inner(
             client, model, system_prompt, user_prompt,
             temperature=temp, expect_json=expect_json,
+            max_tokens=max_tokens if max_tokens is not None else self.chair_max_tokens,
         )
 
     def _call_llm_inner(self, client, model: str, system_prompt: str,
                          user_prompt: str, temperature: float = 0.3,
-                         expect_json: bool = True) -> str:
+                         expect_json: bool = True, max_tokens: int = None) -> str:
         """Internal LLM call helper — shared by expert and chair clients."""
         kwargs = dict(
             model=model,
@@ -430,6 +438,10 @@ class DebateEvaluator:
             ],
             temperature=temperature,
         )
+        # Cap generation length — without this, the Chair's huge cross-factor
+        # JSON can balloon and push the call past request_timeout.
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if expect_json:
             kwargs["response_format"] = {"type": "json_object"}
 
@@ -988,7 +1000,11 @@ class DebateEvaluator:
                         "5. Give an overall confidence assessment\n\n"
                         "CRITICAL: Be specific. Vague answers like 'performs well' are insufficient. "
                         "Reference specific agent arguments, backtest metrics, and financial logic.\n\n"
-                        "Respond in JSON with keys exactly as specified."
+                        "Respond in JSON with keys exactly as specified.\n\n"
+                        "NOTE: Only the top factors are given in full detail — produce detailed "
+                        "selection/rejection entries for THOSE. The compact lower-ranked list is "
+                        "provided for context only; do not emit a separate entry per compact line, "
+                        "but factor their themes into 'key_themes'."
                     ),
                     user_prompt=prompt,
                     temperature=0.2,
@@ -1122,19 +1138,31 @@ class DebateEvaluator:
 
         print(f"  [debate] Chair synthesis appended to {debate_path}")
 
+    @staticmethod
+    def _truncate(text, limit: int) -> str:
+        """Truncate a string to `limit` chars, appending '...' if cut."""
+        if text is None:
+            return ""
+        text = str(text)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
+
     def _build_synthesis_prompt(
         self,
         debate_results: List[Tuple[FactorProposal, "DebateResult"]],
     ) -> str:
-        """Build the comprehensive synthesis prompt for the Chair Agent."""
-        lines = [
-            "=== CROSS-FACTOR SYNTHESIS ===",
-            f"Total factors evaluated: {len(debate_results)}",
-            "",
-            "Below are the complete debate results for each factor:",
-            "",
-        ]
+        """Build the comprehensive synthesis prompt for the Chair Agent.
 
+        Bounded two ways to stay within the Chair request's latency/timeout budget
+        (a single unbounded prompt over 100+ factors on the proxy endpoint routinely
+        exceeds request_timeout and silently falls back to rule-based synthesis):
+
+        1. Per-factor verbose fields (consensus summary, key insights) are truncated.
+        2. Only the top-`synthesis_top_n` factors (by final_score) get the full
+           detail block; the remaining lower-ranked factors are listed compactly so
+           the Chair is still aware of them without a full per-factor entry.
+        """
         # Sort by debate score descending for clarity
         sorted_results = sorted(
             debate_results,
@@ -1142,7 +1170,20 @@ class DebateEvaluator:
             reverse=True,
         )
 
-        for i, (proposal, result) in enumerate(sorted_results):
+        top = sorted_results[: self.synthesis_top_n]
+        rest = sorted_results[self.synthesis_top_n :]
+
+        lines = [
+            "=== CROSS-FACTOR SYNTHESIS ===",
+            f"Total factors evaluated: {len(debate_results)}",
+            f"Detailed review below for the top {len(top)} factors by debate score; "
+            f"{len(rest)} lower-ranked factors are summarized compactly at the end.",
+            "",
+            "Below are the complete debate results for each factor:",
+            "",
+        ]
+
+        for i, (proposal, result) in enumerate(top):
             lines.append(f"--- Factor #{i + 1} ---")
             lines.append(f"Expression: {proposal.expression}")
             lines.append(f"Description: {proposal.description}")
@@ -1153,8 +1194,8 @@ class DebateEvaluator:
             lines.append(f"Debate Final Score: {result.final_score:.2f}")
             lines.append(f"Recommendation: {result.recommendation}")
             lines.append(f"Agent Scores: {json.dumps(result.agent_scores)}")
-            lines.append(f"Consensus Summary: {result.consensus_summary}")
-            lines.append(f"Key Insights: {json.dumps(result.key_insights)}")
+            lines.append(f"Consensus Summary: {self._truncate(result.consensus_summary, 240)}")
+            lines.append(f"Key Insights: {self._truncate(json.dumps(result.key_insights), 480)}")
             if result.all_rounds:
                 # Show score evolution across rounds
                 round_scores = []
@@ -1162,6 +1203,15 @@ class DebateEvaluator:
                     avg = float(np.mean([op.score for op in rnd.opinions]))
                     round_scores.append(f"R{rnd.round_id + 1}={avg:.2f}")
                 lines.append(f"Score Evolution: {' → '.join(round_scores)}")
+            lines.append("")
+
+        if rest:
+            lines.append("--- Lower-ranked candidates (compact) ---")
+            for (proposal, result) in rest:
+                lines.append(
+                    f"- {proposal.expression} | score={result.final_score:.2f} | "
+                    f"{result.recommendation}"
+                )
             lines.append("")
 
         lines.append("---")
