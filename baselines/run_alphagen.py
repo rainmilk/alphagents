@@ -25,7 +25,7 @@ Core methodology:
      maximize-IC-minimize-correlation objective)
   6. Portfolio Construction — Top-N stocks by ensemble factor value,
      equal-weight long-only
-  7. Backtest — Unified BacktestEngine (commission=0.0003, slippage=0.001)
+  7. Backtest — Unified BacktestEngine (commission=0.001, slippage=0.0)
 
 For RL methods, the AlphaPool is populated during training: the RL agent
 generates expressions, each is evaluated and potentially added to the pool,
@@ -1620,7 +1620,7 @@ def run_alphagen_baseline(
     print(f"\n[Step 8] Running backtest...")
     prices_aligned = close.loc[portfolios.index].reindex(columns=portfolios.columns)
     engine = BacktestEngine(
-        commission=0.0003, slippage=0.001, risk_free_rate=0.0,
+        commission=0.001, slippage=0.0, risk_free_rate=0.0,
         holding_period=holding_period if holding_period is not None else 1,
     )
     run_dir = None

@@ -63,9 +63,95 @@ class CandidateFactor:
     is_valid: bool = True          # False when evaluation raises ValueError (parse error)
     parse_error: str = ""          # stores error message for debugging / reflection
     originality_ok: bool = True    # False when the AST originality gate rejects the factor
-    gate_reason: str = ""          # reason recorded by the originality gate
+    gate_reason: str = ""
+    family: str = ""           # inferred PRIMARY factor family (e.g. 'Momentum',
+                               # 'Value/Quality', 'Liquidity', 'Volatility',
+                               # 'Mean-reversion', 'Growth', 'Other'). Used by
+                               # diversity-aware selection (family-balanced elitism
+                               # + improve input) to combat niche mode-collapse.          # reason recorded by the originality gate
     
     
+def _infer_family(expr: str) -> str:
+    """Infer a factor's PRIMARY family from its expression, for diversity bucketing.
+
+    Priority order deliberately pulls price/volume OPERATORS out of the
+    Value/Quality bucket, so a combined factor like `ts_cov(roe, returns, 20) *
+    -rank(pb)` is bucketed as Momentum, not Value. This is what lets
+    diversity-aware selection rescue non-value niches from collapse.
+    """
+    e = (expr or "").lower()
+    if any(k in e for k in ("volume", "amt", "turnover", "illiquid")):
+        return "Liquidity"
+    if any(k in e for k in ("ts_std", "ts_max", "ts_min", "ts_skew", "ts_kurt")):
+        return "Volatility"
+    if any(k in e for k in ("ts_corr", "ts_cov", "ts_pct_change",
+                            "ts_delta", "ts_rank", "returns", "momentum")):
+        return "Momentum"
+    if any(k in e for k in ("ts_zscore", "reversal", "mean_reversion")):
+        return "Mean-reversion"
+    if any(k in e for k in ("growth", "eps")):
+        return "Growth"
+    if any(k in e for k in ("pe", "pb", "ps", "roe", "roa",
+                            "market_cap", "value", "margin", "debt", "quality")):
+        return "Value/Quality"
+    return "Other"
+
+
+# Canonical factor families — shared by reflection + improve so the two stay in
+# lock-step (reflection NAMES the gap; improve is steered toward it).
+_ALL_FAMILIES = ["Momentum", "Mean-reversion", "Value/Quality",
+                "Volatility", "Liquidity", "Growth"]
+
+# Representative operator/field token per family, used by the rule-based improve
+# fallback to SEED a missing family when no LLM is available. Each token is
+# chosen so _infer_family() would classify it into the intended family (no
+# higher-priority keyword leaks in), but the bridge factors set family EXPLICITLY
+# anyway — the composite may contain the parent's keywords that would otherwise
+# mis-classify it.
+_FAMILY_BRIDGE_TOKEN = {
+    "Momentum": "ts_pct_change(close, 20)",
+    "Mean-reversion": "ts_zscore(close, 20)",
+    "Value/Quality": "rank(-pb)",
+    "Volatility": "ts_std(returns, 20)",
+    "Liquidity": "ts_mean(volume, 20)",
+    "Growth": "ts_pct_change(eps, 60)",
+}
+
+
+def _family_balanced_top(factors, n, key):
+    """Select the top-`n` factors by `key` while guaranteeing family diversity.
+
+    Round 1 takes the best factor of each distinct family (so a minority niche
+    like Liquidity survives even if its IC is lower). Round 2 fills the
+    remaining slots purely by `key`. `key` must return a sortable metric
+    (lower = worse); NaN should map to -inf by the caller (e.g. `_ic_key`).
+    """
+    if not factors or n <= 0:
+        return []
+    ordered = sorted(factors, key=key, reverse=True)
+    seen = set()
+    selected = []
+    selected_ids = set()
+    # Round 1: one representative per family (highest key within that family).
+    for f in ordered:
+        fam = getattr(f, "family", "") or "Other"
+        if fam not in seen:
+            selected.append(f)
+            selected_ids.add(id(f))
+            seen.add(fam)
+        if len(selected) >= n:
+            break
+    # Round 2: fill remaining slots by raw key.
+    if len(selected) < n:
+        for f in ordered:
+            if id(f) not in selected_ids:
+                selected.append(f)
+                selected_ids.add(id(f))
+            if len(selected) >= n:
+                break
+    return selected[:n]
+
+
 @dataclass
 class EvolutionRound:
     """Record of an evolution round — stores evaluated factors for this round."""
@@ -93,6 +179,7 @@ _GATE_ALLOWED_FUNCS = {
     'ts_skew', 'ts_kurt', 'ts_min', 'ts_max', 'ts_sum', 'ts_delta',
     'ts_zscore', 'ts_decay', 'delay', 'sign', 'abs', 'log', 'sqrt', 'if',
     'ts_pct_change',
+    'ts_slope',
 }
 # LLM-frequent aliases → canonical (mirrors _FactorExprEvaluator._FUNC_ALIASES)
 _GATE_FUNC_ALIASES = {
@@ -104,8 +191,50 @@ _GATE_FUNC_ALIASES = {
     'ts_pctchange': 'ts_pct_change', 'pct_change': 'ts_pct_change',
     'ts_pctchg': 'ts_pct_change',
     'ts_roc':       'ts_pct_change',   # rate of change = pct change
+    'ts_trend':     'ts_slope',        # alias for rolling linear-regression slope
     'ts_skewness': 'ts_skew', 'ts_kurtosis': 'ts_kurt',
 }
+
+# --- Allowed DATA FIELDS (the ONLY identifiers the evaluator accepts) ---
+# Anything else (revenue, assets, sales, roa, book, debt, cash, equity, ...)
+# raises "Unknown identifier" at backtest. The LLM repeatedly HALLUCINATES these
+# fundamentals, so we (a) inject this allowlist into every generation prompt and
+# (b) pre-validate generated expressions to DROP bad ones instead of letting them
+# waste a backtest slot or spam the logs. This is the single source of truth for
+# valid field names — keep it in sync with the evaluator's `self._data` keys.
+_ALLOWED_FIELDS = {
+    "open", "high", "low", "close", "volume", "amount",
+    "pe", "pb", "ps", "roe", "market_cap", "eps",
+    "return", "returns", "vwap",
+}
+_ALLOWED_FIELDS_STR = (
+    "ALLOWED DATA FIELDS (use ONLY these exact identifiers; any other field name "
+    "— e.g. revenue, assets, sales, roa, book, debt, cash, equity, liability, "
+    "margin — does NOT exist in the dataset and will be rejected): "
+    + ", ".join(sorted(_ALLOWED_FIELDS)) + "."
+)
+_KNOWN_FUNCS = _GATE_ALLOWED_FUNCS | set(_GATE_FUNC_ALIASES.keys())
+
+
+def _validate_factor_expr(expr: str):
+    """Return (is_valid, bad_fields).
+
+    Cheap, data-independent pre-filter: every bare identifier in the expression
+    must be either a known DSL function or an allowed data field. Catches
+    LLM-hallucinated fundamentals (revenue, assets, ...) BEFORE they reach the
+    backtester. A syntax error (or a `return` keyword the custom parser tolerates)
+    is NOT flagged here — we only ever DROP expressions we are sure are invalid.
+    """
+    pre = FactorOriginalityGate._preprocess(expr)
+    ids = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", pre))
+    bad = []
+    for i in ids:
+        name = "if" if i == "_if" else i
+        if name in _KNOWN_FUNCS or name in _ALLOWED_FIELDS:
+            continue
+        bad.append(i)
+    return (len(bad) == 0), sorted(set(bad))
+
 
 # Canonical factor-DSL function whitelist injected into every LLM factor-generation
 # prompt (seed / memory-augmented / improve). This is the SINGLE SOURCE OF TRUTH:
@@ -610,6 +739,7 @@ class _FactorExprEvaluator:
         'ts_skewness':  'ts_skew',
         'ts_kurtosis':  'ts_kurt',
         'ts_roc':       'ts_pct_change',   # rate of change = pct change
+        'ts_trend':     'ts_slope',        # common alias for rolling slope
     }
 
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
@@ -636,6 +766,7 @@ class _FactorExprEvaluator:
             'ts_pct_change': (2, 2),
             'ts_zscore':  (2, 2),
             'ts_decay':   (2, 2),
+            'ts_slope':   (2, 2),
             'delay':      (2, 2),
             'sign':       (1, 1),
             'abs':        (1, 1),
@@ -810,6 +941,35 @@ class _FactorExprEvaluator:
         """Exponential weighted moving average (EWMA / decay)."""
         w = _FactorExprEvaluator._safe_int(window)
         return x.ewm(span=w, adjust=False, min_periods=max(3, w // 2)).mean()
+
+    @staticmethod
+    def _fn_ts_slope(x: pd.DataFrame, window) -> pd.DataFrame:
+        """Rolling linear-regression slope (trend strength) of x over window w,
+        computed per stock. Equals the OLS slope of x on a local time index —
+        the signed trend magnitude per period. A genuinely 'advanced' primitive:
+        captures trend *direction & strength* (a flat series → 0, a steep uptrend
+        → large positive), unlike a single delta which is scale-blind.
+
+        Closed-form OLS slope with the shift-invariant absolute-time trick:
+        slope = (Σ(t·x) − t̄·Σx) / C, where t = absolute row position and
+        C = Σ(t−t̄)² is constant over any fixed window. The row-scaling
+        arithmetic is done in numpy (not Series×DataFrame) to avoid a pandas
+        DatetimeIndex-alignment quirk that would explode the column count."""
+        w = _FactorExprEvaluator._safe_int(window)
+        if w < 2:
+            return pd.DataFrame(np.nan, index=x.index, columns=x.columns)
+        min_p = min(max(3, w * 2 // 3), w)
+        xv = x.values
+        n = xv.shape[0]
+        P = np.arange(n, dtype=float)          # absolute row positions (shift-invariant)
+        t_mean = P - (w - 1) / 2.0             # mean time within the trailing window
+        C = w * (w * w - 1) / 12.0             # Σ(t−t̄)² for t=0..w-1 (constant)
+        tx = xv * P[:, None]                   # t·x, row-wise numpy broadcast
+        tx_df = pd.DataFrame(tx, index=x.index, columns=x.columns)
+        sum_tx = tx_df.rolling(window=w, min_periods=min_p).sum().values
+        sum_x = x.rolling(window=w, min_periods=min_p).sum().values
+        slope = (sum_tx - t_mean[:, None] * sum_x) / C
+        return pd.DataFrame(slope, index=x.index, columns=x.columns)
 
 
 
@@ -1248,7 +1408,7 @@ class SelfEvolvingGenerator:
         min_val_ic: float = 0.01,
         originality_gate: bool = True,
         dedup_similarity: float = 0.90,
-        improve_temperature: float = 0.3,
+        improve_temperature: float = 0.7,
         elitism_carry: int = 2,
         parallel: bool = True,
         api_key: str = "",
@@ -1288,8 +1448,11 @@ class SelfEvolvingGenerator:
             dedup_similarity: Canonical-signature similarity threshold for
                 near-duplicate rejection (0.0 = off, 1.0 = only exact).
             improve_temperature: LLM sampling temperature during factor IMPROVEMENT
-                (NOT seed generation). Low (0.3) = focused refinement of input;
-                high (>0.7) = near-random re-sampling that collapses diversity.
+                (NOT seed generation). Low (~0.3) = focused refinement; higher
+                (~0.7) = more exploration. Diversity is now primarily enforced by
+                the improve-prompt's family-rotation + operator-diversity rules
+                (not by temperature alone), so 0.7 is safe here; the old 0.8 with
+                NO such constraints caused "fresh-lottery" collapse.
             elitism_carry: Number of top factors carried forward unmutated from the
                 previous round. Prevents full-replacement collapse where the
                 entire pool re-converges to a single direction each round.
@@ -1600,6 +1763,7 @@ class SelfEvolvingGenerator:
         successful = [f for f in evaluated_factors if f.ic is not None and f.ic > 0.02]
         moderate = [f for f in evaluated_factors if f.ic is not None and 0 <= f.ic <= 0.02]
         failed = [f for f in evaluated_factors if f.ic is not None and f.ic < 0]
+        combo_count = 0  # populated in section 2; referenced by Suggestions (section 4)
         
         lines = []
         lines.append(f"=== Reflection for Round {round_id + 1} ===")
@@ -1609,108 +1773,134 @@ class SelfEvolvingGenerator:
         lines.append(f"Failed (IC < 0): {len(failed)}")
         lines.append("")
         
-        # --- 2. Analyze successful factors: common patterns ---
+        # --- 2. Analyze successful factors: family & pattern distribution ---
+        # Reuse the persisted `family` field (falling back to _infer_family for
+        # any factor lacking it, e.g. loaded from an old run) so the reported
+        # taxonomy stays consistent with the family-balanced SELECTION in evolve().
+        def _fam(f):
+            return getattr(f, "family", "") or _infer_family(f.expression)
+
         if successful:
             lines.append("--- Successful Factor Patterns ---")
-            
-            # Extract expression features
-            momentum_count = 0
-            value_count = 0
-            quality_count = 0
-            volatility_count = 0
-            growth_count = 0
-            liquidity_count = 0
-            combo_count = 0  # Factors with 2+ operator types
-            
+
+            fam_counts = {}
             for f in successful:
-                expr = f.expression.lower()
-                features = []
-                if any(k in expr for k in ['ts_delta', 'ts_rank', 'momentum', 'return_']):
-                    momentum_count += 1
-                    features.append('momentum')
-                if any(k in expr for k in ['pe', 'pb', 'ps', 'value', 'roe', 'roa']):
-                    value_count += 1
-                    features.append('value')
-                if any(k in expr for k in ['roe', 'roa', 'margin', 'quality', 'debt']):
-                    quality_count += 1
-                    features.append('quality')
-                if any(k in expr for k in ['std', 'vol', 'var', 'risk']):
-                    volatility_count += 1
-                    features.append('volatility')
-                if any(k in expr for k in ['growth', 'revenue', 'eps']):
-                    growth_count += 1
-                    features.append('growth')
-                if any(k in expr for k in ['turnover', 'volume', 'liq']):
-                    liquidity_count += 1
-                    features.append('liquidity')
-                if len(features) >= 2:
-                    combo_count += 1
-            
-            lines.append(f"Feature distribution in successful factors:")
-            if momentum_count > 0:
-                lines.append(f"  - Momentum-related: {momentum_count}")
-            if value_count > 0:
-                lines.append(f"  - Value-related: {value_count}")
-            if quality_count > 0:
-                lines.append(f"  - Quality-related: {quality_count}")
-            if volatility_count > 0:
-                lines.append(f"  - Volatility-related: {volatility_count}")
-            if growth_count > 0:
-                lines.append(f"  - Growth-related: {growth_count}")
-            if liquidity_count > 0:
-                lines.append(f"  - Liquidity-related: {liquidity_count}")
+                fam = _fam(f)
+                fam_counts[fam] = fam_counts.get(fam, 0) + 1
+
+            lines.append("Family distribution in successful factors:")
+            for fam, cnt in sorted(fam_counts.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  - {fam}: {cnt}")
+
+            # Combo = expression uses 2+ distinct FUNCTIONS (mixes factor types)
+            combo_count = sum(
+                1 for f in successful
+                if len(set(re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', f.expression))) >= 2
+            )
             if combo_count > 0:
-                lines.append(f"  - Combined (2+ features): {combo_count} → Suggest mixing factor types in next generation")
-            
-            # Top 3 successful factor expressions
-            top3 = sorted(successful, key=lambda x: x.ic, reverse=True)[:3]
+                lines.append(f"  - Combined (2+ distinct functions): {combo_count} → mixing factor types is working")
+
+            # Top 3 successful factor expressions (rank by val_IC when available)
+            def _rank_key(x):
+                vic = x.val_ic
+                return vic if (vic is not None and not np.isnan(vic)) else (x.ic or 0.0)
+
+            top3 = sorted(successful, key=_rank_key, reverse=True)[:3]
             lines.append("")
             lines.append("Top successful factor expressions:")
             for f in top3:
                 sharpe_str = f"{f.sharpe:.2f}" if f.sharpe else "N/A"
-                lines.append(f"  - IC={f.ic:.4f}, Sharpe={sharpe_str}: {f.expression}")
-            
+                vic = f.val_ic
+                vic_str = f"{vic:.4f}" if (vic is not None and not np.isnan(vic)) else "N/A"
+                lines.append(f"  - IC={f.ic:.4f}, val_IC={vic_str}, Sharpe={sharpe_str}: {f.expression}")
+
             lines.append("")
         
-        # --- 3. Analyze failed factors: root causes ---
+        # --- 3. Analyze failed factors: root causes (family-aware) ---
         if failed:
             lines.append("--- Failed Factor Analysis ---")
-            
-            # Check common issues
-            neg_momentum = [f for f in failed if any(k in f.expression.lower() for k in ['ts_delta', 'momentum'])]
-            neg_value = [f for f in failed if any(k in f.expression.lower() for k in ['pe', 'pb', 'value'])]
-            neg_volatile = [f for f in failed if 'std' in f.expression.lower() or 'vol' in f.expression.lower()]
+
+            fail_counts = {}
+            for f in failed:
+                fam = _fam(f)
+                fail_counts[fam] = fail_counts.get(fam, 0) + 1
+            for fam, cnt in sorted(fail_counts.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  - {cnt} {fam} factor(s) had NEGATIVE IC → consider reversing sign or dropping this style")
+
             too_complex = [f for f in failed if len(re.findall(r'[+\-*/()]', f.expression)) > 10]
-            
-            if neg_momentum:
-                lines.append(f"  - {len(neg_momentum)} momentum factors have negative IC → Consider reversing sign or adjusting window")
-            if neg_value:
-                lines.append(f"  - {len(neg_value)} value factors have negative IC → Current market may not favor value style")
-            if neg_volatile:
-                lines.append(f"  - {len(neg_volatile)} volatility factors have negative IC → Volatility may be mis-priced")
             if too_complex:
                 lines.append(f"  - {len(too_complex)} factors are overly complex (too many operators) → Simplify expressions")
-            
+
             lines.append("")
         
-        # --- 4. Strategic suggestions for next round ---
+        # --- 4. Strategic suggestions for next round (data-driven, family-aware) ---
+        # Bridge from MEASUREMENT -> next round's LLM improve prompt. Name the
+        # concrete family GAP so the prompt's "spread across families" constraint
+        # has something specific to target (otherwise it stays a generic nudge).
         lines.append("--- Suggestions for Next Generation ---")
-        if successful:
-            best = max(successful, key=lambda x: x.ic or 0)
-            lines.append(f"  1. Try extending the successful pattern: {best.expression[:50]}...")
+
+        ALL_FAMS = _ALL_FAMILIES
+        strong = top_factors if top_factors else successful
+        strong_fam = {}
+        for f in strong:
+            fam = _fam(f)
+            strong_fam[fam] = strong_fam.get(fam, 0) + 1
+
+        lines.append("Family coverage of the STRONGEST factors (these feed next round):")
+        for fam in ALL_FAMS:
+            n = strong_fam.get(fam, 0)
+            tag = "   <- MISSING: prioritize next round" if n == 0 else ""
+            lines.append(f"  - {fam}: {n}{tag}")
+
+        present = {fam: strong_fam[fam] for fam in ALL_FAMS if strong_fam.get(fam, 0) > 0}
+        missing = [fam for fam in ALL_FAMS if strong_fam.get(fam, 0) == 0]
+        if present:
+            dom_fam = max(present, key=lambda k: present[k])
+            lines.append(
+                f"  Dominant family: {dom_fam} ({present[dom_fam]}/{len(strong)}). "
+                f"Do NOT generate more {dom_fam}-only variants."
+            )
+
+        if strong:
+            def _rank_key2(x):
+                vic = x.val_ic
+                return vic if (vic is not None and not np.isnan(vic)) else (x.ic or 0.0)
+            best = max(strong, key=_rank_key2)
+            lines.append(
+                f"  1. ANCHOR: keep the best factor (IC={best.ic:.4f}) as-is; "
+                f"do not mutate it into a different style."
+            )
+            if missing:
+                lines.append(
+                    f"  2. PRIORITY: generate 2+ NEW factors from each MISSING family "
+                    f"-> {', '.join(missing)}."
+                )
+                lines.append(
+                    "     The pipeline now carries one representative per family into the"
+                )
+                lines.append(
+                    "     next round, so target these GAPS rather than re-deriving the dominant style."
+                )
+            elif len(present) > 1:
+                minority = [k for k in present if k != dom_fam]
+                lines.append(
+                    f"  2. All families present but {dom_fam} dominates -> generate 2+ more from"
+                )
+                lines.append(f"     the minority families: {', '.join(minority)}.")
             if combo_count > 0:
-                lines.append("  2. Increase factor combinations (momentum + value, quality + reversal)")
-            if len(successful) < 5:
-                lines.append("  3. Current successful factors are few → Increase generation diversity (higher temperature)")
-            else:
-                lines.append("  3. Sufficient successful factors → Try fine-tuning window sizes")
+                lines.append(
+                    "  3. Keep mixing factor types (e.g. value+quality, momentum+liquidity)."
+                )
         else:
-            lines.append("  1. No successful factors this round → Try completely different factor templates")
-            lines.append("  2. Consider lowering LLM temperature to get more conservative factors")
-        
+            lines.append("  1. No successful factors this round -> try completely different templates")
+            lines.append("     (e.g. switch from value to momentum/liquidity).")
+
         if failed and len(failed) > len(successful):
-            lines.append("  4. High failure rate → Add more fundamental filters (pe > 0, roe > 0)")
-        
+            lines.append(
+                "  4. High failure rate -> favor robust, well-understood operators and"
+            )
+            lines.append("     reduce expression complexity; double-check sign direction.")
+
         lines.append("")
         lines.append("=== End of Reflection ===")
         
@@ -1902,18 +2092,59 @@ Supported data sources:
 - return / returns (1-day daily return; alias: close.pct_change(1))
 - vwap (volume-weighted average price = amount / volume)
 
-""" + _FUNCTION_WHITELIST_STR + """
+""" + _FUNCTION_WHITELIST_STR + "\n\n" + _ALLOWED_FIELDS_STR + """
 
-Supported operators: +, -, *, /, ^"""
+Supported operators: +, -, *, /, ^
 
-        # Build JSON example once (shared by both branches)
+PRIMARY OPERATOR MENU (pick a DIFFERENT one for each factor you emit):
+  - ts_corr(x, y, w)        cross-sectional/time-series correlation
+  - ts_cov(x, y, w)         covariance
+  - ts_pct_change(x, w)     period-over-period change
+  - ts_rank(x, w)           cross-sectional rank over a window
+  - ts_zscore(x, w)         z-score over a window
+  - ts_std(x, w)            rolling volatility
+  - ts_delay(x, w)          lagged value
+  - ts_min(x, w) / ts_max(x, w)
+  - ts_slope(x, w)          rolling linear-regression slope (trend strength)
+  - ts_decay(x, w)          linearly-decaying weighted average
+  - ts_mean(x, w) / ts_sum(x, w)
+  - rank(x) / -rank(x)      cross-sectional rank
+
+DIVERSITY MANDATE (critical — factors that violate this are低 quality):
+  1. SPREAD across families: Momentum, Mean-reversion, Value/Quality, Volatility, Liquidity, Growth.
+  2. Each factor MUST use a DIFFERENT primary operator from the menu above.
+  3. NO near-duplicates: two factors must not be algebraically equivalent or differ only by a
+     constant multiplier, a sign flip, or swapping pe<->pb<->ps<->roe within the same family.
+  4. Every factor needs a clear one-line economic intuition."""
+
+        # Build JSON example once (shared by both branches) — showcases a
+        # DIFFERENT family AND a DIFFERENT primary operator per factor so the
+        # few-shot demonstration practises what the prompt preaches.
         json_example = json.dumps({
             "factors": [
-                {"expression": "rank(ts_corr(close, volume, 20))", "description": "Price-volume correlation momentum"},
-                {"expression": "-rank(pe)", "description": "Value factor based on P/E ratio"},
-                {"expression": "rank(ts_zscore(roe, 60))", "description": "Quality factor based on ROE z-score"}
+                {"expression": "rank(ts_corr(close, volume, 20))",
+                 "description": "Price-volume correlation momentum", "family": "Momentum"},
+                {"expression": "-rank(ts_zscore(close, 20))",
+                 "description": "Short-term mean-reversion", "family": "Mean-reversion"},
+                {"expression": "-rank(pb) * rank(roe)",
+                 "description": "Cheap + profitable quality-value", "family": "Value/Quality"},
+                {"expression": "-rank(ts_std(returns, 20))",
+                 "description": "Low realized volatility", "family": "Volatility"},
+                {"expression": "rank(ts_mean(volume, 20) / ts_mean(volume, 60))",
+                 "description": "Liquidity surge vs its own baseline", "family": "Liquidity"},
+                {"expression": "rank(ts_pct_change(eps, 60))",
+                 "description": "EPS (earnings) growth acceleration", "family": "Growth"}
             ]
         }, ensure_ascii=False)
+
+        # Per-call diversity scaffolding (n_factors varies, so compute spread here)
+        _fam_targets = list(_ALL_FAMILIES)
+        _per = max(1, n_factors // len(_fam_targets))
+        _spread_instr = (
+            f"Assign approximately {_per} factors to EACH of these families "
+            f"({', '.join(_fam_targets)}) and distribute any remainder across them; "
+            f"do NOT over-concentrate in Value/Quality."
+        )
 
         if hypothesis:
             user_prompt = (
@@ -1924,8 +2155,14 @@ Supported operators: +, -, *, /, ^"""
                 + "2. Expressions must be valid and use only supported functions and data sources\n"
                 + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
                 + "4. Each factor should have economic intuition tied to the hypothesis\n"
-                + "5. You MUST return exactly " + str(n_factors) + " factors\n"
-                + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
+                + "5. Even though they share a theme, DIVERSIFY: use a different primary operator "
+                "and, where possible, a different family for each\n"
+                + "6. NO near-duplicates: two factors must not be algebraically equivalent or differ "
+                "only by a sign flip, constant multiplier, or swapping pe<->pb<->ps<->roe in the same family\n"
+                + "7. Each factor object MUST include a \"family\" field (one of: "
+                + ", ".join(_fam_targets) + ", or Other)\n"
+                + "8. You MUST return exactly " + str(n_factors) + " factors\n"
+                + "9. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
                 + "\n"
                 + "Example (valid JSON object with \"factors\" key):\n"
                 + json_example + "\n\n"
@@ -1935,12 +2172,17 @@ Supported operators: +, -, *, /, ^"""
             user_prompt = (
                 f"Please generate {n_factors} diverse factor expressions for A-share stock selection.\n"
                 + "Requirements:\n"
-                + "1. Factors should be diverse and cover different categories (momentum, value, quality, liquidity, growth)\n"
+                + "1. " + _spread_instr + "\n"
                 + "2. Expressions must be valid and use only supported functions and data sources\n"
                 + "3. Avoid trivial factors (e.g., just \"close\" or \"volume\")\n"
-                + "4. Each factor should have economic intuition\n"
-                + "5. You MUST return exactly " + str(n_factors) + " factors\n"
-                + "6. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
+                + "4. Each factor should have clear economic intuition\n"
+                + "5. Each factor MUST use a DIFFERENT primary operator (see the menu in the system prompt)\n"
+                + "6. NO near-duplicates: two factors must not be algebraically equivalent or differ "
+                "only by a sign flip, constant multiplier, or swapping pe<->pb<->ps<->roe in the same family\n"
+                + "7. Each factor object MUST include a \"family\" field (one of: "
+                + ", ".join(_fam_targets) + ", or Other)\n"
+                + "8. You MUST return exactly " + str(n_factors) + " factors\n"
+                + "9. Return a JSON object with key \"factors\" (array of factor objects), no other text, no markdown fences\n"
                 + "\n"
                 + "Example (valid JSON object with \"factors\" key):\n"
                 + json_example + "\n\n"
@@ -1954,18 +2196,35 @@ Supported operators: +, -, *, /, ^"""
 
 
             seed_factors = []
+            _valid_fams = set(_ALL_FAMILIES) | {"Other"}
             for i, f in enumerate(factors_json):
                 if not isinstance(f, dict) or "expression" not in f:
                     continue
                 expr = self._fix_parentheses(f["expression"])
+                # Drop expressions that reference non-existent data fields
+                # (e.g. revenue/assets/sales the LLM hallucinates) BEFORE they
+                # waste a backtest slot. The backtester also guards this, but
+                # skipping early keeps the factor budget on valid candidates.
+                _ok, _bad = _validate_factor_expr(expr)
+                if not _ok:
+                    print(f"  [evolve] Skipping seed factor with unknown field(s) "
+                          f"{_bad}: {expr}")
+                    continue
+                # Prefer the LLM's explicit family label (it often knows a
+                # combined factor's intent better than keyword inference), but
+                # validate it — fall back to inference if the label is missing
+                # or unknown.
+                fam = f.get("family") or ""
+                fam = fam if fam in _valid_fams else _infer_family(expr)
                 factor = CandidateFactor(
                     id=f"seed_llm_{i}",
                     expression=expr,
                     description=f.get("description", f"LLM-generated factor {i}"),
                     generation=0,
+                    family=fam,
                 )
                 seed_factors.append(factor)
-            
+
             return seed_factors
             
         except (ValueError, json.JSONDecodeError) as e:
@@ -2029,6 +2288,7 @@ Supported operators: +, -, *, /, ^"""
                 expression=expr,
                 description=desc,
                 generation=0,
+                family=_infer_family(expr),
             )
             seed_factors.append(factor)
         
@@ -2241,7 +2501,9 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             # Select top factors — exclude parse-failed AND gate-rejected factors
             valid_evaluated = [f for f in evaluated_factors
                                if f.is_valid and f.originality_ok and not np.isnan(f.ic)]
-            top_factors = sorted(valid_evaluated, key=lambda x: x.ic, reverse=True)[:self.n_best_factors]
+            top_factors = _family_balanced_top(
+                valid_evaluated, self.n_best_factors, key=lambda x: x.ic
+            )
             
             # Generate reflection based on backtest results
             reflection_notes = self._generate_reflection(evaluated_factors, top_factors, round_id)
@@ -2281,14 +2543,17 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             )
             evolution_history.append(round_record)
             
-            # Elitism: carry top-N unmutated factors into the next round to
-            # prevent diversity collapse. Without this, the entire pool is
-            # replaced every round and can converge to a single direction.
+            # Elitism: carry top-N unmutated factors into the next round, with
+            # one representative per FAMILY (see _family_balanced_top) so a
+            # minority niche (e.g. Liquidity, Momentum) survives even when its
+            # IC is lower than the dominant Value/Quality cluster. Without this,
+            # the pool converges to a single niche and the fused portfolio
+            # collapses to one effective style.
             elite_factors: List[CandidateFactor] = []
             if self.elitism_carry > 0 and top_factors:
-                elite_factors = sorted(
-                    top_factors, key=_ic_key, reverse=True
-                )[:self.elitism_carry]
+                elite_factors = _family_balanced_top(
+                    top_factors, self.elitism_carry, key=_ic_key
+                )
                 # Deep-copy the expressions so the elite originals stay intact
                 # even if improved_factors accidentally mutate the same objects.
                 elite_factors = [
@@ -2298,6 +2563,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                         description=f.description,
                         parent_id=f.id,
                         generation=f.generation,
+                        family=f.family,
                     )
                     for f in elite_factors
                 ]
@@ -2469,35 +2735,111 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             List of improved factors
         """
         system_prompt = """You are a quantitative factor research expert specializing in factor improvement.
-Your task is to analyze top-performing factors and generate improved versions.
+Your task is to analyze top-performing factors and generate improved, DIVERSE AND MORE ADVANCED versions.
 
-Supported operations for factor improvement:
+Improvement operates on TWO tracks — generate BOTH:
+
+[A] BREADTH track — spread coverage across factor families (keeps the population diverse):
 1. Parameter tuning: Adjust window sizes (e.g., change 20 to 10 or 40)
-2. Combination: Combine multiple good factors using arithmetic operations
-3. Nonlinear transformation: Apply log, sqrt, abs, sign to enhance signal
-4. Cross-sectional ranking: Apply rank() to normalize signals
-5. Time-series operations: Use ts_zscore, ts_rank, ts_mean for robustness
-6. Fundamental integration: Combine price signals with pe, pb, roe, market_cap
+2. Family fill: generate factors for families MISSING from your inputs
+   (Momentum, Mean-reversion, Value/Quality, Volatility, Liquidity, Growth)
 
-""" + _FUNCTION_WHITELIST_STR + """
+[B] DEPTH track (PRIORITY) — make the STRONGEST input factors MORE ADVANCED.
+   "Advanced" means higher economic expressiveness, NOT merely a longer string.
+   For the strongest 2-3 input factors, produce DEEPER versions that keep the same
+   intent but increase sophistication. Use at least one of these techniques per
+   depth factor:
+   1. Crossover: combine TWO strong inputs into ONE factor, e.g.
+      rank(A) * rank(B),  rank(A) - rank(B),  rank(A) + rank(-B)
+   2. Nesting: stack transforms, e.g.
+      rank(ts_zscore(A, w)),  ts_zscore(rank(A), w),
+      rank(ts_corr(A, B, w) * ts_std(A, w))
+   3. Regime conditioning: switch behavior by market state with if(cond, A, B), e.g.
+      if(ts_std(returns,20) > ts_mean(ts_std(returns,60),20), A, B)
+   4. Multi-horizon ensemble: blend several window lengths, e.g.
+      0.5*rank(ts_delta(close,5)) + 0.5*rank(ts_delta(close,20))
+   5. Fundamental + signal fusion: rank(price_signal) * rank(-roe), etc.
 
-Guidelines:
-- Improvements should be non-trivial (not just changing window size by 1)
-- Avoid overfitting: don't create overly complex expressions
-- Ensure expressions are valid and can be evaluated
-- Return a JSON object with key "factors" (a list of objects with "expression" and "description" keys)"""
+Supported operators (use the WHITELIST below; reuse operators FREELY when composing
+deeper factors — novelty comes from COMBINATION, not from avoiding known functions):
+rank, ts_rank, ts_corr, ts_cov, ts_mean, ts_std, ts_var, ts_skew, ts_kurt,
+ts_min, ts_max, ts_sum, ts_delta, ts_pct_change, ts_zscore, ts_decay, delay,
+sign, abs, log, sqrt, if
+
+Factor families (for the breadth track):
+- Momentum: ts_corr, ts_cov, ts_pct_change, returns-based signals
+- Mean-reversion: -ts_zscore, -ts_rank, reversal of short-term moves
+- Value / Quality: rank(-pe), rank(-pb), rank(roe), rank(-market_cap)
+- Volatility: ts_std(returns), ts_std(close)/ts_mean(close), ts_max(returns)
+- Liquidity: volume, amount, vwap-based ratios
+- Growth: ts_pct_change(eps, w)
+
+""" + _FUNCTION_WHITELIST_STR + "\n\n" + _ALLOWED_FIELDS_STR + """
+
+Rules:
+- Do NOT generate factors that are near-duplicates of each other.
+- You MAY reuse operators already present in the inputs when building DEEPER composites.
+  For BREADTH factors, PREFER (but do not require) at least one operator not in the
+  input list.
+- Complexity is WELCOMED when it increases economic expressiveness — do NOT artificially
+  keep expressions simple. Avoid ONLY degenerate complexity (e.g. wrapping a constant,
+  or `rank(close - open)` with no signal).
+- Ensure expressions are valid and can be evaluated.
+- Return a JSON object with key "factors" (a list of objects, each with
+  "expression", "description", and "family" keys)."""
 
         # Build prompt with top factors and reflection notes
         factors_str = "\n".join([
             f"  {f.id}: {f.expression} (IC={f.ic:.4f}, Sharpe={f.sharpe:.2f}) - {f.description}"
             for f in top_factors[:self.n_best_factors]  # Only show top N to avoid prompt overflow
         ])
+        # Extract functions already used by top factors, to steer the LLM toward
+        # UNUSED operators (this is the main lever against "all factors look the same").
+        _used_funcs = set()
+        for _f in top_factors:
+            _used_funcs.update(re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', _f.expression))
+        used_functions = ", ".join(sorted(_used_funcs)) if _used_funcs else "(none detected)"
+
+        # --- Family-gap targeting (bridge measurement -> generation) ---
+        # Recompute directly from the input factors (don't parse reflection_notes,
+        # which is fragile to prompt-format drift). Mirrors the family coverage
+        # the reflection reports, so the LLM is steered toward the SPECIFIC
+        # families currently missing from the strongest set.
+        _strong_fam = {}
+        for _f in top_factors:
+            _ff = getattr(_f, "family", "") or _infer_family(_f.expression)
+            _strong_fam[_ff] = _strong_fam.get(_ff, 0) + 1
+        _missing_fams = [fam for fam in _ALL_FAMILIES if _strong_fam.get(fam, 0) == 0]
+        _present_fams = {fam: c for fam, c in _strong_fam.items() if c > 0}
+        if _missing_fams:
+            family_focus = (
+                "PRIORITY FAMILIES to generate (currently MISSING from your inputs): "
+                f"{', '.join(_missing_fams)}. Generate at least 2 NEW factors from these."
+            )
+        else:
+            family_focus = "All families are already represented — still aim to spread evenly."
+        family_avoid = ""
+        if _present_fams:
+            _dom = max(_present_fams, key=lambda k: _present_fams[k])
+            if _present_fams[_dom] >= 2:
+                family_avoid = (
+                    f"AVOID piling on the dominant family '{_dom}' "
+                    f"({_present_fams[_dom]}/{len(top_factors)} of your inputs) — "
+                    f"do NOT generate more {_dom}-only variants."
+                )
+        family_targeting = ""
+        if family_focus or family_avoid:
+            family_targeting = (
+                "Family targeting (data-driven, from your input factors' coverage):\n"
+                f"{family_focus}\n"
+                f"{family_avoid}\n"
+            )
         
         # Build reflection section
         reflection_section = ""
         if reflection_notes:
-            # Truncate to avoid prompt overflow (keep last 3000 chars)
-            notes_truncated = reflection_notes[-3000:] if len(reflection_notes) > 3000 else reflection_notes
+            # Truncate to avoid prompt overflow (keep last 8192 chars)
+            notes_truncated = reflection_notes[-8192:] if len(reflection_notes) > 8192 else reflection_notes
             reflection_section = f"""
 === Reflection Notes from Previous Round ===
 {notes_truncated}
@@ -2509,28 +2851,47 @@ Use these reflection notes to guide your improvements:
 === End of Reflection Notes ===
 """
         
-        user_prompt = f"""Based on the following top-performing factors, generate improved versions.
+        # --- Depth budget: reserve a slice of n_improve for DEEPENING the
+        # strongest factors (the advancement track). The rest serves breadth.
+        # This is the direct fix for "improve generates only shallow factors":
+        # without an explicit depth quota, the breadth/diversity rules crowd out
+        # any attempt to make the strong factors more sophisticated.
+        _depth_budget = max(2, int(self.n_improve * 0.4))
 
-Top factors:
+        user_prompt = f"""Based on the following top-performing factors, generate {self.n_improve} IMPROVED, DIVERSE, and MORE ADVANCED factors.
+
+Top factors (use as a starting point — especially the strongest one):
 {factors_str}
 {reflection_section}
+Functions ALREADY used by the top factors: {used_functions}
+{family_targeting}
 Requirements:
-1. Generate {self.n_improve} improved factors
-2. Each improvement should be based on one or more of the top factors
-3. Improvements can include:
-   - Parameter tuning (change window sizes)
-   - Factor combination (combine 2-3 good factors)
-   - Adding fundamental data (pe, pb, roe, market_cap)
-   - Applying nonlinear transformations
-4. Ensure expressions are valid and diverse
-5. Return strictly as a JSON array
-5. Return a JSON object with key "factors" (array of factor objects)
+1. Return a JSON object: {{"factors": [...]}} with exactly {self.n_improve} entries.
+2. Each entry MUST have keys: "expression", "description", and "family"
+   (one of: {', '.join(_ALL_FAMILIES)}).
+3. DEPTH track (PRIORITY): at least {_depth_budget} of the factors must be DEEPER
+   refinements of your single STRONGEST input factor (or the 2-3 strongest). Keep the
+   same economic intent but increase expressiveness via crossover / nesting /
+   if-condition / multi-horizon ensemble (see system prompt [B]). These MAY share the
+   strongest factor's family and MAY reuse operators already in the inputs.
+   NOTE: your strongest input may itself be a PRIOR-ROUND improvement — deepen THAT one
+   specifically rather than starting from scratch.
+4. BREADTH track: the remaining factors should SPREAD across families — prioritize the
+   MISSING families named in the targeting block above; cover >=3 families (ideally all
+   missing ones). PREFER (do not require) at least one operator NOT in the "already used"
+   list for these breadth factors.
+5. Vary the APPROACH across all factors: parameter tuning, crossover of two strong
+   factors, fundamental fusion, nonlinear transforms, regime conditioning.
+6. Ensure expressions are valid and can be evaluated.
+7. Return ONLY the JSON object, no other text.
 
-Example format:
+Example format (note the DEEPER composites that combine signals / nest transforms):
 {{
   "factors": [
-    {{"expression": "rank(ts_corr(close, volume, 10))", "description": "Improved momentum factor with shorter window"}},
-    {{"expression": "rank(ts_corr(close, volume, 20)) * -rank(pe)", "description": "Combined momentum-value factor"}}
+    {{"expression": "rank(ts_corr(close, volume, 20)) * rank(-ts_zscore(roe, 60))", "description": "Volume-momentum crossed with quality z-score", "family": "Momentum"}},
+    {{"expression": "if(ts_std(returns,20) > ts_mean(ts_std(returns,60),20), rank(ts_delta(close,5)), -rank(ts_delta(close,5)))", "description": "Regime-conditioned short-term reversal", "family": "Mean-reversion"}},
+    {{"expression": "rank(-pb) * rank(ts_mean(roe, 60))", "description": "Value-quality composite", "family": "Value/Quality"}},
+    {{"expression": "rank(ts_mean(volume, 5) / ts_mean(volume, 20)) * rank(-ts_std(returns, 20))", "description": "Liquidity surge tempered by volatility", "family": "Liquidity"}}
   ]
 }}
 
@@ -2545,6 +2906,14 @@ Please generate improved factors now. Return only the JSON object, no other text
                 if not isinstance(f, dict) or "expression" not in f:
                     continue
                 expr = self._fix_parentheses(f["expression"])
+                # Drop expressions referencing non-existent data fields
+                # (revenue/assets/sales the LLM hallucinates) so they don't
+                # waste a backtest slot.
+                _ok, _bad = _validate_factor_expr(expr)
+                if not _ok:
+                    print(f"  [evolve] Skipping improved factor with unknown field(s) "
+                          f"{_bad}: {expr}")
+                    continue
                 # Find parent factor
                 parent_id = top_factors[i % len(top_factors)].id if top_factors else None
                 
@@ -2554,9 +2923,43 @@ Please generate improved factors now. Return only the JSON object, no other text
                     description=f.get("description", f"LLM-improved factor {i}"),
                     parent_id=parent_id,
                     generation=(top_factors[0].generation + 1) if top_factors else 1,
+                    family=f.get("family") or _infer_family(expr),
                 )
                 improved_factors.append(factor)
             
+            # Lightweight diversity guard: drop factors that reuse the exact same
+            # operator signature (same set of functions) as an earlier one. This is
+            # the final backstop against "all improved factors look identical".
+            _seen_sigs = set()
+            _diverse = []
+            for _f in improved_factors:
+                _sig = tuple(sorted(set(re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', _f.expression))))
+                if _sig in _seen_sigs:
+                    continue
+                _seen_sigs.add(_sig)
+                _diverse.append(_f)
+            improved_factors = _diverse
+
+            # --- Advancement observability (makes "is improve getting deeper?"
+            # measurable instead of vibes). Compare structural size of the
+            # improved factors against the inputs they were derived from.
+            try:
+                _gate = FactorOriginalityGate(enabled=True)
+                _in_nodes = [ _gate._analyze(f.expression)[3] for f in top_factors
+                              if f.expression ]
+                _out_nodes = [ _gate._analyze(f.expression)[3] for f in improved_factors
+                               if f.expression ]
+                if _in_nodes and _out_nodes:
+                    _avg_in = sum(_in_nodes) / len(_in_nodes)
+                    _avg_out = sum(_out_nodes) / len(_out_nodes)
+                    print(f"  [evolve] Advancement: improved factors avg "
+                          f"{_avg_out:.1f} AST-nodes vs inputs {_avg_in:.1f} "
+                          f"(Δ={_avg_out - _avg_in:+.1f}); "
+                          f"depth-quota={_depth_budget}/{self.n_improve}")
+            except Exception:
+                # Observability must never break generation.
+                pass
+
             return improved_factors
             
         except json.JSONDecodeError as e:
@@ -2573,6 +2976,16 @@ Please generate improved factors now. Return only the JSON object, no other text
         """
         import random
         random.seed(42)
+
+        # --- Family gap (mirror the LLM improve path) ---
+        # When the strongest set is missing entire families, we still want the
+        # next round to recover those niches even with NO LLM. Computed directly
+        # from the inputs (not parsed from reflection text) for robustness.
+        _strong_fam = {}
+        for _f in top_factors:
+            _ff = getattr(_f, "family", "") or _infer_family(_f.expression)
+            _strong_fam[_ff] = _strong_fam.get(_ff, 0) + 1
+        _missing_fams = [fam for fam in _ALL_FAMILIES if _strong_fam.get(fam, 0) == 0]
 
         improved_factors = []
 
@@ -2627,6 +3040,19 @@ Please generate improved factors now. Return only the JSON object, no other text
             rank_expr = f"rank(rank({expr}))"
             all_strategies.append(rank_expr)
 
+            # Strategy 7: Deep crossover — parent x sibling, regulated by volatility
+            deep_cross = f"rank({expr}) * rank({other_expr}) * rank(-ts_std(returns, 20))"
+            all_strategies.append(deep_cross)
+
+            # Strategy 8: Nested rank-of-ts_zscore (stacking transforms)
+            nested = f"rank(ts_zscore({expr}, 20))"
+            all_strategies.append(nested)
+
+            # Strategy 9: Regime-conditioned version of the parent signal
+            regime = (f"if(ts_std(returns,20) > ts_mean(ts_std(returns,60),20), "
+                      f"rank({expr}), -rank({expr}))")
+            all_strategies.append(regime)
+
             # Select up to n_mutate strategies (capped by available strategies)
             n_strategies = min(self.n_mutate, len(all_strategies))
             improvements = random.sample(all_strategies, n_strategies) if len(all_strategies) > n_strategies else all_strategies
@@ -2639,8 +3065,77 @@ Please generate improved factors now. Return only the JSON object, no other text
                         description=f"Rule-based improvement of {factor.description} (strategy {j+1})",
                         parent_id=factor.id,
                         generation=factor.generation + 1,
+                        family=_infer_family(improved_expr),
                     )
                     improved_factors.append(improved)
+
+        # --- Depth track (mirror the LLM improvement): explicitly DEEPEN the
+        # strongest input factor(s) so the rule-based path also produces
+        # "advanced" factors, not just shallow mutations / breadth seeds. Without
+        # this, the fallback only ever produced parameter tweaks and 1-op combos,
+        # which is exactly the "no more advanced factors" failure mode.
+        if top_factors:
+            _strong = sorted(
+                top_factors,
+                key=lambda f: (f.ic if (f.ic is not None
+                                        and not (isinstance(f.ic, float) and np.isnan(f.ic)))
+                               else float('-inf')),
+                reverse=True,
+            )
+            _s = _strong[0]
+            _s_expr = _s.expression
+            _s2_expr = _strong[1].expression if len(_strong) > 1 else _s_expr
+            _gen = _s.generation + 1
+            _depth_variants = [
+                (f"rank(ts_corr({_s_expr}, {_s2_expr}, 20)) * rank(-ts_zscore(roe, 60))",
+                 "Crossover of two strongest, fused with quality z-score"),
+                (f"if(ts_std(returns,20) > ts_mean(ts_std(returns,60),20), "
+                 f"rank({_s_expr}), -rank({_s_expr}))",
+                 "Regime-conditioned version of the strongest signal"),
+                (f"rank(ts_delta(close,5)) + rank(ts_delta(close,20)) + rank(ts_delta(close,60))",
+                 "Multi-horizon ensemble (short + medium + long momentum)"),
+                (f"rank({_s_expr}) * rank(-pb) * rank(ts_mean(roe, 60))",
+                 "Strongest signal deepened with value-quality fusion"),
+            ]
+            for _k, (_dexpr, _ddesc) in enumerate(_depth_variants):
+                improved_factors.append(CandidateFactor(
+                    id=f"improved_rule_depth_{_s.id}_{_k}",
+                    expression=_dexpr,
+                    description=f"Depth refinement of strongest (rule-based): {_ddesc}",
+                    parent_id=_s.id,
+                    generation=_gen,
+                    family=_infer_family(_dexpr),
+                ))
+
+        # --- Family-gap bridging pass (LLM-unavailable diversity backstop) ---
+        # Seed 1 composite + 1 standalone per missing family so the next round is
+        # not a monoculture. Family labels are set EXPLICITLY (not inferred)
+        # because the composite may contain the parent's keywords that would
+        # mis-classify it; we KNOW we are targeting `fam`, so label it as such.
+        if _missing_fams and top_factors:
+            _base = top_factors[0].expression
+            _gen = top_factors[0].generation + 1
+            _pid = top_factors[0].id
+            for _fam in _missing_fams:
+                _token = _FAMILY_BRIDGE_TOKEN[_fam]
+                _composite = f"rank({_base}) * rank({_token})"
+                improved_factors.append(CandidateFactor(
+                    id=f"improved_rule_bridge_{_fam.replace('/', '_')}",
+                    expression=_composite,
+                    description=f"Family-gap bridge into {_fam} (rule-based)",
+                    parent_id=_pid,
+                    generation=_gen,
+                    family=_fam,
+                ))
+                _standalone = f"rank({_token})"
+                improved_factors.append(CandidateFactor(
+                    id=f"improved_rule_seed_{_fam.replace('/', '_')}",
+                    expression=_standalone,
+                    description=f"Missing-family seed: {_fam} (rule-based)",
+                    parent_id=None,
+                    generation=_gen,
+                    family=_fam,
+                ))
 
         return improved_factors
     

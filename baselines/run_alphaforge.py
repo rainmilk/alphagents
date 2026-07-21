@@ -1339,8 +1339,8 @@ def stage3_evaluate_results(
     # Run unified backtest
     from backtest.engine import BacktestEngine
     engine = BacktestEngine(
-        commission=0.0003,
-        slippage=0.001,
+        commission=0.001,
+        slippage=0.0,
         risk_free_rate=0.0,
         holding_period=config.holding_period,
     )

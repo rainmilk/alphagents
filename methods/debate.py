@@ -31,43 +31,125 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 # Role-specific system prompts
+# IMPORTANT design notes (applied to every role below):
+#   * The factor's backtest IC / Sharpe are REAL evidence (when provided). They
+#     MUST anchor the 0-10 score — narrative alone is not enough.
+#   * Each expert evaluates strictly from ITS OWN domain lens. Be the honest
+#     advocate: disagree with peers when theory supports it; never rubber-stamp.
+#   * If a factor is largely OUTSIDE your domain, say so in 'concerns' and cap
+#     your score at <=6 (you cannot credibly endorse an out-of-domain factor).
 ROLE_PROMPTS = {
     "Momentum Expert": (
         "You are a Momentum Expert specializing in quantitative stock selection. "
         "You evaluate factors based on: trend persistence, volume confirmation, "
         "reactivity to price signals, and robustness across market regimes. "
-        "A good momentum factor should have high IC, low turnover, and work well "
-        "in trending markets. Score factors 0-10 and provide concise reasoning."
+        "A good momentum factor has high Rank-IC, low turnover, and works in "
+        "trending markets. "
+        "SCORING ANCHORS (use the provided IC/Sharpe when available): "
+        "IC>=0.03 -> 8-10; IC 0.015-0.03 -> 6-8; IC 0.005-0.015 -> 4-6; "
+        "IC<0.005 or negative Sharpe -> <=5 regardless of narrative. "
+        "If no IC/Sharpe is provided, state that your score is narrative-only "
+        "and discount it. Be the honest advocate for momentum — disagree with "
+        "peers when their argument ignores price/volume dynamics. "
+        "If this factor is largely OUTSIDE your domain, state that in 'concerns' "
+        "and cap your score at <=6."
     ),
     "Value Expert": (
         "You are a Value Expert specializing in fundamental stock selection. "
         "You evaluate factors based on: fundamental signal quality, mean-reversion properties, "
         "avoidance of value traps, and long-term predictive power. "
-        "A good value factor should capture mispricing, have economic intuition, "
-        "and be robust across business cycles. Score factors 0-10."
+        "A good value factor captures mispricing, has economic intuition, "
+        "and is robust across business cycles. "
+        "SCORING ANCHORS (use the provided IC/Sharpe when available): "
+        "IC>=0.03 -> 8-10; IC 0.015-0.03 -> 6-8; IC 0.005-0.015 -> 4-6; "
+        "IC<0.005 or negative Sharpe -> <=5 regardless of narrative. "
+        "If no IC/Sharpe is provided, state that your score is narrative-only "
+        "and discount it. Flag value traps (cheap for a reason) explicitly in "
+        "'concerns'. If this factor is largely OUTSIDE your domain, state that "
+        "in 'concerns' and cap your score at <=6."
     ),
     "Quality Expert": (
         "You are a Quality Expert specializing in corporate fundamental analysis. "
         "You evaluate factors based on: earnings quality, profitability sustainability, "
         "balance sheet strength, and management efficiency. "
-        "A good quality factor should identify companies with durable competitive advantages, "
-        "low bankruptcy risk, and consistent cash flow generation. Score factors 0-10."
+        "A good quality factor identifies companies with durable competitive advantages, "
+        "low bankruptcy risk, and consistent cash flow generation. "
+        "SCORING ANCHORS (use the provided IC/Sharpe when available): "
+        "IC>=0.03 -> 8-10; IC 0.015-0.03 -> 6-8; IC 0.005-0.015 -> 4-6; "
+        "IC<0.005 or negative Sharpe -> <=5 regardless of narrative. "
+        "If no IC/Sharpe is provided, state that your score is narrative-only "
+        "and discount it. Note: a pure valuation field (e.g. pb, pe) is VALUE, "
+        "not Quality — reserve high scores for genuine quality signals "
+        "(profitability, margins). If this factor is largely OUTSIDE your domain, "
+        "state that in 'concerns' and cap your score at <=6."
     ),
     "Volatility Expert": (
         "You are a Volatility Expert specializing in risk-adjusted factor evaluation. "
         "You evaluate factors based on: downside protection, drawdown control, "
         "tail-risk behavior, and risk-adjusted return potential. "
-        "A good low-vol factor should have stable IC, low max drawdown contribution, "
-        "and positive performance in stress periods. Score factors 0-10."
+        "A good low-vol factor has stable IC, low max-drawdown contribution, "
+        "and positive performance in stress periods. "
+        "SCORING ANCHORS (use the provided IC/Sharpe when available): "
+        "Sharpe>=1.0 with IC>=0.02 -> 8-10; Sharpe 0.5-1.0 -> 6-8; "
+        "Sharpe<0.3 or high drawdown -> <=5 regardless of narrative. "
+        "If no IC/Sharpe is provided, state that your score is narrative-only "
+        "and discount it. Judge factors on RISK-ADJUSTED behaviour, not raw "
+        "return. If this factor is largely OUTSIDE your domain, state that in "
+        "'concerns' and cap your score at <=6."
     ),
     "Growth Expert": (
         "You are a Growth Expert specializing in forward-looking signal evaluation. "
         "You evaluate factors based on: earnings growth sustainability, analyst revision trends, "
         "R&D efficiency, and scalability of business model. "
-        "A good growth factor should identify companies with accelerating fundamentals, "
-        "high ROCIC, and expanding market share. Score factors 0-10."
+        "A good growth factor identifies companies with accelerating fundamentals, "
+        "high ROCIC, and expanding market share. "
+        "SCORING ANCHORS (use the provided IC/Sharpe when available): "
+        "IC>=0.03 -> 8-10; IC 0.015-0.03 -> 6-8; IC 0.005-0.015 -> 4-6; "
+        "IC<0.005 or negative Sharpe -> <=5 regardless of narrative. "
+        "If no IC/Sharpe is provided, state that your score is narrative-only "
+        "and discount it. Distinguish genuine growth (EPS / earnings "
+        "acceleration, e.g. ts_pct_change(eps, N)) from mere valuation — a static pb/pe is NOT growth. "
+        "If this factor is largely OUTSIDE your domain, state that in 'concerns' "
+        "and cap your score at <=6."
     ),
 }
+
+# Canonical factor families — kept consistent with methods/evolve.py's
+# _ALL_FAMILIES so a factor's family label means the same thing in BOTH the
+# evolution stage (diversity-aware selection) and the debate stage (diversity-
+# aware Chair selection). Drift here would silently let Value/Quality factors
+# sneak past the diversity gate.
+_DEBATE_FAMILIES = [
+    "Momentum", "Mean-reversion", "Value/Quality",
+    "Volatility", "Liquidity", "Growth", "Other",
+]
+
+
+def _infer_family(expr: str) -> str:
+    """Infer a factor's PRIMARY family from its expression.
+
+    EXACT mirror of methods/evolve.py:_infer_family (same keyword priority) so a
+    factor carries the same family label in BOTH the evolution stage (diversity-
+    aware selection) and the debate stage (diversity-aware Chair selection).
+    Drift here would let Value/Quality factors slip past the diversity gate.
+    """
+    e = (expr or "").lower()
+    if any(k in e for k in ("volume", "amt", "turnover", "illiquid")):
+        return "Liquidity"
+    if any(k in e for k in ("ts_std", "ts_max", "ts_min", "ts_skew", "ts_kurt")):
+        return "Volatility"
+    if any(k in e for k in ("ts_corr", "ts_cov", "ts_pct_change",
+                            "ts_delta", "ts_rank", "returns", "momentum")):
+        return "Momentum"
+    if any(k in e for k in ("ts_zscore", "reversal", "mean_reversion")):
+        return "Mean-reversion"
+    if any(k in e for k in ("growth", "eps")):
+        return "Growth"
+    if any(k in e for k in ("pe", "pb", "ps", "roe", "roa",
+                            "market_cap", "value", "margin", "debt", "quality")):
+        return "Value/Quality"
+    return "Other"
+
 
 # Structured output schema for independent evaluation
 EVAL_SCHEMA = {
@@ -115,6 +197,10 @@ class FactorProposal:
     rationale: Optional[str] = None
     ic: Optional[float] = None  # optional IC from backtest
     sharpe: Optional[float] = None  # optional Sharpe from backtest
+    family: Optional[str] = None  # optional factor family label (e.g. 'Momentum',
+                                   # 'Value/Quality'). When omitted, _infer_family()
+                                   # derives it from the expression so the Chair can
+                                   # still enforce family-diverse selection.
 
 
 @dataclass
@@ -175,9 +261,9 @@ class DebateEvaluator:
         parallel_eval: bool = True,
         request_timeout: float = 120.0,
         max_retries: int = 3,
-        # --- Chair synthesis prompt bounding (prevents 120s timeouts on huge pools) ---
+        # --- Chair synthesis prompt bounding (prevents timeouts on huge pools) ---
         synthesis_top_n: int = 50,
-        chair_max_tokens: int = 4096,
+        chair_max_tokens: int = 8192,
     ):
         """
         Initialize debate evaluator.
@@ -497,16 +583,6 @@ class DebateEvaluator:
         ic_str = f", IC={factor_proposal.ic:.4f}" if factor_proposal.ic is not None else ""
         sharpe_str = f", Sharpe={factor_proposal.sharpe:.4f}" if factor_proposal.sharpe is not None else ""
 
-        user_prompt_template = (
-            f"Please evaluate the following quantitative stock selection factor:\n\n"
-            f"Expression: {factor_proposal.expression}\n"
-            f"Description: {factor_proposal.description}\n"
-            f"{ic_str}{sharpe_str}\n\n"
-            f"Provide your evaluation as a JSON object with keys: "
-            f"'score' (float 0-10), 'reasoning' (string), "
-            f"'concerns' (list of strings), 'strengths' (list of strings)."
-        )
-
         if self.parallel_eval and len(self.agents) > 1:
             # --- Parallel: ThreadPoolExecutor for I/O-bound API calls ---
             import concurrent.futures
@@ -517,7 +593,7 @@ class DebateEvaluator:
                 for agent in role_order:
                     future = executor.submit(
                         self._evaluate_single_agent,
-                        agent, factor_proposal, user_prompt_template,
+                        agent, factor_proposal,
                     )
                     future_to_role[future] = agent
 
@@ -546,9 +622,7 @@ class DebateEvaluator:
         # --- Serial: simple for-loop (debug-friendly) ---
         opinions = []
         for agent in self.agents:
-            opinion = self._evaluate_single_agent(
-                agent, factor_proposal, user_prompt_template,
-            )
+            opinion = self._evaluate_single_agent(agent, factor_proposal)
             opinions.append(opinion)
 
         return opinions
@@ -557,12 +631,38 @@ class DebateEvaluator:
         self,
         agent: "AgentRole",
         factor_proposal: "FactorProposal",
-        user_prompt: str,
     ) -> "AgentOpinion":
         """Evaluate a single factor from one agent's perspective (used by both
-        serial and parallel pathways in _independent_evaluation)."""
+        serial and parallel pathways in _independent_evaluation).
+
+        The user prompt is built PER AGENT so each expert is explicitly told its
+        role (belt-and-suspenders with the system prompt) and receives the same
+        grounding rules. Previously a single shared template was reused for all
+        five agents, so the role name could not be injected per agent.
+        """
         role_name = agent.value
         system_prompt = ROLE_PROMPTS.get(role_name, ROLE_PROMPTS["Momentum Expert"])
+
+        ic_str = f", IC={factor_proposal.ic:.4f}" if factor_proposal.ic is not None else ""
+        sharpe_str = f", Sharpe={factor_proposal.sharpe:.4f}" if factor_proposal.sharpe is not None else ""
+
+        user_prompt = (
+            f"You are the {role_name}. Evaluate the following quantitative stock "
+            f"selection factor strictly from YOUR domain perspective:\n\n"
+            f"Expression: {factor_proposal.expression}\n"
+            f"Description: {factor_proposal.description}\n"
+            f"{ic_str}{sharpe_str}\n\n"
+            f"CRITICAL SCORING RULES:\n"
+            f"- The IC/Sharpe above are REAL backtest results — they MUST anchor your 0-10 score. "
+            f"Follow your role's scoring anchors. Do NOT score >7 for a factor with IC<0.005 "
+            f"or negative Sharpe, no matter how plausible the story.\n"
+            f"- If IC/Sharpe are absent, say so in 'reasoning' and treat your score as narrative-only (discount it).\n"
+            f"- If this factor is largely OUTSIDE your domain, state that in 'concerns' and cap your score at <=6.\n"
+            f"- 'strengths'/'concerns' must be specific to YOUR domain (not generic praise).\n\n"
+            f"Provide your evaluation as a JSON object with keys: "
+            f"'score' (float 0-10), 'reasoning' (string), "
+            f"'concerns' (list of strings), 'strengths' (list of strings)."
+        )
 
         if self.use_llm and self.client:
             try:
@@ -719,14 +819,21 @@ class DebateEvaluator:
         system_prompt = ROLE_PROMPTS.get(role_name, ROLE_PROMPTS["Momentum Expert"])
 
         user_prompt = (
-            f"You are participating in round {round_id + 1}/{self.n_rounds} of a factor evaluation debate.\n\n"
+            f"You are the {role_name} participating in round {round_id + 1}/{self.n_rounds} "
+            f"of a factor evaluation debate.\n\n"
             f"Factor to evaluate:\n"
             f"Expression: {factor_proposal.expression}\n"
             f"Description: {factor_proposal.description}\n\n"
-            f"Other experts' opinions from previous round:\n{context}\n\n"
-            f"Based on the above discussion, refine YOUR evaluation of this factor. "
+            f"Other experts' opinions from the previous round:\n{context}\n\n"
+            f"Refine YOUR evaluation of this factor from YOUR domain perspective:\n"
+            f"- Keep grounding your score in the REAL backtest IC/Sharpe (shown earlier); "
+            f"do not let peer pressure override hard evidence.\n"
+            f"- Revise your score ONLY if a peer's argument is financially sound AND contradicts "
+            f"your own evidence. Never change just to conform. If you hold your position, explain "
+            f"why in 'reasoning'.\n"
+            f"- Update 'strengths'/'concerns' to reflect what the debate surfaced.\n"
             f"Respond in JSON with keys: 'score' (float 0-10), 'reasoning' (string), "
-            f"'concerns' (list), 'strengths' (list), 'changed_mind' (bool, whether you revised your score)."
+            f"'concerns' (list of strings), 'strengths' (list of strings)."
         )
 
         if self.use_llm and self.client:
@@ -887,9 +994,12 @@ class DebateEvaluator:
                         "You are the Chief Investment Officer (Chair Agent) synthesizing a "
                         "multi-agent factor evaluation debate. "
                         "Five experts (Momentum, Value, Quality, Volatility, Growth) have debated "
-                        "this factor. Your job is to weigh their arguments, resolve disagreements, "
-                        "and produce the FINAL authoritative judgment. "
-                        "Be decisive — if experts are split, break the tie with clear reasoning."
+                        "this factor. Your job is to weigh their ARGUMENTS (not just their numbers), "
+                        "resolve disagreements, and produce the FINAL authoritative judgment. "
+                        "Your 'final_score' (0-10) MUST stay consistent with the debate score "
+                        "distribution shown in the prompt (mean and std) — do not deviate wildly "
+                        "without explicit justification. Be decisive — if experts are split, break "
+                        "the tie with clear reasoning grounded in the backtest evidence."
                     ),
                     user_prompt=summary_prompt,
                     temperature=0.2,
@@ -930,6 +1040,10 @@ class DebateEvaluator:
     def _build_consensus_prompt(self, factor_proposal: FactorProposal,
                                 debate_rounds: List[DebateRound]) -> str:
         """Build prompt for final consensus LLM call."""
+        all_scores = [op.score for rnd in debate_rounds for op in rnd.opinions]
+        mean_s = float(np.mean(all_scores)) if all_scores else 0.0
+        std_s = float(np.std(all_scores)) if all_scores else 0.0
+
         lines = [
             f"Factor: {factor_proposal.expression}",
             f"Description: {factor_proposal.description}",
@@ -938,15 +1052,24 @@ class DebateEvaluator:
             lines.append(f"IC: {factor_proposal.ic:.4f}")
         if factor_proposal.sharpe is not None:
             lines.append(f"Sharpe: {factor_proposal.sharpe:.4f}")
-        lines.append("\nDebate rounds summary:")
+        lines.append(f"\nDebate score distribution: mean={mean_s:.2f}, std={std_s:.2f}")
+        lines.append("Debate rounds (scores + each agent's key argument):")
         for rnd in debate_rounds:
-            score_str = ", ".join([f"{op.agent_role.value}={op.score:.1f}" for op in rnd.opinions])
-            lines.append(f"  Round {rnd.round_id + 1}: {score_str}")
+            for op in rnd.opinions:
+                top_concern = (op.concerns[0] if op.concerns else "")
+                top_strength = (op.strengths[0] if op.strengths else "")
+                lines.append(
+                    f"  R{rnd.round_id + 1} {op.agent_role.value}={op.score:.1f} | "
+                    f"strength: {self._truncate(top_strength, 120)} | "
+                    f"concern: {self._truncate(top_concern, 120)}"
+                )
         lines.append(
-            "\nProvide final consensus as JSON with keys: "
-            "'final_score' (float 0-10), 'key_insights' (list of strings), "
+            "\nSynthesize the ARGUMENTS above (not just the numbers). "
+            "Provide final consensus as JSON with keys: "
+            "'final_score' (float 0-10, consistent with the distribution above), "
+            "'key_insights' (list of strings — the decisive points that settled the debate), "
             "'recommendation' (APPROVE/REJECT/CONDITIONAL), "
-            "'consensus_summary' (string)."
+            "'consensus_summary' (string — concise wrap-up of the verdict)."
         )
         return "\n".join(lines)
 
@@ -994,10 +1117,19 @@ class DebateEvaluator:
                         "on factor selection. You have reviewed multi-agent debate results for ALL "
                         "candidate factors. Your job:\n"
                         "1. Rank factors from best to worst\n"
-                        "2. For each SELECTED factor, explain WHY it was chosen (具体的入选理由)\n"
+                        "2. For each SELECTED factor, explain WHY it was chosen (具体的入选理由) — "
+                        "reference its backtest IC/Sharpe AND the debate evidence\n"
                         "3. For each REJECTED factor, explain WHY it was eliminated (具体的淘汰原因)\n"
                         "4. Identify cross-cutting themes (e.g., 'momentum dominates', 'value factors weak')\n"
                         "5. Give an overall confidence assessment\n\n"
+                        "CRITICAL — FAMILY DIVERSITY (do NOT skip):\n"
+                        "Each factor is labeled with its Family (Momentum / Mean-reversion / "
+                        "Value-Quality / Volatility / Liquidity / Growth). A good portfolio of "
+                        "factors spans MULTIPLE families. Do NOT select 10 factors that are all "
+                        "variants of the same idea (e.g., all -rank(pb)-style Value-Quality clones) "
+                        "just because they score similarly. Cap selection to at most 2-3 factors per "
+                        "family UNLESS one family is dramatically superior (then justify it). "
+                        "Report portfolio concentration risk explicitly in 'key_themes'.\n\n"
                         "CRITICAL: Be specific. Vague answers like 'performs well' are insufficient. "
                         "Reference specific agent arguments, backtest metrics, and financial logic.\n\n"
                         "Respond in JSON with keys exactly as specified.\n\n"
@@ -1009,7 +1141,12 @@ class DebateEvaluator:
                     user_prompt=prompt,
                     temperature=0.2,
                 )
-                parsed = json.loads(raw)
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Response was likely truncated by max_tokens — try to
+                    # recover a usable prefix before giving up to rule-based.
+                    parsed = self._salvage_json(raw)
 
                 # Validate and coerce required fields
                 result = {
@@ -1148,6 +1285,47 @@ class DebateEvaluator:
             return text
         return text[:limit] + "..."
 
+    @staticmethod
+    def _salvage_json(raw: str):
+        """Best-effort repair of a JSON string truncated by a max_tokens cap.
+
+        The Chair response can be cut mid-value when generation hits the token
+        limit. This closes an open string, strips a trailing comma, and closes
+        open containers in correct LIFO order so a usable prefix still parses.
+        Raises (json.JSONDecodeError or similar) if the truncation is too deep
+        to repair — callers should then fall back to rule-based synthesis.
+        """
+        s = raw.rstrip()
+        stack = []          # stack of still-open '[' / '{'
+        instr = False
+        esc = False
+        for ch in s:
+            if esc:
+                esc = False
+                continue
+            if ch == '\\':
+                esc = True
+                continue
+            if ch == '"':
+                instr = not instr
+                continue
+            if instr:
+                continue
+            if ch in '[{':
+                stack.append(ch)
+            elif ch in ']}':
+                if stack:
+                    stack.pop()
+        if instr:
+            s += '"'                       # close unterminated string
+        s = s.rstrip()
+        if s.endswith(','):
+            s = s[:-1]                     # drop dangling comma before close
+        close_map = {'[': ']', '{': '}'}
+        while stack:
+            s += close_map[stack.pop()]    # close remaining containers (LIFO)
+        return json.loads(s)
+
     def _build_synthesis_prompt(
         self,
         debate_results: List[Tuple[FactorProposal, "DebateResult"]],
@@ -1173,9 +1351,19 @@ class DebateEvaluator:
         top = sorted_results[: self.synthesis_top_n]
         rest = sorted_results[self.synthesis_top_n :]
 
+        # Family distribution across the WHOLE pool — gives the Chair an at-a-glance
+        # view of concentration so it can honor the family-diversity directive.
+        fam_counts: Dict[str, int] = {}
+        for proposal, _ in sorted_results:
+            fam = proposal.family or _infer_family(proposal.expression)
+            fam_counts[fam] = fam_counts.get(fam, 0) + 1
+        fam_dist = ", ".join(f"{k}={v}" for k, v in sorted(
+            fam_counts.items(), key=lambda kv: -kv[1]))
+
         lines = [
             "=== CROSS-FACTOR SYNTHESIS ===",
             f"Total factors evaluated: {len(debate_results)}",
+            f"Family distribution (whole pool): {fam_dist}",
             f"Detailed review below for the top {len(top)} factors by debate score; "
             f"{len(rest)} lower-ranked factors are summarized compactly at the end.",
             "",
@@ -1184,9 +1372,11 @@ class DebateEvaluator:
         ]
 
         for i, (proposal, result) in enumerate(top):
+            fam = proposal.family or _infer_family(proposal.expression)
             lines.append(f"--- Factor #{i + 1} ---")
             lines.append(f"Expression: {proposal.expression}")
             lines.append(f"Description: {proposal.description}")
+            lines.append(f"Family: {fam}")
             if proposal.ic is not None:
                 lines.append(f"Backtest IC: {proposal.ic:.4f}")
             if proposal.sharpe is not None:
@@ -1208,9 +1398,10 @@ class DebateEvaluator:
         if rest:
             lines.append("--- Lower-ranked candidates (compact) ---")
             for (proposal, result) in rest:
+                fam = proposal.family or _infer_family(proposal.expression)
                 lines.append(
-                    f"- {proposal.expression} | score={result.final_score:.2f} | "
-                    f"{result.recommendation}"
+                    f"- {proposal.expression} | family={fam} | "
+                    f"score={result.final_score:.2f} | {result.recommendation}"
                 )
             lines.append("")
 
@@ -1218,16 +1409,20 @@ class DebateEvaluator:
         lines.append(
             "Provide your cross-factor synthesis as JSON with keys:\n"
             "  'overall_assessment' (string): Your holistic judgment of the factor pool\n"
-            "  'factors_ranked' (array): Factors ranked from best to worst, each with:\n"
+            "  'factors_ranked' (array): Top factors ranked from best to worst, each with:\n"
             "    - 'rank' (int), 'expression' (string), 'final_score' (float),\n"
-            "    - 'selection_reason' (string, 入选理由 — WHY this factor is selected),\n"
-            "    - 'strengths' (array of strings), 'risks' (array of strings)\n"
+            "    - 'selection_reason' (string, 入选理由 — WHY this factor is selected)\n"
+            "    NOTE: keep selection_reason concise (1-2 sentences). Do NOT add 'strengths'/'risks' arrays.\n"
             "  'selected_count' (int): How many factors you recommend selecting\n"
             "  'rejected_factors' (array): Factors NOT selected, each with:\n"
             "    - 'expression' (string), 'final_score' (float),\n"
-            "    - 'rejection_reason' (string, 淘汰原因 — WHY this factor was rejected)\n"
+            "    - 'rejection_reason' (string, 淘汰原因 — WHY this factor was rejected, concise)\n"
             "  'key_themes' (array of strings): Cross-cutting observations\n"
-            "  'chair_confidence' (string): HIGH / MEDIUM / LOW"
+            "  'chair_confidence' (string): HIGH / MEDIUM / LOW\n"
+            "FAMILY DIVERSITY: each factor above is labeled with its Family. Prefer a "
+            "diverse selection that spans MULTIPLE families; DO NOT pick many near-duplicate "
+            "factors from the same family. Report any portfolio concentration risk in 'key_themes'.\n"
+            "Keep the ENTIRE response compact — verbose output risks being truncated by the token limit."
         )
         return "\n".join(lines)
 
@@ -1275,6 +1470,38 @@ class DebateEvaluator:
         for i, entry in enumerate(ranked):
             entry["rank"] = i + 1
 
+        # --- Family-balanced capping (mirror evolve._family_balanced_top) ---
+        # Without the Chair LLM, we cannot rely on free-text diversity reasoning,
+        # so we enforce it structurally: keep at most MAX_PER_FAMILY factors per
+        # family, spilling the rest into `rejected` with an explicit reason. This
+        # stops a Value/Quality-heavy population from collapsing the final
+        # portfolio into a single family when the LLM is unavailable.
+        _MAX_PER_FAMILY = 3
+        fam_count: Dict[str, int] = {}
+        capped_extra = []
+        selected = []
+        for entry in ranked:  # already composite-desc
+            fam = _infer_family(entry["expression"])
+            entry["family"] = fam
+            if fam_count.get(fam, 0) < _MAX_PER_FAMILY:
+                fam_count[fam] = fam_count.get(fam, 0) + 1
+                selected.append(entry)
+            else:
+                capped_extra.append(entry)
+        for entry in capped_extra:
+            rejected.append({
+                "expression": entry["expression"],
+                "final_score": entry["final_score"],
+                "rejection_reason": (
+                    f"家族集中剔除: {entry['family']} 已入选 {_MAX_PER_FAMILY} 个（上限），"
+                    f"composite={entry['composite_score']} 但因组合多样性要求移入淘汰。"
+                ),
+            })
+        ranked = selected
+        ranked.sort(key=lambda x: x["composite_score"], reverse=True)
+        for i, entry in enumerate(ranked):
+            entry["rank"] = i + 1
+
         # Identify themes from agent scores
         themes = []
         all_recommendations = [r.recommendation for _, r in debate_results]
@@ -1283,6 +1510,20 @@ class DebateEvaluator:
 
         avg_score = float(np.mean([r.final_score for _, r in debate_results]))
         themes.append(f"Average debate score: {avg_score:.2f}/10")
+
+        # Family concentration report (post-cap) so the report surfaces diversity
+        if ranked:
+            fam_dist = {}
+            for e in ranked:
+                fam_dist[e["family"]] = fam_dist.get(e["family"], 0) + 1
+            dist_str = ", ".join(f"{k}:{v}" for k, v in sorted(fam_dist.items(),
+                                                              key=lambda kv: -kv[1]))
+            themes.append(f"Selected family distribution: {dist_str}")
+            if len(fam_dist) == 1:
+                themes.append(
+                    "CONCENTRATION RISK: all selected factors belong to a single family — "
+                    "population lacks diversity, consider widening the search."
+                )
 
         return {
             "overall_assessment": (

@@ -68,7 +68,7 @@ data:
 llm:
   # Factor generation → used by step4_evolve_factors
   generator:
-    model: "bailian/deepseek-v4-flash"
+    model: "deepseek-v4-flash"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.7
@@ -91,7 +91,7 @@ llm:
   # Chair Agent — synthesizes debate results into ranked cross-factor report
   # Used by step5b_chair_synthesis (runs after step5_evaluate_factors)
   chair:
-    model: "bailian/deepseek-v4-pro"   # 当前与专家 evaluator 共用相同模型
+    model: "deepseek-v4-pro"   # 当前与专家 evaluator 共用相同模型
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.2  # 主席需要更确定性的输出
@@ -100,31 +100,31 @@ llm:
     # --- Timeout / prompt bounding (fixes [Step 5b] APITimeoutError on large pools) ---
     request_timeout: 150        # [ACTIVE] seconds before a Chair LLM call times out (proxy endpoint is slow on long context)
     synthesis_top_n: 25         # [ACTIVE] #factors fed FULL detail to Chair (rest get a compact line); bounds prompt size & timeout
-    max_tokens: 4096            # [ACTIVE] cap Chair generation length (prevents runaway cross-factor JSON output)
+    max_tokens: 8192            # [ACTIVE] cap Chair generation length (compact schema + top-25 fits comfortably; bump only if truncation recurs)
     
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
-  n_seeds_hypothesis: 25        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
-  n_seeds_single_stage: 25       # [ACTIVE] plain single-stage seed factors
-  n_seeds_memory_augment: 25     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_seeds_hypothesis: 20        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  n_seeds_single_stage: 20       # [ACTIVE] plain single-stage seed factors
+  n_seeds_memory_augment: 10     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
-  n_best_factors: 35   # [ACTIVE] top-N factors to retain per round
+  n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
   max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
-  n_improve: 25        # [ACTIVE] target number of improved factors per round (LLM generation)
+  n_improve: 20        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
   convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
   convergence_window: 2     # [ACTIVE] number of recent rounds to check for convergence
   patience: 3               # [ACTIVE] max consecutive non-improving rounds before early stop
-  val_ratio: 0.4            # [ACTIVE] fraction of TRAIN period held out as validation for factor SELECTION and early-stop (0 = disabled; full train used as before). This is the key anti-overfitting lever: evolution is driven by train IC but factors are finally ranked/early-stopped on validation IC.
+  val_ratio: 0.3            # [ACTIVE] fraction of TRAIN period held out as validation for factor SELECTION and early-stop (0 = disabled; full train used as before). This is the key anti-overfitting lever: evolution is driven by train IC but factors are finally ranked/early-stopped on validation IC.
   min_ic: 0.02              # [ACTIVE] quality filter: drop factors with IC below this
-  min_val_ic: 0.01         # [ACTIVE] honest gate (val-mode only): drop factors whose validation IC < this. Requires a real OOS edge — at val_ratio=0.3 the holdout window is ~hundreds of days (SE of mean val-IC ≈ 0.005), so 0.01 ≈ "factor must show a small but statistically-meaningful rank-IC on holdout" (~2 SE above zero). Set 0.005 for a more lenient bar; avoid 0.02 (= min_ic) unless you want val IC to match the in-sample floor (too strict given holdout noise).
+  min_val_ic: 0.02         # [ACTIVE] honest gate (val-mode only): drop factors whose validation IC < this. Requires a real OOS edge — at val_ratio=0.3 the holdout window is ~hundreds of days (SE of mean val-IC ≈ 0.005), so 0.01 ≈ "factor must show a small but statistically-meaningful rank-IC on holdout" (~2 SE above zero). Set 0.005 for a more lenient bar; avoid 0.02 (= min_ic) unless you want val IC to match the in-sample floor (too strict given holdout noise).
   min_sharpe: 0.0           # [ACTIVE] soft guard: drop factors with NEGATIVE Sharpe. NOTE: Sharpe here is distorted by overlapping-window annualization (daily-sampled 10d forward returns * sqrt(252)), so keep this a soft floor, not a hard gate. Was 0.5 — dead code: it constantly cleared every factor, then the fallback re-admitted all of them, so the filter never excluded anything.
   max_drawdown: -1.0       # [ACTIVE] quality filter: drop factors with drawdown worse than this. Cumsum-based after fix (single-sided 10d LS returns); -0.20 was too strict for 2023-2024 A-share bear market — even decent factors easily exceed -20% cumulative.
   originality_gate: true    # [ACTIVE] static AST gate: reject structural near-duplicates + trivial/no-data/constant-dominated factors before they enter the pool
   dedup_similarity: 0.90    # [ACTIVE] canonical-signature similarity above which a factor is treated as a near-duplicate of an accepted one
-  improve_temperature: 0.3  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Low = refinement, high = re-sampling. The old 0.8 was causing diversity collapse (every round was a fresh lottery, not incremental improvement).
-  elitism_carry: 2          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
+  improve_temperature: 0.7  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
+  elitism_carry: 3          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
 
 # ==================== Memory Bank Configuration ====================
 memory:
@@ -187,8 +187,8 @@ fusion:
 backtest:
   # Trading → used by BacktestEngine (step8_backtest)
   trading:
-    commission: 0.0003     # [ACTIVE] 0.03% per trade
-    slippage: 0.001        # [ACTIVE] 0.1% per trade
+    commission: 0.001     # [ACTIVE] 0.1% one-sided (paper-aligned)
+    slippage: 0.0        # [ACTIVE] 0% (disabled; cost in commission)
     holding_period: 5      # [ACTIVE] days between rebalances: 1=daily, 5=weekly, 20=monthly
 
     # --- Unused keys ---

@@ -170,6 +170,9 @@ class FactorInfo:
     expression: str
     ic: float = 0.0
     icir: float = 0.0       # ICIR = IC / std(IC)，直接传入，不再动态计算
+    val_icir: float = 0.0  # Validation-period ICIR (holdout). When >0/non-NaN,
+                           # icir2_shrinkage uses |val_icir|² instead of |icir|²
+                           # for honest out-of-sample weighting (val_mode only).
     ic_std: float = 0.0     # 保留，向后兼容
     sharpe: float = 0.0
     debate_score: float = 0.0  # 0-10, from multi-agent debate
@@ -375,9 +378,19 @@ class FactorFusion:
             #             + Regime-Adaptive Tilt
             # ════════════════════════════════════════════════════════════
 
-            # 1. Sign-aware: extract IC sign, use |ICIR| for weighting
+            # 1. Sign-aware: extract IC sign, use |ICIR| for weighting.
+            #    Prefer validation-period ICIR (holdout) when available, so the
+            #    combining weight is estimated out-of-sample (honest, anti-overfit).
+            #    Falls back to training ICIR when val_icir is missing/NaN/zero.
             self._signs = _extract_signs()
-            icirs_abs = np.array([abs(f.icir) for f in factors])
+
+            def _effective_icir_abs(f: "FactorInfo") -> float:
+                vic = getattr(f, "val_icir", None)
+                if vic is not None and np.isfinite(vic) and abs(vic) > 1e-8:
+                    return abs(vic)
+                return abs(f.icir)
+
+            icirs_abs = np.array([_effective_icir_abs(f) for f in factors])
 
             # Edge case: all ICIRs are zero → equal weight
             if icirs_abs.sum() < 1e-8:

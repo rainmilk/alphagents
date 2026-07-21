@@ -21,7 +21,7 @@ Core methodology (from baselines/AlphaGrail/):
   3. LLM Tournament Selection: linear king-of-the-hill (sequential comparison)
      via LLM (GPT-4o) with full metric set, or quantitative fallback
   4. Portfolio Construction: top-N stocks by winning factor score, equal-weight
-  5. Backtest: unified BacktestEngine (commission=0.0003, slippage=0.001)
+  5. Backtest: unified BacktestEngine (commission=0.001, slippage=0.0)
 
 Data: main project DataLoader (NOT rqfactor/rqdatac)
 Backtest: unified BacktestEngine (same as all other baselines)
@@ -1416,8 +1416,8 @@ def run_alphagrail_baseline(
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
     engine = BacktestEngine(
-        commission=0.0003,
-        slippage=0.001,
+        commission=0.001,
+        slippage=0.0,
         risk_free_rate=0.0,
         holding_period=holding_period,
     )

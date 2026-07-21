@@ -745,11 +745,22 @@ class AAAI2027Pipeline:
             if isinstance(factor, dict):
                 expr = factor['expression']
                 desc = factor['description']
+                ic = factor.get('ic')
+                sharpe = factor.get('sharpe')
+                family = factor.get('family') or None
             else:
                 expr = factor.expression
                 desc = factor.description
+                # Thread the REAL backtest evidence + family label into the
+                # debate. Without these the experts score factors on narrative
+                # alone and the Chair cannot enforce family diversity — see
+                # methods/debate.py prompt changes.
+                ic = getattr(factor, 'ic', None)
+                sharpe = getattr(factor, 'sharpe', None)
+                family = getattr(factor, 'family', '') or None
 
-            proposal = FactorProposal(expression=expr, description=desc)
+            proposal = FactorProposal(expression=expr, description=desc,
+                                      ic=ic, sharpe=sharpe, family=family)
 
             result = self.debate_evaluator.evaluate(proposal)
             self.debate_results.append((factor, result))
@@ -840,11 +851,18 @@ class AAAI2027Pipeline:
             if isinstance(factor, dict):
                 expr = factor.get('expression', '')
                 desc = factor.get('description', '')
+                ic = factor.get('ic')
+                sharpe = factor.get('sharpe')
+                family = factor.get('family') or None
             else:
                 expr = getattr(factor, 'expression', '')
                 desc = getattr(factor, 'description', '')
+                ic = getattr(factor, 'ic', None)
+                sharpe = getattr(factor, 'sharpe', None)
+                family = getattr(factor, 'family', '') or None
 
-            proposal = FactorProposal(expression=expr, description=desc)
+            proposal = FactorProposal(expression=expr, description=desc,
+                                      ic=ic, sharpe=sharpe, family=family)
             proposals_and_results.append((proposal, result))
 
         # Call Chair synthesis (saves chair_synthesis.json + appends to debate_factors_result.json internally)
@@ -912,7 +930,8 @@ class AAAI2027Pipeline:
                 ic_val = getattr(f, 'ic', 0.0)
                 icir_val = getattr(f, 'icir', 0.0)
                 sharpe_val = getattr(f, 'sharpe', 0.0)
-                factor_meta_lookup[expr] = (ic_val, icir_val, sharpe_val)
+                val_icir_val = getattr(f, 'val_icir', 0.0)
+                factor_meta_lookup[expr] = (ic_val, icir_val, sharpe_val, val_icir_val)
 
         debate_score_map = {}
         if hasattr(self, 'debate_results') and self.debate_results:
@@ -935,7 +954,7 @@ class AAAI2027Pipeline:
 
             meta = factor_meta_lookup.get(name)
             if meta:
-                ic_val, icir_val, sharpe_val = meta
+                ic_val, icir_val, sharpe_val, val_icir_val = meta
                 if abs(icir_val) > 1e-8:
                     ic_std_val = ic_val / icir_val
                 else:
@@ -954,7 +973,7 @@ class AAAI2027Pipeline:
                 ic=ic_val, icir=icir_val, ic_std=ic_std_val,
                 sharpe=sharpe_val, debate_score=dscore,
                 ic_sign=ic_sign,
-                n_periods=n_periods,
+                n_periods=n_periods, val_icir=val_icir_val,
             ))
 
         # Save for step7 (which reads weights/signs from JSON, but still needs

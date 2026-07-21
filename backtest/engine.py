@@ -30,8 +30,8 @@ class BacktestEngine:
     
     def __init__(
         self,
-        commission: float = 0.0003,
-        slippage: float = 0.001,
+        commission: float = 0.001,
+        slippage: float = 0.0,
         benchmark: str = 'hs300',
         risk_free_rate: float = 0.0,
         holding_period: int = 1,
@@ -40,8 +40,8 @@ class BacktestEngine:
         Initialize backtest engine.
         
         Args:
-            commission: Trading commission rate (default: 0.03%)
-            slippage: Slippage rate (default: 0.1%)
+            commission: Trading commission rate (default: 0.1%)
+            slippage: Slippage rate (default: 0.0, disabled)
             benchmark: Benchmark index name
             risk_free_rate: Annualized risk-free rate for Sharpe ratio (default: 0.0)
             holding_period: Number of trading days to hold positions before rebalancing.

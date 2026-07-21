@@ -408,8 +408,8 @@ def run_xgboost_simple(
     prices_aligned = prices_aligned.reindex(columns=portfolios.columns)
 
     engine = BacktestEngine(
-        commission=0.0003,
-        slippage=0.001,
+        commission=0.001,
+        slippage=0.0,
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
