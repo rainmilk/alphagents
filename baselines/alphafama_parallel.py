@@ -14,26 +14,25 @@ from baselines.AlphaFAMA.src.alpha_functions import AlphaFactory
 
 
 def _compute_factors_chunk(ticker_groups):
-    """Compute Alpha101 exposures + forward returns for a *chunk* of tickers.
+    """Compute Alpha101 factor *exposures* for a *chunk* of tickers.
 
-    Runs inside a worker process under ProcessPoolExecutor. Returns
-    ``(ex_list, ret_list)`` with the same element structure as the original
-    serial loop. The per-ticker math is identical to the serial path — only
-    the scheduling is distributed, so numerical results are unchanged.
+    Runs inside a worker process under ProcessPoolExecutor. Returns ``ex_list``
+    — a list of per-ticker exposure frames — with the same element structure
+    as the original serial loop. The per-ticker math is identical to the
+    serial path; only the scheduling is distributed, so numerical results are
+    unchanged.
+
+    NOTE: the forward-return IC *target* (``returns``) is intentionally NOT
+    produced here anymore. It is computed once, unconditionally, in
+    ``run_alphafama.py`` Step 3 via ``_compute_returns`` — a single source of
+    truth shared by both the Alpha101-on and Alpha101-off paths. (Previously
+    this worker also built ``returns`` and leaked a spurious ``ticker`` column
+    into the frame; that divergence is now gone.)
     """
-    ex_list, ret_list = [], []
+    ex_list = []
     for ticker, grp in ticker_groups:
         alphas = AlphaFactory.all_alphas(grp)
         ex_list.append(
             pd.DataFrame(alphas, index=grp.index).assign(ticker=ticker)
         )
-        # IC TARGET must be the forward-period return so AlphaFAMA's Rank-IC is
-        # comparable to the other baselines. We keep the daily `returns` column
-        # intact for the Alpha101 feature inputs and use `forward_return` here.
-        # Rename to 'returns' so compute_ic_matrix (which reads ['returns']) works.
-        ret_list.append(
-            grp[["forward_return"]]
-            .rename(columns={"forward_return": "returns"})
-            .assign(ticker=ticker)
-        )
-    return ex_list, ret_list
+    return ex_list

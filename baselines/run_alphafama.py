@@ -695,7 +695,7 @@ def run_alphafama_baseline(
     output_dir: Optional[str] = None,
     use_llm: bool = True,
     use_alpha101: bool = False,
-    llm_iters: int = 10,
+    llm_iters: int = 5,
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
     n_jobs: Optional[int] = None,
@@ -826,11 +826,25 @@ def run_alphafama_baseline(
     print(f"  Converted: train={len(train_df)} rows, test={len(test_df)} rows, "
           f"MultiIndex (date, ticker)")
 
+    # ── Step 3: Compute forward-return IC target (both branches) ────────
+    # The Rank-IC target is the forward-period return, derived from the
+    # `forward_return` column produced in Step 2. It depends only on price —
+    # NOT on the Alpha101 library — so we compute it ONCE here, unconditionally,
+    # for both the Alpha101-on and Alpha101-off paths. This gives a single
+    # source of truth for the IC target (previously it was computed two
+    # different ways: inline in `_compute_factors` on the on-path, and via a
+    # separate `_compute_returns` on the off-path — a drift hazard, and the
+    # on-path version also leaked a spurious `ticker` column into the frame).
+    print("\n[Step 3] Computing forward-return IC target (train + test)...")
+    train_returns = _compute_returns(train_df)
+    test_returns = _compute_returns(test_df)
+    print(f"  IC target rows: train={len(train_returns)}, test={len(test_returns)}")
+
     # ── Step 4: Generate Alpha101 factors ──────────────────────────────
     if use_alpha101:
         print("\n[Step 4] Generating Alpha101 factors...")
-        train_exposures, train_returns = _compute_factors(train_df, n_jobs=n_jobs)
-        test_exposures, test_returns = _compute_factors(test_df, n_jobs=n_jobs)
+        train_exposures = _compute_factors(train_df, n_jobs=n_jobs)
+        test_exposures = _compute_factors(test_df, n_jobs=n_jobs)
 
         n_factors = len(train_exposures.columns)
         print(f"  Generated {n_factors} factors")
@@ -838,12 +852,11 @@ def run_alphafama_baseline(
         print("\n[Step 4] Alpha101 factors DISABLED — skipping all-Alpha101 "
               "computation (LLM will seed from the base formula library).")
         # Empty exposure frames keep the downstream merge / IC logic uniform.
-        # Returns are computed regardless (they only depend on price, not on
-        # Alpha101) so LLM-generated factors still have a valid IC target.
+        # train_returns / test_returns are already computed in Step 3 (they
+        # depend only on price, so LLM-generated factors still have a valid
+        # IC target).
         train_exposures = pd.DataFrame(index=train_df.index)
         test_exposures = pd.DataFrame(index=test_df.index)
-        train_returns = _compute_returns(train_df)
-        test_returns = _compute_returns(test_df)
         n_factors = 0
 
     # ── Step 5: Compute Rank-IC on training data ───────────────────────
@@ -1153,15 +1166,19 @@ from baselines.alphafama_parallel import _compute_factors_chunk
 def _compute_factors(
     df: pd.DataFrame,
     n_jobs: int = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Compute Alpha101 factor exposures for each ticker.
+    Compute Alpha101 factor *exposures* for each ticker.
 
     Each ticker's factor computation is fully independent, so we distribute
     tickers across worker processes for a near-linear speedup while keeping the
     numerical results *bit-identical* to the serial loop (the per-ticker
     computation is unchanged; only the scheduling differs). Falls back to the
     serial loop when parallelism is disabled or unavailable.
+
+    The forward-return IC *target* (``returns``) is NOT produced here — it is
+    computed once in Step 3 via ``_compute_returns`` so both the Alpha101-on
+    and Alpha101-off paths share a single source of truth.
 
     Args:
         df: AlphaFAMA-format DataFrame with MultiIndex (date, ticker).
@@ -1170,7 +1187,7 @@ def _compute_factors(
             ``ALPHAFAMA_N_JOBS``.
 
     Returns:
-        Tuple of (exposures_df, returns_df) with MultiIndex (date, ticker).
+        exposures_df with MultiIndex (date, ticker).
     """
     groups = list(df.groupby("ticker"))
 
@@ -1182,7 +1199,7 @@ def _compute_factors(
 
     # Serial path: explicitly disabled, single ticker, or nothing to split.
     if n_jobs <= 1 or len(groups) <= 1:
-        ex_list, ret_list = _compute_factors_chunk(groups)
+        ex_list = _compute_factors_chunk(groups)
     else:
         n_workers = max(1, min(n_jobs, len(groups)))
         # Contiguous chunks preserve ticker order across the final concat, so
@@ -1193,28 +1210,27 @@ def _compute_factors(
         try:
             with ProcessPoolExecutor(max_workers=n_workers) as ex:
                 results = list(ex.map(_compute_factors_chunk, chunks))
-            ex_list, ret_list = [], []
-            for cel, crl in results:
+            ex_list = []
+            for cel in results:
                 ex_list.extend(cel)
-                ret_list.extend(crl)
         except Exception as e:  # pragma: no cover - pool fallback safety
             logger.warning(
                 f"_compute_factors: parallel path failed ({e}); "
                 f"falling back to serial."
             )
-            ex_list, ret_list = _compute_factors_chunk(groups)
+            ex_list = _compute_factors_chunk(groups)
 
     exposures = pd.concat(ex_list)
-    returns = pd.concat(ret_list)
-    return exposures, returns
+    return exposures
 
 
 def _compute_returns(df: pd.DataFrame) -> pd.DataFrame:
     """Extract the forward-return IC target as a (date, ticker) frame.
 
-    Mirrors the returns slice produced inside ``_compute_factors_chunk`` but
-    without any Alpha101 factor computation. Used when Alpha101 factors are
-    disabled so the LLM-generated factors still have a valid Rank-IC target.
+    This is the SINGLE source of truth for the Rank-IC target, computed once
+    in Step 3 and shared by both the Alpha101-on and Alpha101-off paths. It
+    selects the ``forward_return`` column produced by Step 2's conversion and
+    renames it to ``returns`` (the name ``compute_ic_matrix`` reads).
     """
     ret_list = []
     for _ticker, grp in df.groupby("ticker"):
@@ -1383,14 +1399,14 @@ if __name__ == '__main__':
                         help='Enable LLM alpha-mining (default: enabled)')
     parser.add_argument('--no-llm', action='store_false', dest='use_llm',
                         help='Disable LLM alpha-mining')
-    parser.add_argument('--use-alpha101', action='store_true', default=False,
+    parser.add_argument('--use-alpha101', action='store_true', default=True,
                         help='Enable the 101 handcrafted Alpha101 factor '
                              'exposures as the starting pool (default: OFF — '
                              'LLM seeds from the base formula library only)')
     parser.add_argument('--no-alpha101', action='store_false', dest='use_alpha101',
                         help='Disable Alpha101 factors (default)')
-    parser.add_argument('--llm-iters', type=int, default=10,
-                        help='Number of LLM mining iterations (default: 10)')
+    parser.add_argument('--llm-iters', type=int, default=5,
+                        help='Number of LLM mining iterations (default: 5)')
     parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return horizon (trading days) for IC evaluation. '
                              'Defaults to config evolution.forward_period (10).')
