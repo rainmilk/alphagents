@@ -106,6 +106,20 @@ _GATE_FUNC_ALIASES = {
     'ts_roc':       'ts_pct_change',   # rate of change = pct change
     'ts_skewness': 'ts_skew', 'ts_kurtosis': 'ts_kurt',
 }
+
+# Canonical factor-DSL function whitelist injected into every LLM factor-generation
+# prompt (seed / memory-augmented / improve). This is the SINGLE SOURCE OF TRUTH:
+# the originality gate only accepts these names (plus the aliases in
+# _GATE_FUNC_ALIASES), so keeping prompts in sync with this set stops the LLM from
+# inventing unregistered names like ts_roc / ts_skewness / ts_kurtosis.
+_FUNCTION_WHITELIST_STR = (
+    "ALLOWED FUNCTIONS (use ONLY these exact names; any other function name is "
+    "rejected by the engine): "
+    + ", ".join(sorted(_GATE_ALLOWED_FUNCS))
+    + ". A few common aliases (e.g. ts_stddev, ts_average, ts_diff, ts_lag, "
+    "ts_pctchange) are auto-normalized, but prefer the exact names listed above."
+)
+
 # AST node types that count toward "structural size" (excludes Expression/Load
 # and bare operator singletons like ast.Add).
 _GATE_MEANINGFUL = (ast.Name, ast.Call, ast.Constant, ast.BinOp,
@@ -1888,29 +1902,8 @@ Supported data sources:
 - return / returns (1-day daily return; alias: close.pct_change(1))
 - vwap (volume-weighted average price = amount / volume)
 
-Supported functions (WorldQuant style):
-- rank(X): cross-sectional percentile rank [0, 1]
-- ts_rank(X, w): rolling time-series rank within window w
-- ts_corr(X, Y, w): rolling correlation between X and Y over window w
-- ts_cov(X, Y, w): rolling covariance between X and Y over window w
-- ts_mean(X, w): rolling mean over window w
-- ts_std(X, w): rolling standard deviation over window w (alias: ts_stddev)
-- ts_var(X, w): rolling variance over window w
-- ts_skew(X, w): rolling skewness over window w
-- ts_kurt(X, w): rolling kurtosis over window w
-- ts_min(X, w): rolling minimum over window w
-- ts_max(X, w): rolling maximum over window w
-- ts_sum(X, w): rolling sum over window w
-- ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
-- ts_pct_change(X, w): (X - delay(X, w)) / delay(X, w) (alias: ts_pctchange, pct_change)
-- ts_zscore(X, w): rolling z-score over window w
-- delay(X, d): lag by d periods (alias: ts_lag, lag)
-- sign(X): element-wise sign
-- abs(X): element-wise absolute value
-- log(X): element-wise natural log
-- sqrt(X): element-wise square root
+""" + _FUNCTION_WHITELIST_STR + """
 
-Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, cov, skew, kurt/kurtosis, ts_pctchange/pct_change are accepted as aliases.
 Supported operators: +, -, *, /, ^"""
 
         # Build JSON example once (shared by both branches)
@@ -2073,7 +2066,8 @@ Supported operators: +, -, *, /, ^"""
 
     def _generate_via_llm_with_prompt(self, user_prompt: str, n_factors: int) -> list[dict]:
         """Call LLM with a custom user_prompt (from MemoryAugmentedGenerator)."""
-        system_prompt = """You are a quantitative factor research expert specializing in A-share stock selection.
+        system_prompt = (
+            """You are a quantitative factor research expert specializing in A-share stock selection.
 Your task is to generate diverse, economically meaningful factor expressions for stock selection.
 
 Supported data sources:
@@ -2082,31 +2076,16 @@ Supported data sources:
 - return / returns (1-day daily return; alias: close.pct_change(1))
 - vwap (volume-weighted average price = amount / volume)
 
-Supported functions (WorldQuant style):
-- rank(X): cross-sectional percentile rank [0, 1]
-- ts_rank(X, w): rolling time-series rank within window w
-- ts_corr(X, Y, w): rolling correlation between X and Y over window w
-- ts_mean(X, w): rolling mean over window w (alias: ts_average, ts_avg)
-- ts_std(X, w): rolling standard deviation over window w (alias: ts_stddev)
-- ts_min(X, w): rolling minimum over window w
-- ts_max(X, w): rolling maximum over window w
-- ts_sum(X, w): rolling sum over window w
-- ts_delta(X, w): X - delay(X, w) (alias: ts_diff)
-- ts_pct_change(X, w): (X - delay(X, w)) / delay(X, w) (alias: ts_pctchange, pct_change)
-- ts_zscore(X, w): rolling z-score over window w
-- delay(X, d): lag by d periods (alias: ts_lag, lag)
-- sign(X): element-wise sign
-- abs(X): element-wise absolute value
-- log(X): element-wise natural log
-- sqrt(X): element-wise square root
-
-Note: ts_stddev, ts_average/ts_avg, ts_diff, ts_lag/lag, ts_pctchange/pct_change are accepted as aliases.
+"""
+            + _FUNCTION_WHITELIST_STR
+            + """
 
 Supported operators: +, -, *, /, ^
 
 Return a JSON object with a "factors" key, which is an array of objects.
 Each object must have "expression" and "description" keys.
 Ensure expressions are valid and can be evaluated by the factor engine."""
+        )
 
         resp = self._call_llm(
             system_prompt=system_prompt,
@@ -2499,6 +2478,8 @@ Supported operations for factor improvement:
 4. Cross-sectional ranking: Apply rank() to normalize signals
 5. Time-series operations: Use ts_zscore, ts_rank, ts_mean for robustness
 6. Fundamental integration: Combine price signals with pe, pb, roe, market_cap
+
+""" + _FUNCTION_WHITELIST_STR + """
 
 Guidelines:
 - Improvements should be non-trivial (not just changing window size by 1)

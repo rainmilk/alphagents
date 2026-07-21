@@ -91,7 +91,7 @@ llm:
   # Chair Agent — synthesizes debate results into ranked cross-factor report
   # Used by step5b_chair_synthesis (runs after step5_evaluate_factors)
   chair:
-    model: "glm-5.2"   # 当前与专家 evaluator 共用相同模型
+    model: "bailian/deepseek-v4-pro"   # 当前与专家 evaluator 共用相同模型
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.2  # 主席需要更确定性的输出
