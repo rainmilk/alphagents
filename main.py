@@ -1894,19 +1894,19 @@ Examples:
         help='Skip cache and re-download real data',
     )
     parser.add_argument(
-        '--train-start', type=str, default='2022-01-01',
+        '--train-start', type=str, default=None,
         help='Train start date (YYYY-MM-DD, default: 2022-01-01)',
     )
     parser.add_argument(
-        '--test-end', type=str, default='2024-12-31',
+        '--test-end', type=str, default=None,
         help='Test end date (YYYY-MM-DD, default: 2024-12-31)',
     )
     parser.add_argument(
-        '--train-end', type=str, default='2023-12-31',
+        '--train-end', type=str, default=None,
         help='Train end date (YYYY-MM-DD, default: 2023-12-31)',
     )
     parser.add_argument(
-        '--test-start', type=str, default='2024-01-01',
+        '--test-start', type=str, default=None,
         help='Test start date (YYYY-MM-DD, default: 2024-01-01)',
     )
     parser.add_argument(

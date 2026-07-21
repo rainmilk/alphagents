@@ -910,7 +910,7 @@ def stage1_mine_factors(
 
     if use_gan:
         # Use GAN-based mining
-        device = 'cuda:0' if False else 'cpu'  # Always CPU for safety
+        device = 'cuda:0' if True else 'cpu'  # Always CPU for safety
         factor_exprs, factor_rankics, gan_stats = gan_mine_factors(
             prices_multindex=prices_multindex,
             forward_returns=forward_returns,
@@ -1487,7 +1487,7 @@ def run_alphaforge_baseline(
             if test_end_date is None:
                 test_end_date = config['data'].get('test_end_date', '2025-12-31')
             if instruments is None:
-                instruments = config['data']['universe'].get('name', 'csi300')
+                instruments = config['data']['universe'].get('index', 'csi300')
             if top_n_stocks is None:
                 top_n_stocks = config.get('backtest', {}).get('top_n_stocks', 50)
         except Exception as e:
@@ -1594,6 +1594,7 @@ def run_alphaforge_baseline(
         top_n_stocks=top_n_stocks,
         forward_period=forward_period,
         holding_period=holding_period if holding_period is not None else 1,
+        window=20,
     )
     
     # Create output directory

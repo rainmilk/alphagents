@@ -652,8 +652,8 @@ def parse_args():
                         help='Output directory')
     parser.add_argument('--config', type=str, default='config/config.yaml',
                         help='Main project config path')
-    parser.add_argument('--train-start', type=str, default='2020-01-01')
-    parser.add_argument('--test-end', type=str, default='2023-12-31')
+    parser.add_argument('--train-start', type=str, default=None)
+    parser.add_argument('--test-end', type=str, default=None)
     parser.add_argument('--train-end', type=str, default=None,
                         help='Last training (IS) date YYYY-MM-DD (default: config train_end_date)')
     parser.add_argument('--test-start', type=str, default=None,
