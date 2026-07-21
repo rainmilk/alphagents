@@ -80,7 +80,7 @@ llm:
     
   # Multi-agent debate evaluation → used by step5_evaluate_factors
   evaluator:
-    model: "tencent/Hunyuan-A13B-Instruct"
+    model: "deepseek-reasoner"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.3
@@ -101,10 +101,13 @@ llm:
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
-  n_seeds: 30          # [ACTIVE] number of candidate factors per round
-  n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
+  n_seeds_hypothesis: 25        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  n_seeds_single_stage: 25       # [ACTIVE] plain single-stage seed factors
+  n_seeds_memory_augment: 25     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
+  n_best_factors: 35   # [ACTIVE] top-N factors to retain per round
   max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
-  n_improve: 10        # [ACTIVE] target number of improved factors per round (LLM generation)
+  n_improve: 25        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
   convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
   convergence_window: 2     # [ACTIVE] number of recent rounds to check for convergence
@@ -118,8 +121,6 @@ evolution:
   dedup_similarity: 0.90    # [ACTIVE] canonical-signature similarity above which a factor is treated as a near-duplicate of an accepted one
   improve_temperature: 0.3  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Low = refinement, high = re-sampling. The old 0.8 was causing diversity collapse (every round was a fresh lottery, not incremental improvement).
   elitism_carry: 2          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
-  seed_hypothesis_driven: true  # [ACTIVE] Stage1→Stage2 hypothesis-driven seed generation (Stage1: LLM proposes market hypotheses; Stage2: factors express hypotheses). Set to false to use old single-stage prompt.
-  seed_hypothesis_ratio: 0.5   # [ACTIVE] fraction of seed factors that are hypothesis-driven (only used when seed_hypothesis_driven=true). 0.5 = half-half, 1.0 = all hypothesis (legacy), 0.0 = all single-stage.
 
 # ==================== Memory Bank Configuration ====================
 memory:

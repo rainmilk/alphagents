@@ -103,6 +103,7 @@ _GATE_FUNC_ALIASES = {
     'max': 'ts_max', 'min': 'ts_min', 'mean': 'ts_mean', 'sum': 'ts_sum',
     'ts_pctchange': 'ts_pct_change', 'pct_change': 'ts_pct_change',
     'ts_pctchg': 'ts_pct_change',
+    'ts_skewness': 'ts_skew', 'ts_kurtosis': 'ts_kurt',
 }
 # AST node types that count toward "structural size" (excludes Expression/Load
 # and bare operator singletons like ast.Add).
@@ -291,6 +292,7 @@ _TOKEN_RE = re.compile(
     r'(?P<number>\d+\.?\d*(?:[eE][+-]?\d+)?)'  # number
     r'|(?P<ident>[a-zA-Z_]\w*)'                   # identifier / function name
     r'|(?P<cmp>[<>!=]=|[<>!=])'                   # comparison operators: >=, <=, ==, !=, >, <, !
+    r'|(?P<pow>\*\*)'                             # power operator (**) — must precede `op`
     r'|(?P<op>[+\-*/^])'                          # arithmetic operator
     r'|(?P<paren>[()])'                            # parentheses
     r'|(?P<comma>,)'                               # comma
@@ -316,6 +318,8 @@ def _tokenize(expr: str) -> List[tuple]:
             tokens.append(('IDENT', value))
         elif kind == 'cmp':
             tokens.append(('CMP', value))
+        elif kind == 'pow':
+            tokens.append(('POWER', '**'))
         elif kind == 'op':
             tokens.append(('OP', value))
         elif kind == 'paren':
@@ -364,7 +368,7 @@ class _FactorExprEvaluator:
         log(X)           — element-wise natural log
         sqrt(X)          — element-wise square root (clamped >= 0)
 
-    Operators: +, -, *, /, ^ (power)
+    Operators: +, -, *, /, ^ and ** (power)
     """
 
     def __init__(self, data_map: Dict[str, pd.DataFrame]):
@@ -451,15 +455,34 @@ class _FactorExprEvaluator:
                 left = (left != right).astype(float)
         return left
     def _parse_term(self) -> pd.DataFrame:
-        """term := factor (('*' | '/') factor)*"""
-        left = self._parse_unary()
+        """term := power (('*' | '/') power)*"""
+        left = self._parse_power()
         while self._peek()[0] == 'OP' and self._peek()[1] in ('*', '/'):
             op = self._advance()[1]
-            right = self._parse_unary()
+            right = self._parse_power()
             if op == '*':
                 left = left * right
             else:
                 left = left / right.replace(0, np.nan)
+        return left
+
+    def _parse_power(self) -> pd.DataFrame:
+        """power := unary (('^' | '**') unary)*   (left-associative exponentiation)
+
+        Both `^` and `**` are the power operator (documented in the class
+        docstring). It binds tighter than `*` / `/`, so `a * b ^ 2` parses as
+        `a * (b ^ 2)` — which is what LLM-generated expressions like
+        `sqrt(1 - ts_corr(x, y, w)^2)` need. Previously the `^` token was
+        recognized by the tokenizer but never consumed by any parse rule, so it
+        leaked up and raised "Expected PAREN()), got ('OP', '^')" at the
+        enclosing `)`. `**` was likewise mis-lexed as two `*` operators.
+        """
+        left = self._parse_unary()
+        while (self._peek()[0] == 'OP' and self._peek()[1] == '^') or \
+              (self._peek()[0] == 'POWER' and self._peek()[1] == '**'):
+            self._advance()
+            right = self._parse_unary()
+            left = left ** right
         return left
 
     def _parse_unary(self) -> pd.DataFrame:
@@ -568,6 +591,9 @@ class _FactorExprEvaluator:
         'ts_pctchange': 'ts_pct_change',   # AlphaForge canonical spelling
         'pct_change':   'ts_pct_change',   # pandas naming
         'ts_pctchg':    'ts_pct_change',
+        # longer "statistics" spellings the LLM sometimes emits
+        'ts_skewness':  'ts_skew',
+        'ts_kurtosis':  'ts_kurt',
     }
 
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
@@ -1191,7 +1217,9 @@ class SelfEvolvingGenerator:
     def __init__(
         self,
         llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
-        n_seeds: int = 20,
+        n_seeds_hypothesis: int = 0,
+        n_seeds_single_stage: int = 20,
+        n_seeds_memory_augment: int = 0,
         n_best_factors: int = 10,
         n_improve: int = 10,
         n_mutate: int = 5,
@@ -1206,8 +1234,6 @@ class SelfEvolvingGenerator:
         dedup_similarity: float = 0.90,
         improve_temperature: float = 0.3,
         elitism_carry: int = 2,
-        seed_hypothesis_driven: bool = False,
-        seed_hypothesis_ratio: float = 1.0,
         parallel: bool = True,
         api_key: str = "",
         base_url: str = "http://180.163.156.38:53000/v1",
@@ -1217,7 +1243,17 @@ class SelfEvolvingGenerator:
         
         Args:
             llm_model: LLM model to use
-            n_seeds: Number of seed factors to generate
+            n_seeds_hypothesis: Target number of **hypothesis-driven** seed factors
+                (Stage1→Stage2: LLM proposes market hypotheses, then factors
+                expressing them). Produced whenever ``n_seeds_hypothesis > 0``
+                (no separate master flag needed). 0 = none.
+            n_seeds_single_stage: Target number of **plain single-stage** seed
+                factors (the legacy 撒网式 coverage prompt, no hypothesis). 0 = none.
+            n_seeds_memory_augment: Target number of **memory-augmented** seed
+                factors. Consumed by ``MemoryAugmentedGenerator`` (few-shot
+                examples from the memory bank). 0 = memory augmentation off.
+                Splitting the old single ``n_seeds`` into these three lets you
+                control each seed *source* independently.
             n_best_factors: Number of top factors to select per round and final output
             n_improve: Target number of improved factors to generate per round
             n_mutate: Number of mutation variations per top factor (rule-based fallback)
@@ -1239,16 +1275,8 @@ class SelfEvolvingGenerator:
                 (NOT seed generation). Low (0.3) = focused refinement of input;
                 high (>0.7) = near-random re-sampling that collapses diversity.
             elitism_carry: Number of top factors carried forward unmutated from the
-                previous round. Prevents "full replacement" collapse where the
+                previous round. Prevents full-replacement collapse where the
                 entire pool re-converges to a single direction each round.
-            seed_hypothesis_driven: Enable Stage1→Stage2 hypothesis-driven seed
-                generation. Stage1 generates 3-5 market hypotheses; Stage2 builds
-                factors expressing them. Falls back to old single-stage prompt if
-                disabled or Stage1 fails.
-            seed_hypothesis_ratio: Fraction of seed factors that should be
-                hypothesis-driven (only used when seed_hypothesis_driven=True).
-                1.0 = all hypothesis (legacy behavior), 0.0 = all single-stage,
-                0.5 = half hypothesis-driven / half single-stage.
             parallel: If False, evaluate factors serially (easier to debug)
             originality_gate: Enable the static AST originality gate (structural
                 dedup + triviality/semantics checks) before factors enter the pool.
@@ -1259,7 +1287,9 @@ class SelfEvolvingGenerator:
             base_url: API base URL
         """
         self.llm_model = llm_model
-        self.n_seeds = n_seeds
+        self.n_seeds_hypothesis = n_seeds_hypothesis
+        self.n_seeds_single_stage = n_seeds_single_stage
+        self.n_seeds_memory_augment = n_seeds_memory_augment
         self.n_best_factors = n_best_factors
         self.n_improve = n_improve
         self.n_mutate = n_mutate
@@ -1272,8 +1302,6 @@ class SelfEvolvingGenerator:
         self.min_val_ic = min_val_ic
         self.improve_temperature = improve_temperature
         self.elitism_carry = elitism_carry
-        self.seed_hypothesis_driven = seed_hypothesis_driven
-        self.seed_hypothesis_ratio = float(seed_hypothesis_ratio)
         self.parallel = parallel
 
         # Static AST originality gate (structural dedup + triviality + semantics)
@@ -1727,162 +1755,112 @@ class SelfEvolvingGenerator:
 
     def generate_seed_factors(self) -> List['CandidateFactor']:
         """
-        Generate seed factors using LLM with hypothesis-driven generation.
+        Generate seed factors from the three explicit sources.
 
-        Stage 1: LLM proposes 3-5 distinct market hypotheses.
-        Stage 2: LLM generates factors that express those hypotheses (replaces
-        the old "撒网式覆盖五大类" prompt with thesis-driven factor construction).
-        Falls back to the old single-stage prompt if Stage 1 fails.
-        Falls back to rule-based generation if LLM is unavailable.
+        The three counts set in ``__init__`` are independent and control each
+        seed *source* directly (no implicit ratio / cross-fill):
+
+        * ``n_seeds_hypothesis``      → Stage1→Stage2 hypothesis-driven factors.
+          Produced whenever ``n_seeds_hypothesis > 0``.
+        * ``n_seeds_single_stage``   → plain single-stage (撒网式) factors.
+        * ``n_seeds_memory_augment``  → memory-augmented factors. These are NOT
+          generated here; ``main.py`` feeds this count to
+          ``MemoryAugmentedGenerator`` and concatenates the result. (We only
+          report the target here for logging.)
+
+        Because the counts are explicit, if the hypothesis pipeline under-
+        delivers we do NOT silently re-fill those slots from single-stage — the
+        produced numbers reflect exactly what was requested. Each subset still
+        best-effort tops up its OWN count if the LLM under-delivers a single call.
+        Falls back to rule-based generation (filling the requested total) only
+        when the LLM is entirely unavailable.
         """
-        n_factors = self.n_seeds
-        print(f"Generating {n_factors} seed factors...")
+        n_hyp_target = self.n_seeds_hypothesis
+        n_plain_target = self.n_seeds_single_stage
+        n_mem_target = self.n_seeds_memory_augment
+        print(f"Generating seed factors — hypothesis: {n_hyp_target}, "
+              f"single-stage: {n_plain_target}, memory-augment(target): {n_mem_target}")
 
-        if self.use_llm and self.client:
-            # ── Mixed hypothesis / non-hypothesis split ──
-            # seed_hypothesis_ratio = fraction of seed factors that should be
-            # hypothesis-driven. Only meaningful when seed_hypothesis_driven is
-            # enabled. 1.0 = all hypothesis (legacy), 0.0 = all single-stage,
-            # 0.5 = half-half. For any fractional ratio we generate the two
-            # subsets independently and concatenate (hypothesis first).
-            ratio = self.seed_hypothesis_ratio
-            if self.seed_hypothesis_driven and 0.0 < ratio < 1.0:
-                return self._generate_mixed_seed_factors(n_factors, ratio)
-
-            if self.seed_hypothesis_driven:
-                # ── Stage 1: Generate market hypotheses ──
-                hypotheses = self._llm_generate_hypotheses(
-                    n_hypotheses=min(5, max(3, n_factors // 3)),
-                )
-
-                if hypotheses:
-                    # ── Stage 2: Generate factors per hypothesis ──
-                    factors_per_hypothesis = max(2, n_factors // len(hypotheses))
-                    all_factors: List[CandidateFactor] = []
-                    for i, h in enumerate(hypotheses):
-                        try:
-                            batch = self._generate_factors_via_llm(
-                                factors_per_hypothesis, hypothesis=h,
-                            )
-                            if batch:
-                                # Tag description with hypothesis index for traceability
-                                for f in batch:
-                                    if not f.description.startswith(f"[H{i+1}]"):
-                                        f.description = f"[H{i+1}] {f.description}"
-                                all_factors.extend(batch)
-                        except Exception as e:
-                            print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
-
-                    if all_factors:
-                        result = all_factors[:n_factors]
-                        print(f"Generated {len(result)} seed factors via hypothesis-driven pipeline "
-                              f"({len(hypotheses)} hypotheses, {len(all_factors)} raw)")
-                        return result
-
-                print("  [hypothesis] Stage 1 failed or produced no usable factors; "
-                      "falling back to single-stage seed generation.")
-
-            # ── Single-stage generation ──
-            # Runs as the primary path when hypothesis-driven is OFF, or as the
-            # fallback when Stage 1/2 produced nothing usable.
-            try:
-                seed_factors = self._generate_factors_via_llm(n_factors)
-                if seed_factors and len(seed_factors) >= 1:
-                    result = seed_factors[:n_factors]
-                    print(f"Generated {len(result)} seed factors via LLM (single-stage)")
-                    return result
-            except Exception as e:
-                print(f"  [evolve] LLM factor generation failed: {e}")
-
-        # ── Fallback: rule-based generation ──
-        print(f"  [evolve] Using rule-based factor generation.")
-        return self._generate_factors_rule_based(n_factors)
-    
-    def _generate_mixed_seed_factors(
-        self, n_factors: int, ratio: float
-    ) -> List['CandidateFactor']:
-        """
-        Generate ``n_factors`` seed factors split between the two pipelines.
-
-        ``ratio`` is the fraction that should be hypothesis-driven. Up to
-        ``round(n_factors * ratio)`` factors are produced via the hypothesis
-        pipeline (each tagged ``[H*]`` for traceability); the remainder is
-        filled by the plain single-stage prompt so the TOTAL always reaches
-        ``n_factors``. The ratio is best-effort — if the LLM delivers fewer
-        hypothesis factors than targeted, single-stage tops up the gap.
-
-        If the hypothesis pipeline yields nothing usable, the entire batch is
-        produced by the single-stage pipeline.
-
-        Args:
-            n_factors: Total number of seed factors to produce.
-            ratio: Fraction (0.0–1.0) that should be hypothesis-driven.
-
-        Returns:
-            List of exactly ``n_factors`` candidate factors (or fewer only if
-            both pipelines fail).
-        """
-        n_hyp = int(round(n_factors * ratio))
-        n_plain = n_factors - n_hyp
-        print(f"  [mixed] {n_hyp}/{n_factors} hypothesis-driven, "
-              f"{n_plain}/{n_factors} single-stage (ratio={ratio})")
-
-        hyp_factors: List[CandidateFactor] = []
-        plain_factors: List[CandidateFactor] = []
+        if not (self.use_llm and self.client):
+            # LLM unavailable → rule-based fills the local (non-memory) total.
+            total = n_hyp_target + n_plain_target
+            print(f"  [evolve] LLM unavailable -> rule-based generation of {total}.")
+            return self._generate_factors_rule_based(total)
 
         # ── Hypothesis-driven subset ──
-        if n_hyp > 0:
-            hypotheses = self._llm_generate_hypotheses(
-                n_hypotheses=min(5, max(3, n_hyp // 3)),
-            )
-            if hypotheses:
-                factors_per_hypothesis = max(1, n_hyp // len(hypotheses))
-                for i, h in enumerate(hypotheses):
-                    try:
-                        batch = self._generate_factors_via_llm(
-                            factors_per_hypothesis, hypothesis=h,
-                        )
-                        if batch:
-                            for f in batch:
-                                if not f.description.startswith(f"[H{i+1}]"):
-                                    f.description = f"[H{i+1}] {f.description}"
-                            hyp_factors.extend(batch)
-                    except Exception as e:
-                        print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
+        hyp_factors: List[CandidateFactor] = []
+        if n_hyp_target > 0:
+            hyp_factors = self._generate_hypothesis_factors(n_hyp_target)
+            print(f"  Generated {len(hyp_factors)}/{n_hyp_target} "
+                  f"hypothesis-driven seed factors")
             if not hyp_factors:
-                print("  [mixed] hypothesis pipeline yielded nothing; "
-                      "routing its share to single-stage")
-                n_hyp = 0
+                print("  [hypothesis] pipeline yielded nothing (those seeds dropped "
+                      "— not backfilled from single-stage to keep counts explicit)")
 
-        # ── Single-stage fill ──
-        # Keep at most n_hyp hypothesis-driven factors, then fill the remaining
-        # gap with single-stage generation so the TOTAL always reaches
-        # n_factors (the "half-half" ratio is best-effort: if the LLM delivers
-        # fewer hypothesis factors than n_hyp, single-stage tops up the rest).
-        hyp_kept = hyp_factors[:n_hyp]
-        need = n_factors - len(hyp_kept)
+        # ── Single-stage subset ──
         plain_factors: List[CandidateFactor] = []
-        if need > 0:
-            try:
-                plain = self._generate_factors_via_llm(need)
-                if plain:
-                    plain_factors = plain[:need]
-            except Exception as e:
-                print(f"  [evolve] single-stage generation failed: {e}")
-            # If single-stage also under-delivered, try one more top-up call.
-            if len(plain_factors) < need:
-                try:
-                    extra = self._generate_factors_via_llm(need - len(plain_factors))
-                    if extra:
-                        plain_factors.extend(extra[: need - len(plain_factors)])
-                except Exception as e:
-                    print(f"  [evolve] single-stage top-up failed: {e}")
+        if n_plain_target > 0:
+            plain_factors = self._generate_single_stage_factors(n_plain_target)
+            print(f"  Generated {len(plain_factors)}/{n_plain_target} "
+                  f"single-stage seed factors")
 
-        # Hypothesis-driven first, then single-stage; trim to exactly n_factors.
-        result = (hyp_kept + plain_factors)[:n_factors]
-        print(f"  [mixed] generated {len(result)} seed factors "
-              f"({len(hyp_kept)} hypothesis-driven, {len(plain_factors)} single-stage)")
+        # Hypothesis first, then single-stage. No trimming to a shared total —
+        # the two counts are independent by design.
+        result = hyp_factors + plain_factors
+        print(f"Generated {len(result)} seed factors locally "
+              f"({len(hyp_factors)} hypothesis-driven, {len(plain_factors)} single-stage). "
+              f"Memory-augmented seeds (target {n_mem_target}) are added by the caller.")
         return result
+
+    def _generate_hypothesis_factors(self, n_hyp: int) -> List['CandidateFactor']:
+        """
+        Stage1→Stage2 hypothesis-driven generation, targeting ``n_hyp`` factors.
+
+        Stage 1: LLM proposes 3-5 distinct market hypotheses.
+        Stage 2: LLM generates factors expressing each hypothesis (thesis-driven
+        construction, replacing the old category-coverage prompt). Each factor is
+        tagged ``[H*]`` in its description for traceability.
+        """
+        if n_hyp <= 0:
+            return []
+        hypotheses = self._llm_generate_hypotheses(
+            n_hypotheses=min(5, max(3, n_hyp // 3)),
+        )
+        if not hypotheses:
+            return []
+        factors_per_hypothesis = max(1, n_hyp // len(hypotheses))
+        all_factors: List[CandidateFactor] = []
+        for i, h in enumerate(hypotheses):
+            try:
+                batch = self._generate_factors_via_llm(
+                    factors_per_hypothesis, hypothesis=h,
+                )
+                if batch:
+                    for f in batch:
+                        if not f.description.startswith(f"[H{i+1}]"):
+                            f.description = f"[H{i+1}] {f.description}"
+                    all_factors.extend(batch)
+            except Exception as e:
+                print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
+        return all_factors[:n_hyp]
+
+    def _generate_single_stage_factors(self, n_plain: int) -> List[CandidateFactor]:
+        """
+        Plain single-stage (撒网式) generation, targeting ``n_plain`` factors.
+
+        Best-effort: makes a primary LLM call for ``n_plain`` factors, then a
+        single top-up call if the first under-delivered. Returns whatever was
+        produced (may be fewer than ``n_plain`` only if the LLM keeps failing).
+        """
+        if n_plain <= 0:
+            return []
+        try:
+            seed_factors = self._generate_factors_via_llm(n_plain)
+            if seed_factors and len(seed_factors) >= 1:
+                return seed_factors[:n_plain]
+        except Exception as e:
+            print(f"  [evolve] single-stage generation failed: {e}")
+        return []
 
     def _generate_factors_via_llm(self, n_factors: int, hypothesis: Optional[str] = None) -> List[CandidateFactor]:
         """
@@ -2072,13 +2050,14 @@ Supported operators: +, -, *, /, ^"""
         Parameters
         ----------
         prompt : str, augmented prompt with few-shot examples from memory bank
-        n_factors : int, number of factors to generate (default: self.n_seeds)
+        n_factors : int, number of factors to generate
+            (default: self.n_seeds_memory_augment)
 
         Returns
         -------
         list[dict], each with "expression" and "description" keys
         """
-        n = n_factors or self.n_seeds
+        n = n_factors if n_factors is not None else self.n_seeds_memory_augment
 
         if self.use_llm and self.client:
             try:

@@ -363,28 +363,37 @@ class AAAI2027Pipeline:
         
     def step3_generate_factors(
         self,
-        use_memory: bool = True,
     ):
         """
         Step 3: Generate factors using LLM.
 
         The number of factors is read from config: evolution.n_seed_factors
-        
-        Args:
-            use_memory: Whether to use memory-augmented generation
+
+        Memory augmentation is enabled implicitly when ``n_seeds_memory_augment > 0``
+        (read from config) AND the memory bank has at least one entry. Set the
+        count to 0 to skip memory augmentation entirely — no separate boolean flag
+        needed.
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 3] Skipped: methods modules not available")
             return
         
-        n_seeds = self.config['evolution']['n_seeds']
-        print(f"\n[Step 3] Generating {n_seeds} seed factors...")
+        evo_cfg = self.config['evolution']
+        n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
+        n_seeds_single_stage = evo_cfg.get('n_seeds_single_stage', 0)
+        n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
+        n_shots = evo_cfg.get('n_shots', 3)
+        print(f"\n[Step 3] Generating seed factors — "
+              f"hypothesis: {n_seeds_hypothesis}, "
+              f"single-stage: {n_seeds_single_stage}, "
+              f"memory-augment: {n_seeds_memory_augment}")
         
         # Initialize evolving generator
-        evo_cfg = self.config['evolution']
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
-            n_seeds=n_seeds,
+            n_seeds_hypothesis=n_seeds_hypothesis,
+            n_seeds_single_stage=n_seeds_single_stage,
+            n_seeds_memory_augment=n_seeds_memory_augment,
             n_best_factors=evo_cfg['n_best_factors'],
             n_improve=evo_cfg.get('n_improve', 10),
             n_mutate=evo_cfg.get('n_mutate', 5),
@@ -399,20 +408,21 @@ class AAAI2027Pipeline:
             dedup_similarity=evo_cfg.get('dedup_similarity', 0.90),
             improve_temperature=evo_cfg.get('improve_temperature', 0.3),
             elitism_carry=evo_cfg.get('elitism_carry', 2),
-            seed_hypothesis_driven=evo_cfg.get('seed_hypothesis_driven', False),
-            seed_hypothesis_ratio=evo_cfg.get('seed_hypothesis_ratio', 1.0),
         )
         
         # Generate seed factors
         seed_factors = self.evolving_generator.generate_seed_factors()
         
-        # If memory is available, augment generation
-        if use_memory and self.memory_bank is not None and len(self.memory_bank) > 0:
-            print("  Using memory-augmented generation...")
+        # If memory-augment seeds are requested AND the memory bank has entries,
+        # augment via few-shot retrieval. Enabled purely by n_seeds_memory_augment > 0.
+        if (n_seeds_memory_augment > 0
+                and self.memory_bank is not None and len(self.memory_bank) > 0):
+            print(f"  Using memory-augmented generation (target {n_seeds_memory_augment}, few-shot n_shots={n_shots})...")
             memory_generator = MemoryAugmentedGenerator(
                 base_generator=self.evolving_generator,
                 memory_bank=self.memory_bank,
                 encoder=self.market_encoder,
+                n_shots=n_shots,
             )
             # Use memory-augmented generator to produce factors with
             # few-shot examples retrieved from the memory bank
@@ -422,7 +432,7 @@ class AAAI2027Pipeline:
                 market_close = close_source.mean(axis=1)
                 market_df = pd.DataFrame({'close': market_close})
                 augmented_factors = memory_generator.generate(
-                    task_description=f"Generate {n_seeds} alpha factors for A-share stock selection",
+                    task_description=f"Generate {n_seeds_memory_augment} alpha factors for A-share stock selection",
                     retrieval_query=(
                         "quality factor with stable profitability and ROE, "
                         "value reversal factor using valuation metrics like PE and PB, "
@@ -431,6 +441,7 @@ class AAAI2027Pipeline:
                         "liquidity factor for small-cap premium"
                     ),
                     price_df=market_df,
+                    n_factors=n_seeds_memory_augment,
                 )
                 if augmented_factors:
                     # Convert dict results to CandidateFactor objects
@@ -446,12 +457,20 @@ class AAAI2027Pipeline:
                     ]
                     self.generated_factors = seed_factors + aug_factor_objs
                     print(f"  Memory-augmented generation: {len(aug_factor_objs)} additional factors")
+                else:
+                    self.generated_factors = seed_factors
             except Exception as e:
                 print(f"  Memory augmentation skipped: {e}")
                 self.generated_factors = seed_factors
         else:
+            if n_seeds_memory_augment == 0:
+                print("  Memory augmentation skipped (n_seeds_memory_augment=0).")
+            elif self.memory_bank is None or len(self.memory_bank) == 0:
+                print("  Memory augmentation skipped (memory bank empty).")
             self.generated_factors = seed_factors
-        print(f"  Generated {len(seed_factors)} seed factors")
+        print(f"  Total generated factors: {len(self.generated_factors)} "
+              f"({len(seed_factors)} base + "
+              f"{len(self.generated_factors) - len(seed_factors)} memory-augmented)")
         print("  [✓] Factor generation complete")
         
     def _split_train_val(self, train_data: dict, val_ratio: float):
@@ -1897,7 +1916,24 @@ Examples:
     )
     parser.add_argument(
         '--n-seeds', type=int, default=None,
-        help='Override llm.generator.n_seeds from config (default: use config value)',
+        help='[legacy] Convenience: sets n_seeds_single_stage (single-stage seed '
+             'count). Prefer the three explicit flags below for full control.',
+    )
+    parser.add_argument(
+        '--n-seeds-hypothesis', type=int, default=None,
+        help='Number of hypothesis-driven seed factors (default: config value)',
+    )
+    parser.add_argument(
+        '--n-seeds-single-stage', type=int, default=None,
+        help='Number of plain single-stage seed factors (default: config value)',
+    )
+    parser.add_argument(
+        '--n-seeds-memory-augment', type=int, default=None,
+        help='Number of memory-augmented seed factors (default: config value)',
+    )
+    parser.add_argument(
+        '--n-shots', type=int, default=None,
+        help='Few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (default: config value)',
     )
     parser.add_argument(
         '--n-evolution-rounds', type=int, default=5,
@@ -1944,8 +1980,18 @@ Examples:
         pipeline = AAAI2027Pipeline(config_path=args.config)
         
         # Apply CLI overrides to config
+        evo_overrides = pipeline.config['evolution']
+        if args.n_seeds_hypothesis is not None:
+            evo_overrides['n_seeds_hypothesis'] = args.n_seeds_hypothesis
+        if args.n_seeds_single_stage is not None:
+            evo_overrides['n_seeds_single_stage'] = args.n_seeds_single_stage
+        if args.n_seeds_memory_augment is not None:
+            evo_overrides['n_seeds_memory_augment'] = args.n_seeds_memory_augment
+        if args.n_shots is not None:
+            evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:
-            pipeline.config['evolution']['n_seeds'] = args.n_seeds
+            # Legacy convenience: single-stage seed count.
+            evo_overrides['n_seeds_single_stage'] = args.n_seeds
         if args.n_evolution_rounds != 5:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:

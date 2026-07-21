@@ -995,6 +995,10 @@ class MemoryAugmentedGenerator:
     将其作为 few-shot 示例注入 prompt，实现状态感知的 warm-start 生成。
 
     这是论文 Figure 3 的核心流程图组件。
+
+    Note: ``n_shots`` 控制注入 LLM prompt 的 few-shot 示例条数，
+    与 ``memory.retrieval.top_k``（config，用于 main.py 的因子池合并步骤）
+    相互独立，请勿混淆。
     """
 
     def __init__(
@@ -1002,7 +1006,7 @@ class MemoryAugmentedGenerator:
         base_generator: object,  # 基础生成器（如 evolve.py 中的 SelfEvolvingGenerator）
         memory_bank: FactorMemoryBank,
         encoder: MarketStateEncoder,
-        n_shots: int = 3,
+        n_shots: int = 5,
     ):
         self.base_generator = base_generator
         self.memory_bank = memory_bank
