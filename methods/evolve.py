@@ -103,6 +103,7 @@ _GATE_FUNC_ALIASES = {
     'max': 'ts_max', 'min': 'ts_min', 'mean': 'ts_mean', 'sum': 'ts_sum',
     'ts_pctchange': 'ts_pct_change', 'pct_change': 'ts_pct_change',
     'ts_pctchg': 'ts_pct_change',
+    'ts_roc':       'ts_pct_change',   # rate of change = pct change
     'ts_skewness': 'ts_skew', 'ts_kurtosis': 'ts_kurt',
 }
 # AST node types that count toward "structural size" (excludes Expression/Load
@@ -594,6 +595,7 @@ class _FactorExprEvaluator:
         # longer "statistics" spellings the LLM sometimes emits
         'ts_skewness':  'ts_skew',
         'ts_kurtosis':  'ts_kurt',
+        'ts_roc':       'ts_pct_change',   # rate of change = pct change
     }
 
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:

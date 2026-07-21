@@ -80,7 +80,7 @@ llm:
     
   # Multi-agent debate evaluation → used by step5_evaluate_factors
   evaluator:
-    model: "deepseek-reasoner"
+    model: "tencent/Hunyuan-A13B-Instruct"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.3
