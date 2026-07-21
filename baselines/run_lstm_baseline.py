@@ -760,7 +760,7 @@ if __name__ == '__main__':
                         help='Mini-batch size')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate')
-    parser.add_argument('--holding-period', type=int, default=1,
+    parser.add_argument('--holding-period', type=int, default=None,
                         help='Holding period (1=daily, 5=weekly)')
     parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return period in days (default: config evolution.forward_period, 10)')

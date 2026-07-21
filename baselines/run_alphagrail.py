@@ -1536,11 +1536,11 @@ if __name__ == '__main__':
                         help='Test start date (YYYY-MM-DD)')
     parser.add_argument('--top-n', type=int, default=50,
                         help='Number of stocks in portfolio')
-    parser.add_argument('--holding-period', type=int, default=1,
+    parser.add_argument('--holding-period', type=int, default=None,
                         help='Rebalance frequency (1=daily, 5=weekly)')
     parser.add_argument('--use-llm', action='store_true',
                         help='Use LLM for tournament (needs OpenAI API key)')
-    parser.add_argument('--forward-period', type=int, default=10,
+    parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return period in days (should match MASE forward_period)')
     parser.add_argument('--n-quantiles', type=int, default=5,
                         help='Number of quantile groups for group return analysis')

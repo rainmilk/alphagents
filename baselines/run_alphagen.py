@@ -1757,7 +1757,7 @@ if __name__ == '__main__':
                         help='Discount factor (1.0 = no discount)')
     parser.add_argument('--ent-coef', type=float, default=0.01,
                         help='Entropy coefficient')
-    parser.add_argument('--device', default='cpu',
+    parser.add_argument('--device', default='cuda',
                         choices=['cpu', 'cuda', 'auto'],
                         help='Device for RL training')
     parser.add_argument('--forward-period', type=int, default=None,
