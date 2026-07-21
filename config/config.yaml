@@ -98,8 +98,8 @@ llm:
     # 设计理念：专家用低成本模型做大量评估，主席做最终的跨因子综合排名
     # 理想场景下 chair 应使用更强的推理模型（如 GPT-4o），当前出于成本考虑使用相同模型
     # --- Timeout / prompt bounding (fixes [Step 5b] APITimeoutError on large pools) ---
-    request_timeout: 300        # [ACTIVE] seconds before a Chair LLM call times out (proxy endpoint is slow on long context)
-    synthesis_top_n: 50         # [ACTIVE] #factors fed FULL detail to Chair (rest get a compact line); bounds prompt size & timeout
+    request_timeout: 150        # [ACTIVE] seconds before a Chair LLM call times out (proxy endpoint is slow on long context)
+    synthesis_top_n: 25         # [ACTIVE] #factors fed FULL detail to Chair (rest get a compact line); bounds prompt size & timeout
     max_tokens: 4096            # [ACTIVE] cap Chair generation length (prevents runaway cross-factor JSON output)
     
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
