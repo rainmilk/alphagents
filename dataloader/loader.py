@@ -809,11 +809,21 @@ def _load_from_tushare(
 
         raw_codes = []
         if index_code:
-            # 1) Tushare native index constituents (primary)
+            # 1) Tushare native index constituents (primary).
+            # NOTE: Tushare's index_member returns the stock column as `con_code`
+            # (e.g. '000001.SZ'), NOT `ts_code`. It also returns the FULL
+            # constituent HISTORY by default, so we filter to current members
+            # via `is_new == 'Y'`.
             try:
-                df_cons = pro.index_member(index_code=index_code, is_new="Y")
-                raw_codes = df_cons["ts_code"].tolist()
-                print(f"  [tushare] index_member '{index_code}': {len(raw_codes)} constituents")
+                df_cons = pro.index_member(index_code=index_code)
+                if df_cons is not None and not df_cons.empty:
+                    if "is_new" in df_cons.columns:
+                        df_cons = df_cons[df_cons["is_new"] == "Y"]
+                    col = "con_code" if "con_code" in df_cons.columns else "ts_code"
+                    raw_codes = df_cons[col].tolist()
+                    print(f"  [tushare] index_member '{index_code}': {len(raw_codes)} constituents")
+                else:
+                    print(f"  [tushare] index_member returned empty for '{index_code}'; trying akshare fallback")
             except Exception as e:
                 print(f"  [tushare] index_member failed ({e}); trying akshare fallback")
 
