@@ -42,7 +42,8 @@ class MCTSSearch:
                  diversity_threshold: Optional[float] = None,
                  overall_threshold: Optional[float] = None,
                  seed_formula: Optional[str] = None,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 checkpoint_dir: str = "chkpts"):
         """
         初始化MCTS搜索。
         
@@ -80,6 +81,7 @@ class MCTSSearch:
         self.overall_threshold = overall_threshold or THRESHOLDS['overall']
         self.seed_formula = seed_formula
         self.output_dir = output_dir
+        self.checkpoint_dir = checkpoint_dir
         
         # 搜索状态
         self.iteration = 0
@@ -726,7 +728,7 @@ class MCTSSearch:
         return count_recursive(self.root)
     
     def save_checkpoint(self) -> None:
-        """保存搜索检查点。"""
+        """保存搜索检查点到 checkpoint_dir。"""
         checkpoint = {
             'iteration': self.iteration,
             'root': self.root,
@@ -736,17 +738,25 @@ class MCTSSearch:
             'repo_returns': self.repo_returns,
             'fsa_miner': self.fsa_miner
         }
-        
+
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         filename = f"mcts_checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
-        with open(filename, 'wb') as f:
+        filepath = os.path.join(self.checkpoint_dir, filename)
+        with open(filepath, 'wb') as f:
             pickle.dump(checkpoint, f)
-        print(f"检查点已保存: {filename}")
+        print(f"检查点已保存: {filepath}")
     
     def load_checkpoint(self, filename: str) -> None:
-        """加载搜索检查点。"""
-        with open(filename, 'rb') as f:
+        """加载搜索检查点。若给定路径不存在，则回退到 checkpoint_dir 中按文件名查找。"""
+        path = filename
+        if not os.path.exists(path) and self.checkpoint_dir:
+            candidate = os.path.join(self.checkpoint_dir, os.path.basename(filename))
+            if os.path.exists(candidate):
+                path = candidate
+
+        with open(path, 'rb') as f:
             checkpoint = pickle.load(f)
-        
+
         self.iteration = checkpoint['iteration']
         self.root = checkpoint['root']
         self.best_formula = checkpoint['best_formula']
@@ -754,8 +764,8 @@ class MCTSSearch:
         self.alpha_repository = checkpoint['alpha_repository']
         self.repo_returns = checkpoint['repo_returns']
         self.fsa_miner = checkpoint['fsa_miner']
-        
-        print(f"检查点已加载: {filename}")
+
+        print(f"检查点已加载: {path}")
         print(f"从迭代 {self.iteration} 继续")
     
     def save_results(self) -> None:
