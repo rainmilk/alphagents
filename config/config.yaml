@@ -105,8 +105,8 @@ llm:
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
-  n_seeds_hypothesis: 20        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
-  n_seeds_single_stage: 20       # [ACTIVE] plain single-stage seed factors
+  n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  n_seeds_single_stage: 15       # [ACTIVE] plain single-stage seed factors
   n_seeds_memory_augment: 20     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
   n_best_factors: 25   # [ACTIVE] top-N factors to retain per round
