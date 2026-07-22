@@ -264,14 +264,15 @@ class AAAI2027Pipeline:
     def _save_split_data(self, train_start_date: str = None, train_end_date: str = None,
                          test_start_date: str = None, test_end_date: str = None):
         """
-        Persist train/test data as CSV files under data/train/ and data/test/.
+        Persist train/test data as CSV files under
+        data/{universe}_{train_start}_{test_end}/train/ and .../test/.
 
-        Directory structure:
-            data/train/price/close.csv, open.csv, high.csv, low.csv, volume.csv, amount.csv
-            data/train/fundamental/pe.csv, pb.csv, ...
-            data/train/industry.csv
-            data/test/  (same structure)
-            data/split_info.json  — metadata
+        Directory structure (window-keyed, mirrors the experiments/ convention):
+            data/{universe}_{train_start}_{test_end}/train/price/close.csv, open.csv, ...
+            data/{universe}_{train_start}_{test_end}/train/fundamental/pe.csv, pb.csv, ...
+            data/{universe}_{train_start}_{test_end}/train/industry.csv
+            data/{universe}_{train_start}_{test_end}/test/  (same structure)
+            data/{universe}_{train_start}_{test_end}/split_info.json  — metadata
         """
         
         def _save_category(data_dict, root: str, category: str):
@@ -294,8 +295,15 @@ class AAAI2027Pipeline:
             csv_path = os.path.join(root, filename)
             pd.Series(series).to_csv(csv_path, index=True, encoding='utf-8-sig')
         
+        # Window-keyed data tag so the exported train/test CSVs land under
+        # data/{universe}_{train_start}_{test_end}/ — matching the experiments/
+        # directory convention. Do NOT reuse config_path("data", ...): that
+        # branch is intentionally date-blind for raw/cache artifacts, so the
+        # split export must build its own window-tagged path.
+        _data_tag = f"{global_config.universe}_{self._train_start_date or 'NA'}_{self._test_end_date or 'NA'}"
+
         for split, data in [("train", self.train_data), ("test", self.test_data)]:
-            root = config_path("data", split)
+            root = os.path.join("data", _data_tag, split)
             os.makedirs(root, exist_ok=True)
             
             n_price = _save_category(data.get('price_data'), root, "price")
@@ -322,7 +330,7 @@ class AAAI2027Pipeline:
             "saved_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         
-        info_path = config_path("data", "split_info.json")
+        info_path = os.path.join("data", _data_tag, "split_info.json")
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(split_info, f, indent=2, ensure_ascii=False)
         
@@ -734,6 +742,7 @@ class AAAI2027Pipeline:
             request_timeout=chair_cfg.get('request_timeout', 120.0),
             synthesis_top_n=chair_cfg.get('synthesis_top_n', 50),
             chair_max_tokens=chair_cfg.get('max_tokens', 4096),
+            chair_max_per_family=self.config['fusion'].get('chair_max_per_family', 3),
             # Parallel: 5 agents evaluate the same factor concurrently (I/O-bound API calls)
             parallel_eval=eval_cfg.get('parallel_eval', True),
         )
@@ -788,19 +797,29 @@ class AAAI2027Pipeline:
             except Exception:
                 current_state = None
             saved = 0
+            skipped_low_ic = 0
+            save_min_ic = self.config.get('memory', {}).get('save_min_ic', 0.0)
             for factor, result in self.debate_results:
                 if isinstance(factor, dict):
                     expr = factor.get('expression', '')
                     desc = factor.get('description', '')
                     is_from_memory = factor.get('_from_memory', False)
+                    factor_ic = factor.get('ic')
                 else:
                     expr = getattr(factor, 'expression', '')
                     desc = getattr(factor, 'description', '')
                     is_from_memory = getattr(factor, '_from_memory', False)
+                    factor_ic = getattr(factor, 'ic', None)
                 if not expr:
                     continue
                 # Skip factors retrieved from memory — they're already stored there
                 if is_from_memory:
+                    continue
+                # Quality gate: don't persist factors below the IC floor, otherwise
+                # the bank accumulates noise that Step 4b retrieval feeds back into
+                # future pools. Missing IC (None) is kept, not dropped.
+                if save_min_ic and factor_ic is not None and factor_ic < save_min_ic:
+                    skipped_low_ic += 1
                     continue
                 try:
                     self.memory_bank.add(
@@ -817,8 +836,11 @@ class AAAI2027Pipeline:
                     saved += 1
                 except Exception as e:
                     print(f"  [memory] add failed: {e}")
-            if saved:
-                print(f"  Saved {saved} factors to memory bank")
+            if saved or skipped_low_ic:
+                _msg = f"  Saved {saved} factors to memory bank"
+                if skipped_low_ic:
+                    _msg += f" (skipped {skipped_low_ic} below save_min_ic={save_min_ic})"
+                print(_msg)
         
     def step5b_chair_synthesis(self):
         """
@@ -879,6 +901,39 @@ class AAAI2027Pipeline:
                 print(f"      - {theme}")
         print("  [✓] Chair synthesis complete")
 
+        # ── Persist Chair selection so Step 6 can actually use it ──
+        # Without this, the Chair's selected/rejected counts were a no-op report
+        # and Step 6 fused ALL best_factors (the "Selected 5 / Fused 13" bug).
+        # We store the *expressions* the Chair ranked (its chosen subset) plus
+        # the rejected set and per-factor final_score. Whitespace-normalized so
+        # they match self.best_factors expressions exactly.
+        _ranked = synthesis.get('factors_ranked', []) or []
+        _rejected = synthesis.get('rejected_factors', []) or []
+        self.chair_synthesis = synthesis
+        self.chair_selected_expressions = {
+            str(item.get('expression', '')).strip()
+            for item in _ranked if str(item.get('expression', '')).strip()
+        }
+        self.chair_rejected_expressions = {
+            str(item.get('expression', '')).strip()
+            for item in _rejected if str(item.get('expression', '')).strip()
+        }
+        self.chair_score_map = {
+            str(item.get('expression', '')).strip(): float(item.get('final_score') or 0.0)
+            for item in _ranked if str(item.get('expression', '')).strip()
+        }
+        # Rejected factors also carry final_score — needed so Step 6 can
+        # DOWNWEIGHT (soft-reject) them instead of hard-dropping. Without this
+        # map, soft-rejected factors would fall back to debate_score 0.0.
+        self.chair_rejected_score_map = {
+            str(item.get('expression', '')).strip(): float(item.get('final_score') or 0.0)
+            for item in _rejected if str(item.get('expression', '')).strip()
+        }
+        print(f"  [step5b→step6] Chair selection persisted: "
+              f"{len(self.chair_selected_expressions)} ranked, "
+              f"{len(self.chair_rejected_expressions)} rejected "
+              f"(use_chair_selection={self.config['fusion'].get('use_chair_selection', False)})")
+
     def step6_fuse_factors(self):
         """
         Step 6: Fuse factors using ICIR² shrinkage fusion with sign-aware,
@@ -922,6 +977,61 @@ class AAAI2027Pipeline:
             forward_period=getattr(self, '_forward_period', None),
         )
 
+        # ── Apply Step 5b Chair selection (if enabled) ──
+        # The Chair Agent ranks a SUBSET of best_factors as selected and explicitly
+        # rejects others. When use_chair_selection is on, we drop the rejected ones
+        # from the fusion pool so the Chair's decision actually takes effect.
+        # Factors the Chair neither ranked nor rejected (LLM count inconsistency)
+        # are KEPT with a warning, so we never silently lose a factor.
+        use_chair = bool(self.config.get('fusion', {}).get('use_chair_selection', False))
+        chair_sel = set(getattr(self, 'chair_selected_expressions', set()) or set())
+        chair_rej = set(getattr(self, 'chair_rejected_expressions', set()) or set())
+        # Soft-reject: when enabled, factors the Chair REJECTED are kept in the
+        # fusion pool but their debate_score prior is downweighted (see the
+        # debate_score_map block below). This stops a MEDIUM-confidence Chair
+        # from permanently discarding a high-IC factor (e.g. score 8.0) purely
+        # for family overlap. Set chair_soft_reject=false to restore hard-drop.
+        chair_soft_reject = bool(self.config['fusion'].get('chair_soft_reject', True))
+        chair_soft_weight = float(self.config['fusion'].get('chair_soft_reject_weight', 0.3))
+        # Warn if the Chair listed the same factor in both sets (LLM double-count).
+        # The keep-branch (selected) wins in the loop below, so flag it explicitly.
+        _sel_rej_overlap = chair_sel & chair_rej
+        if _sel_rej_overlap:
+            print(f"  [warn] Chair listed {len(_sel_rej_overlap)} factor(s) in BOTH "
+                  f"selected and rejected (kept as selected): "
+                  f"{sorted(_sel_rej_overlap)[:3]}"
+                  f"{'...' if len(_sel_rej_overlap) > 3 else ''}")
+        if use_chair and chair_sel:
+            _kept, _dropped, _soft = {}, [], []
+            for _k, _v in train_factor_dict.items():
+                _base = _k.split('__dup')[0].strip()
+                if _base in chair_sel:
+                    _kept[_k] = _v
+                elif _base in chair_rej:
+                    if chair_soft_reject:
+                        # Keep the factor but flag for downweight (below), so a
+                        # hard family-cap decision never silently loses a strong
+                        # factor. Its influence in the combined factor shrinks.
+                        _kept[_k] = _v
+                        _soft.append(_k)
+                    else:
+                        _dropped.append(_k)
+                else:
+                    print(f"  [warn] Chair neither ranked nor rejected {_base!r}; "
+                          f"keeping (uncovered by Chair).")
+                    _kept[_k] = _v
+            if chair_soft_reject:
+                print(f"  Chair selection applied: kept {len(_kept)} "
+                      f"(selected={len(chair_sel)}, soft-rejected={len(_soft)} "
+                      f"downweighted x{chair_soft_weight}) of "
+                      f"{len(train_factor_dict)} computed factors.")
+            else:
+                print(f"  Chair selection applied: kept {len(_kept)} / dropped "
+                      f"{len(_dropped)} of {len(train_factor_dict)} computed factors.")
+                for _d in _dropped:
+                    print(f"    - dropped by Chair: {_d}")
+            train_factor_dict = _kept
+
         # ── 2. Build factor_infos from backtest results (IC/ICIR from train data) ──
         factor_meta_lookup = {}
         if hasattr(self, 'best_factors') and self.best_factors:
@@ -933,8 +1043,26 @@ class AAAI2027Pipeline:
                 val_icir_val = getattr(f, 'val_icir', 0.0)
                 factor_meta_lookup[expr] = (ic_val, icir_val, sharpe_val, val_icir_val)
 
+        # ── Debate prior score (debate_score) for fusion ──
+        # Prefer the Chair Agent's final_score (step5b) when chair selection is
+        # enabled — it is the authoritative cross-factor ranking. Otherwise fall
+        # back to the per-factor Step-5 multi-agent debate score.
         debate_score_map = {}
-        if hasattr(self, 'debate_results') and self.debate_results:
+        _chair_scores = getattr(self, 'chair_score_map', None)
+        if use_chair and _chair_scores:
+            # Selected factors keep their full Chair final_score as the fusion
+            # prior. Soft-rejected factors (if enabled) get the same score but
+            # scaled by chair_soft_reject_weight, so they still contribute to
+            # the combined factor with reduced influence instead of vanishing.
+            debate_score_map = dict(_chair_scores)
+            _rej_scores = getattr(self, 'chair_rejected_score_map', None)
+            if _rej_scores and chair_soft_reject:
+                for _e, _s in _rej_scores.items():
+                    debate_score_map[_e] = _s * chair_soft_weight
+            print(f"  Using Chair final_score as fusion prior "
+                  f"({len(debate_score_map)} factors"
+                  f"{', soft-rejected downweighted' if chair_soft_reject else ''}).")
+        elif hasattr(self, 'debate_results') and self.debate_results:
             for factor, result in self.debate_results:
                 if isinstance(factor, dict):
                     expr = factor.get('expression', '')
@@ -953,6 +1081,10 @@ class AAAI2027Pipeline:
                 values_df.index = pd.to_datetime(values_df.index)
 
             meta = factor_meta_lookup.get(name)
+            if meta is None:
+                # dup-suffixed variant (expr__dupN) or chair-selected factor:
+                # fall back to the base expression so it keeps its IC/ICIR meta.
+                meta = factor_meta_lookup.get(name.split('__dup')[0].strip())
             if meta:
                 ic_val, icir_val, sharpe_val, val_icir_val = meta
                 if abs(icir_val) > 1e-8:
@@ -963,6 +1095,9 @@ class AAAI2027Pipeline:
                 ic_val = ic_std_val = sharpe_val = 0.0
 
             dscore = debate_score_map.get(name, 0.0)
+            if dscore == 0.0:
+                # fall back to base expression (dup-suffix or whitespace variant)
+                dscore = debate_score_map.get(name.split('__dup')[0].strip(), 0.0)
             ic_sign = float(np.sign(ic_val)) if abs(ic_val) > 1e-10 else 1.0
             # Effective sample size for IC/ICIR:
             # factor values have T dates, but last forward_period dates lack forward returns

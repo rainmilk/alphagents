@@ -107,9 +107,9 @@ evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   n_seeds_hypothesis: 20        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
   n_seeds_single_stage: 20       # [ACTIVE] plain single-stage seed factors
-  n_seeds_memory_augment: 10     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_seeds_memory_augment: 20     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
-  n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
+  n_best_factors: 25   # [ACTIVE] top-N factors to retain per round
   max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
   n_improve: 20        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
@@ -123,7 +123,7 @@ evolution:
   max_drawdown: -1.0       # [ACTIVE] quality filter: drop factors with drawdown worse than this. Cumsum-based after fix (single-sided 10d LS returns); -0.20 was too strict for 2023-2024 A-share bear market — even decent factors easily exceed -20% cumulative.
   originality_gate: true    # [ACTIVE] static AST gate: reject structural near-duplicates + trivial/no-data/constant-dominated factors before they enter the pool
   dedup_similarity: 0.90    # [ACTIVE] canonical-signature similarity above which a factor is treated as a near-duplicate of an accepted one
-  improve_temperature: 0.7  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
+  improve_temperature: 0.6  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
   elitism_carry: 3          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
 
 # ==================== Memory Bank Configuration ====================
@@ -143,7 +143,12 @@ memory:
     top_k: 5           # [ACTIVE] number of factors to retrieve from memory per query
     state_weight: 0.3  # [ACTIVE] weight of market-state similarity vs semantic similarity
     min_ic: 0.02       # [ACTIVE] minimum IC threshold to filter retrieved factors
-    
+
+  # Save gate → used by step5 save loop (main.py). Factors below this train IC
+  # are NOT persisted to the memory bank, so low-quality factors don't accumulate
+  # and get re-fed into future pools via Step 4b retrieval. Set 0.0 to disable.
+  save_min_ic: 0.02    # [ACTIVE] minimum train IC to persist a freshly-evolved factor
+
   # Update → used by MemoryBank.update_quality / _update_existing_factor
   update:
     alpha: 0.3  # [UNUSED] EMA decay factor — currently hardcoded as 0.3 in memory.py
@@ -155,7 +160,7 @@ memory:
   
   # Embedder → used by FactorEmbedder (step1 init)
   encoder:
-    model: "all-MiniLM-L12-v2"  # [ACTIVE] sentence-transformers model for factor embedding
+    model: "paraphrase-multilingual-MiniLM-L12-v2"  # [ACTIVE] sentence-transformers model for factor embedding
     device: "cuda"              # [ACTIVE] cuda | cpu
 
 # ==================== Fusion Configuration [ALL ACTIVE] ====================
@@ -174,6 +179,22 @@ fusion:
     regime_tilt_strength: 0.2    # regime tilt magnitude (0=disabled, 0.2=moderate, 0.5=aggressive)
     shrinkage_kappa: 0.3         # debate prior confidence [0,1] (0=no prior, 1=full prior)
     ipr_alpha: 2.0               # IPR penalty sensitivity (higher = more aggressive redundancy penalty)
+
+  # Step 5b Chair selection → used by step6_fuse_factors
+  # When true, ONLY the factors the Chair Agent explicitly RANKED in step5b
+  # enter the fusion pool; factors the Chair REJECTED are dropped. This makes
+  # the Chair's selection/rejection actually take effect (instead of being a
+  # no-op report, which previously caused "Selected 5 / Fused 13" confusion).
+  # Set false to keep the legacy behaviour (fuse all best_factors regardless).
+  use_chair_selection: true
+
+  # ── Chair strictness controls (only used when use_chair_selection: true) ──
+  # Fixes "Step 5b rejects 11/15 — is that too strict?". The Chair REJECTED
+  # factors with final_score (8.0) HIGHER than some SELECTED ones (7.8) purely
+  # for family overlap, yet hard-dropped them at only MEDIUM confidence.
+  chair_max_per_family: 3        # [ACTIVE] family-diversity cap fed to the Chair prompt (was hardcoded "2-3"). Raise to 4-5 to let a dominant family keep more variants.
+  chair_soft_reject: true        # [ACTIVE] true = rejected factors are DOWNWEIGHTED (kept in fusion with a reduced prior), not hard-dropped. Prevents a MEDIUM-confidence Chair from permanently discarding a high-IC factor.
+  chair_soft_reject_weight: 0.3  # [ACTIVE] debate_score multiplier for soft-rejected factors (0 = drop the prior entirely, 1 = no penalty).
 
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:

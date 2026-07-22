@@ -264,6 +264,7 @@ class DebateEvaluator:
         # --- Chair synthesis prompt bounding (prevents timeouts on huge pools) ---
         synthesis_top_n: int = 50,
         chair_max_tokens: int = 8192,
+        chair_max_per_family: int = 3,
     ):
         """
         Initialize debate evaluator.
@@ -299,6 +300,7 @@ class DebateEvaluator:
         self.max_retries = max(1, int(max_retries))
         self.synthesis_top_n = max(1, int(synthesis_top_n))
         self.chair_max_tokens = max(1, int(chair_max_tokens))
+        self.chair_max_per_family = max(2, int(chair_max_per_family))
 
         # Initialize OpenAI client for EXPERT agents
         self.client = None
@@ -1127,7 +1129,8 @@ class DebateEvaluator:
                         "Value-Quality / Volatility / Liquidity / Growth). A good portfolio of "
                         "factors spans MULTIPLE families. Do NOT select 10 factors that are all "
                         "variants of the same idea (e.g., all -rank(pb)-style Value-Quality clones) "
-                        "just because they score similarly. Cap selection to at most 2-3 factors per "
+                        f"just because they score similarly. Cap selection to at most "
+                        f"{self.chair_max_per_family} factors per "
                         "family UNLESS one family is dramatically superior (then justify it). "
                         "Report portfolio concentration risk explicitly in 'key_themes'.\n\n"
                         "CRITICAL: Be specific. Vague answers like 'performs well' are insufficient. "
@@ -1149,20 +1152,39 @@ class DebateEvaluator:
                     parsed = self._salvage_json(raw)
 
                 # Validate and coerce required fields
+                factors_ranked = self._validate_factors_ranked(
+                    parsed.get("factors_ranked", [])
+                )
+                rejected_factors = self._validate_rejected_factors(
+                    parsed.get("rejected_factors", [])
+                )
                 result = {
                     "overall_assessment": str(parsed.get("overall_assessment", "")),
-                    "factors_ranked": self._validate_factors_ranked(
-                        parsed.get("factors_ranked", [])
-                    ),
-                    "selected_count": int(parsed.get("selected_count", 0)),
-                    "rejected_factors": self._validate_rejected_factors(
-                        parsed.get("rejected_factors", [])
-                    ),
+                    "factors_ranked": factors_ranked,
+                    # Use the REAL length of the validated ranked list, not the
+                    # LLM's self-reported selected_count — the chair LLM has been
+                    # observed to miscount (e.g. reporting 5 selected + 9 rejected
+                    # = 14 for an input of 13). Aligns with _rule_based_synthesis.
+                    "selected_count": len(factors_ranked),
+                    "rejected_factors": rejected_factors,
                     "key_themes": [str(t) for t in parsed.get("key_themes", [])],
                     "chair_confidence": str(parsed.get("chair_confidence", "MEDIUM")),
                     "timestamp": datetime.now().isoformat(),
                     "_source": "chair_llm",
                 }
+                # Consistency check: the union of selected+rejected must cover
+                # exactly the input count, with no overlap. The chair LLM is not
+                # reliable here, so surface any mismatch instead of hiding it.
+                _total_input = len(debate_results)
+                _sel_exprs = {str(i.get('expression', '')).strip() for i in factors_ranked}
+                _rej_exprs = {str(i.get('expression', '')).strip() for i in rejected_factors}
+                _overlap = _sel_exprs & _rej_exprs
+                _listed = len(_sel_exprs | _rej_exprs)
+                if _listed != _total_input or _overlap:
+                    print(f"  [warn] Chair count inconsistency: input={_total_input}, "
+                          f"listed={_listed} (selected={len(_sel_exprs)}, "
+                          f"rejected={len(_rej_exprs)}, overlap={len(_overlap)}). "
+                          f"Chair may have double-counted or missed factors.")
                 print(f"  [debate] Chair synthesis complete: {result['selected_count']} selected, "
                       f"{len(result['rejected_factors'])} rejected, "
                       f"confidence={result['chair_confidence']}")
