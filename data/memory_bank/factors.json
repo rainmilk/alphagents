@@ -1051,9 +1051,9 @@
     "created_at": "2026-07-22T13:01:23.537733",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 8,
-    "last_retrieved": "2026-07-22T15:58:46.575943",
-    "quality_score": 0.5913578792709444
+    "retrieval_count": 10,
+    "last_retrieved": "2026-07-22T16:56:38.244173",
+    "quality_score": 0.6013914140440519
   },
   {
     "factor_id": "69564acfdf407802",
@@ -1073,9 +1073,9 @@
     "created_at": "2026-07-22T13:01:23.571360",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 8,
-    "last_retrieved": "2026-07-22T15:58:46.575943",
-    "quality_score": 0.6407404404502619
+    "retrieval_count": 10,
+    "last_retrieved": "2026-07-22T16:56:38.244173",
+    "quality_score": 0.6507739752233695
   },
   {
     "factor_id": "7e851fd93c28ec0e",
@@ -1109,17 +1109,17 @@
       "trend": "sideways",
       "correlation": "medium"
     },
-    "ic": 0.07533561332581468,
-    "icir": 0.7559599008889653,
-    "sharpe": 3.5574529227262213,
-    "win_rate": 0.7138728323699421,
-    "max_drawdown": -0.09184425655350005,
+    "ic": 0.0746323889792758,
+    "icir": 0.7170938376703886,
+    "sharpe": 3.3442737946659213,
+    "win_rate": 0.7034682080924854,
+    "max_drawdown": -0.10784595816662498,
     "created_at": "2026-07-22T13:01:23.633334",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 8,
-    "last_retrieved": "2026-07-22T15:58:46.575943",
-    "quality_score": 0.6460488942763289
+    "retrieval_count": 10,
+    "last_retrieved": "2026-07-22T16:56:38.244173",
+    "quality_score": 0.6323319792146457
   },
   {
     "factor_id": "5db3f6f6d234730b",
@@ -1139,9 +1139,9 @@
     "created_at": "2026-07-22T13:01:23.662360",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 8,
-    "last_retrieved": "2026-07-22T15:58:46.575943",
-    "quality_score": 0.533408249015467
+    "retrieval_count": 9,
+    "last_retrieved": "2026-07-22T16:51:37.400541",
+    "quality_score": 0.5386762747983583
   },
   {
     "factor_id": "6ffbeddcf426179d",
@@ -1425,9 +1425,9 @@
     "created_at": "2026-07-22T14:17:44.047529",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 4,
-    "last_retrieved": "2026-07-22T15:58:46.575943",
-    "quality_score": 0.5077752672760237
+    "retrieval_count": 5,
+    "last_retrieved": "2026-07-22T16:56:38.244173",
+    "quality_score": 0.5168913451157214
   },
   {
     "factor_id": "066f86898151b911",
@@ -1711,9 +1711,9 @@
     "created_at": "2026-07-22T16:07:10.367120",
     "source": "debate",
     "parent_ids": [],
-    "retrieval_count": 0,
-    "last_retrieved": "",
-    "quality_score": 0.5361876654095179
+    "retrieval_count": 2,
+    "last_retrieved": "2026-07-22T16:56:38.244173",
+    "quality_score": 0.5911182798429234
   },
   {
     "factor_id": "059eb2ce3c7cef64",
@@ -1736,5 +1736,335 @@
     "retrieval_count": 0,
     "last_retrieved": "",
     "quality_score": 0.28107437710187827
+  },
+  {
+    "factor_id": "72a3044a3daa4de5",
+    "expression": "-rank(ts_std(returns, 20)) * rank(ts_corr(close, volume, 20))",
+    "description": "Low volatility with high price-volume correlation: stable stocks with strong volume confirmation.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.04526384417298757,
+    "icir": 0.27825376746574787,
+    "sharpe": -0.449557940520827,
+    "win_rate": 0.47109826589595377,
+    "max_drawdown": -0.8039308849460971,
+    "created_at": "2026-07-22T17:26:24.220573",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.11685157526568454
+  },
+  {
+    "factor_id": "eb7f645f141441b0",
+    "expression": "rank(ts_slope(close, 20)) * rank(-pb)",
+    "description": "[H2] Low P/B stocks with recent positive price momentum (trend) continue to outperform as undervaluation corrects.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.02456507437454792,
+    "icir": 0.11938195149897857,
+    "sharpe": 0.24582180494679173,
+    "win_rate": 0.521613832853026,
+    "max_drawdown": -0.37798025148148184,
+    "created_at": "2026-07-22T17:26:24.254592",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.14118748425255834
+  },
+  {
+    "factor_id": "8cc6645371c2f214",
+    "expression": "rank(ts_mean(volume, 5) / ts_mean(volume, 20)) * rank(-ts_std(returns, 20))",
+    "description": "Liquidity surge combined with low volatility",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.04815230241499188,
+    "icir": 0.300886759156342,
+    "sharpe": 0.05104145260576174,
+    "win_rate": 0.5144508670520231,
+    "max_drawdown": -0.6249429159034341,
+    "created_at": "2026-07-22T17:26:24.286121",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.13207046987847673
+  },
+  {
+    "factor_id": "836dfd9cfdf82efa",
+    "expression": "-rank(pe) * rank(ts_mean(returns, 20))",
+    "description": "Low PE with past returns: value and momentum combination.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.050626866294347754,
+    "icir": 0.3053403877154883,
+    "sharpe": 0.3984999812436354,
+    "win_rate": 0.5444126074498568,
+    "max_drawdown": -0.6493312397943868,
+    "created_at": "2026-07-22T17:26:24.315125",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.17404595276150875
+  },
+  {
+    "factor_id": "22b50e8b7c3fff6c",
+    "expression": "ts_min(returns, 20)",
+    "description": "Minimum daily return over 20 days, captures downside tail risk.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.036707749946989374,
+    "icir": 0.20463606749098157,
+    "sharpe": -0.1873783471999097,
+    "win_rate": 0.5329512893982808,
+    "max_drawdown": -0.7371875568238321,
+    "created_at": "2026-07-22T17:26:24.344374",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.12494413285315087
+  },
+  {
+    "factor_id": "077d4646e0d61426",
+    "expression": "rank(ts_corr(close, volume, 20)) * -rank(market_cap) * rank(ts_std(returns, 20)) * (rank(ts_pct_change(eps, 5)) + rank(ts_pct_change(eps, 20)))",
+    "description": "Cross of price-volume momentum, small-cap, high vol, and multi-horizon EPS growth",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.05804917541416527,
+    "icir": 0.5411410381784696,
+    "sharpe": 2.45698414637714,
+    "win_rate": 0.6666666666666666,
+    "max_drawdown": -0.08466894355691913,
+    "created_at": "2026-07-22T17:26:24.369506",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.40805633567812993
+  },
+  {
+    "factor_id": "9892884b428e4d3b",
+    "expression": "rank(ts_pct_change(eps, 20)) * rank(-pb)",
+    "description": "Earnings growth with low price-to-book value",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.02774544782390495,
+    "icir": 0.16959741015956176,
+    "sharpe": 0.303017710937067,
+    "win_rate": 0.5250737463126843,
+    "max_drawdown": -0.3568798334728281,
+    "created_at": "2026-07-22T17:26:24.402091",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.14918924426819605
+  },
+  {
+    "factor_id": "256bd9ad6349d3cc",
+    "expression": "rank(ts_corr(close, volume, 20)) * -rank(market_cap) * rank(ts_std(returns, 20)) * rank(ts_pct_change(eps, 5))",
+    "description": "Price-volume correlation augmented small-cap high vol EPS growth",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.053614893459480756,
+    "icir": 0.5152338251258539,
+    "sharpe": 2.1235980258592297,
+    "win_rate": 0.6416184971098265,
+    "max_drawdown": -0.10124317333620932,
+    "created_at": "2026-07-22T17:26:24.428142",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.36749094873762866
+  },
+  {
+    "factor_id": "fe94b391d4885cb5",
+    "expression": "rank(ts_mean(market_cap, 20)) * -rank(ts_std(returns, 20))",
+    "description": "Large-cap low volatility: size and low risk.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.07218831084740587,
+    "icir": 0.6143708800042956,
+    "sharpe": 2.9503623204663296,
+    "win_rate": 0.6965317919075145,
+    "max_drawdown": -0.15745338780524415,
+    "created_at": "2026-07-22T17:26:24.454145",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.47043674585183876
+  },
+  {
+    "factor_id": "02d53194d670142c",
+    "expression": "rank(-pb) * rank(-ts_zscore(returns, 20))",
+    "description": "[H2] Low P/B stocks that have recently experienced negative returns (oversold) mean-revert strongly.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.04217719346833091,
+    "icir": 0.23564135330797184,
+    "sharpe": 0.6491799296840887,
+    "win_rate": 0.5404624277456648,
+    "max_drawdown": -0.28701534341506324,
+    "created_at": "2026-07-22T17:26:24.481574",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.19409907525170728
+  },
+  {
+    "factor_id": "8c3abb4732577ac6",
+    "expression": "-rank(market_cap) * rank(ts_std(returns, 20)) * rank(ts_delta(close, 5))",
+    "description": "Small-cap high volatility combined with short-term price momentum.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.047368874606382554,
+    "icir": 0.392618947317853,
+    "sharpe": 2.2401154077138603,
+    "win_rate": 0.6473988439306358,
+    "max_drawdown": -0.08509535656930257,
+    "created_at": "2026-07-22T17:26:24.508695",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.37717574686070454
+  },
+  {
+    "factor_id": "04e1b32636a74625",
+    "expression": "-rank(market_cap) * rank(ts_std(returns, 20)) * (rank(ts_pct_change(eps, 5)) + rank(ts_pct_change(eps, 20)))",
+    "description": "Multi-horizon EPS growth (5-day and 20-day) combined with size and volatility",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.06864544612440569,
+    "icir": 0.6552200485950563,
+    "sharpe": 3.5942361023161893,
+    "win_rate": 0.7315634218289085,
+    "max_drawdown": -0.06308933175405126,
+    "created_at": "2026-07-22T17:26:24.535579",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.5400590176596034
+  },
+  {
+    "factor_id": "81a4f028af41f7f1",
+    "expression": "-rank(market_cap) * rank(ts_std(returns, 20)) * rank(ts_pct_change(eps, 5))",
+    "description": "Small-cap high volatility combined with short-term earnings per share growth.",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.06108965222636946,
+    "icir": 0.6046484865393705,
+    "sharpe": 3.0116314773869597,
+    "win_rate": 0.6994219653179191,
+    "max_drawdown": -0.10826221392877816,
+    "created_at": "2026-07-22T17:26:24.560748",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.47159236691546447
+  },
+  {
+    "factor_id": "b4b33a398a97df9b",
+    "expression": "-rank(market_cap) * rank(ts_std(returns, 20)) * rank(ts_pct_change(eps, 5)) * rank(ts_delta(close, 5))",
+    "description": "Small-cap high volatility combined with EPS growth and short-term price momentum",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.044802054145787105,
+    "icir": 0.41704990588117785,
+    "sharpe": 2.1034349944232806,
+    "win_rate": 0.6329479768786127,
+    "max_drawdown": -0.09523419624575047,
+    "created_at": "2026-07-22T17:26:24.588968",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.35933412189094416
+  },
+  {
+    "factor_id": "63038263ee353c74",
+    "expression": "rank(ts_mean(returns, 20)) * -rank(market_cap) * rank(ts_std(returns, 20)) * rank(ts_pct_change(eps, 5))",
+    "description": "Average return momentum with size, volatility, and growth",
+    "market_state": {
+      "volatility": "low",
+      "liquidity": "normal",
+      "trend": "bear",
+      "correlation": "low"
+    },
+    "ic": 0.07101000478874643,
+    "icir": 0.6011595509092149,
+    "sharpe": 2.9267673915853774,
+    "win_rate": 0.6936416184971098,
+    "max_drawdown": -0.10760636297690895,
+    "created_at": "2026-07-22T17:26:24.607966",
+    "source": "debate",
+    "parent_ids": [],
+    "retrieval_count": 0,
+    "last_retrieved": "",
+    "quality_score": 0.4669100652523329
   }
 ]
