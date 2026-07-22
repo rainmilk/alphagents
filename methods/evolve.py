@@ -2705,6 +2705,9 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         # min_ic / max_drawdown / min_sharpe are secondary guards. NOTE: f.sharpe
         # is distorted by overlapping-window annualization (daily-sampled 10d
         # forward returns * sqrt(252)), so it is a soft floor, not a hard gate.
+        # In val_mode the min_sharpe soft floor reads f.val_sharpe (the holdout
+        # realized P&L) instead of the distorted train sharpe — keeping the
+        # "trust the sample-out-of signal" principle consistent across the gate.
         # The degenerate fallback must NOT silently return a wall of junk factors:
         # if every factor fails the gate we keep only the single best by the
         # honest ranking key, so the pipeline survives and the mis-tuning is loud.
@@ -2718,7 +2721,16 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                     continue
             if f.ic < self.min_ic:
                 continue
-            if f.sharpe < self.min_sharpe:
+            # Soft Sharpe floor. In val_mode prefer the holdout val_sharpe (the
+            # honest, sample-out-of realized P&L) over the distorted train sharpe.
+            # Only switch when a valid val_sharpe exists — when the val split was
+            # invalid it stays NaN, so we correctly fall back to train sharpe.
+            # (val_mode=False leaves val_sharpe at its 0.0 default, so we must NOT
+            # switch there, or every factor would be filtered at min_sharpe>0.)
+            _sharpe_for_filter = f.sharpe
+            if val_mode and f.val_sharpe is not None and not np.isnan(f.val_sharpe):
+                _sharpe_for_filter = f.val_sharpe
+            if _sharpe_for_filter < self.min_sharpe:
                 continue
             if f.max_drawdown < self.max_drawdown:
                 continue
