@@ -60,6 +60,7 @@ class CandidateFactor:
     max_drawdown: float = 0.0
     val_ic: float = 0.0            # Validation-period Rank-IC (set only when a val_backtester is supplied). Used for final selection + early-stop to combat train overfitting.
     val_icir: float = 0.0
+    val_sharpe: float = 0.0        # Validation-period long-short Sharpe (holdout window). Same-window counterpart to val_ic, so val_IC vs val_Sharpe comparisons are apples-to-apples (factor.sharpe is on the full TRAIN window). Direction-aligned by sign(val_IC) — see _compute_quantile_metrics.
     is_valid: bool = True          # False when evaluation raises ValueError (parse error)
     parse_error: str = ""          # stores error message for debugging / reflection
     originality_ok: bool = True    # False when the AST originality gate rejects the factor
@@ -1151,9 +1152,9 @@ class FactorBacktester:
             # Step 3: Rank IC
             ic, ic_ir = rank_ic(fv_aligned, fr_aligned)
 
-            # Step 4: Quantile portfolio metrics
+            # Step 4: Quantile portfolio metrics (direction-aligned to IC sign)
             sharpe, win_rate, max_dd, long_short_ret = self._compute_quantile_metrics(
-                fv_aligned, fr_aligned
+                fv_aligned, fr_aligned, ic=ic
             )
 
             metrics = {
@@ -1303,18 +1304,32 @@ class FactorBacktester:
         factor_values: pd.DataFrame,
         forward_returns: pd.DataFrame,
         n_quantiles: int = 5,
+        ic: float = 0.0,
     ) -> Tuple[float, float, float, pd.Series]:
         """
         Build a long-short quantile portfolio and compute performance metrics.
 
         For each period:
           1. Sort stocks by factor value and assign to n_quantiles
-          2. Top quantile = long, bottom quantile = short
-          3. Long-short return = equal-weighted top return - equal-weighted bottom return
+          2. Rank the quantiles by factor value (highest = top, lowest = bottom)
+          3. Long-short return = sign(IC) * (top return - bottom return)
+
+        Direction is aligned to the factor's Rank-IC sign: a factor whose IC is
+        negative is only predictive when traded REVERSED (long the bottom
+        quantile / short the top). Flipping here means the reported Sharpe,
+        win_rate and max_drawdown reflect the factor's *usable* direction rather
+        than a hardcoded long-high/short-low convention — this rescues genuinely
+        predictive reverse factors that would otherwise be mis-scored as losers.
+        Convention (matches README §Sign Extraction and fusion.py): when |IC| is
+        near zero the direction is unreliable, so we default to +1 (no flip) —
+        near-zero-IC factors already carry ~zero weight downstream.
 
         Returns:
             (annualized_sharpe, win_rate, max_drawdown, long_short_returns_series)
         """
+        # Align portfolio direction to the factor's predictive sign.
+        ic_sign = 1.0 if (ic is None or np.isnan(ic) or abs(ic) <= 1e-10) else float(np.sign(ic))
+
         long_short_rets = []
 
         for t in range(len(factor_values)):
@@ -1342,7 +1357,7 @@ class FactorBacktester:
             top_ret = fr_valid[top_mask].mean()
             bot_ret = fr_valid[bot_mask].mean()
 
-            long_short_rets.append(top_ret - bot_ret)
+            long_short_rets.append(ic_sign * (top_ret - bot_ret))
 
         if not long_short_rets:
             return 0.0, 0.5, 0.0, pd.Series(dtype=float)
@@ -1812,7 +1827,11 @@ class SelfEvolvingGenerator:
                 sharpe_str = f"{f.sharpe:.2f}" if f.sharpe else "N/A"
                 vic = f.val_ic
                 vic_str = f"{vic:.4f}" if (vic is not None and not np.isnan(vic)) else "N/A"
-                lines.append(f"  - IC={f.ic:.4f}, val_IC={vic_str}, Sharpe={sharpe_str}: {f.expression}")
+                vsharpe = getattr(f, 'val_sharpe', None)
+                vsharpe_str = (f"{vsharpe:.2f}"
+                               if (vsharpe is not None and not np.isnan(vsharpe)) else "N/A")
+                lines.append(f"  - IC={f.ic:.4f}, val_IC={vic_str}, "
+                              f"Sharpe(train)={sharpe_str}, val_Sharpe={vsharpe_str}: {f.expression}")
 
             lines.append("")
         
@@ -2488,8 +2507,10 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                     if vmetrics.get('is_valid', True):
                         factor.val_ic = vmetrics.get('ic', float('nan'))
                         factor.val_icir = vmetrics.get('icir', float('nan'))
+                        factor.val_sharpe = vmetrics.get('sharpe', 0.0)
                     else:
                         factor.val_ic = float('nan')
+                        factor.val_sharpe = float('nan')
                 evaluated_factors.append(factor)
 
                 # Only update best_ic with valid factors that have a real IC value
@@ -2645,8 +2666,10 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                     if vmetrics.get('is_valid', True):
                         factor.val_ic = vmetrics.get('ic', float('nan'))
                         factor.val_icir = vmetrics.get('icir', float('nan'))
+                        factor.val_sharpe = vmetrics.get('sharpe', 0.0)
                     else:
                         factor.val_ic = float('nan')
+                        factor.val_sharpe = float('nan')
                 if factor.is_valid and not np.isnan(factor.ic) and factor.ic > best_ic:
                     best_ic = factor.ic
             # Save improved factors with real IC/Sharpe/win_rate after backtest evaluation
