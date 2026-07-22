@@ -10,6 +10,14 @@ data:
   # Data source — loader supports westock, tushare, akshare, auto
   source: "tushare"  # tushare | akshare | westock | auto
   tushare_token: "d83808e8ee98957fe38996678210faacda9f68d8c22574f38f572704"  # set your Tushare Pro token here, or use env var TUSHARE_TOKEN
+
+  # Optional global cap on the number of stocks to fetch.
+  # Unset / null (default) => respect each universe's REAL size:
+  #   hs300 = 300, zz500 = 500, all_a = 1000.
+  # Set to an int ONLY if you deliberately trade coverage for fetch speed
+  # (e.g. 300). When truncation happens the loader prints a WARNING — it is
+  # never silent. Do NOT use this to paper over a larger universe silently.
+  max_stocks: null  # e.g. 300 to cap everything at 300 for speed
   
   # Stock universe
   universe:

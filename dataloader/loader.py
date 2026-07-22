@@ -55,6 +55,37 @@ def _load_cache(cache_file: str):
 # local store via DataLoader.load_data() — no network access at experiment time.
 DATASETS_DIR = "datasets"
 
+# ---------------------------------------------------------------------------
+# Universe-aware constituent cap
+# ---------------------------------------------------------------------------
+# Each index defines a fixed number of constituents. Real loaders MUST respect
+# this — silently truncating zz500 (500) to 300 corrupts the experiment's
+# universe semantics. `max_stocks` (config data.max_stocks) overrides the
+# default ONLY when the caller explicitly wants fewer stocks for performance.
+_UNIVERSE_CAP = {"hs300": 300, "zz500": 500, "all_a": 1000}
+_MAX_STOCKS_OVERRIDE = None  # set via set_max_stocks(); None => use _UNIVERSE_CAP
+
+
+def set_max_stocks(n: Optional[int]) -> None:
+    """Override the default per-universe cap (config data.max_stocks)."""
+    global _MAX_STOCKS_OVERRIDE
+    _MAX_STOCKS_OVERRIDE = n
+
+
+def cap_universe(stock_codes: List[str], universe: str) -> List[str]:
+    """Cap a constituent list to the universe's defined size (or the override).
+
+    Prints a WARNING whenever truncation actually happens, so the silent
+    data-loss bug from the old hardcoded [:300] can never recur unnoticed.
+    """
+    cap = _MAX_STOCKS_OVERRIDE if _MAX_STOCKS_OVERRIDE is not None else _UNIVERSE_CAP.get(universe, 1000)
+    if len(stock_codes) > cap:
+        print(f"  [loader] WARNING: '{universe}' has {len(stock_codes)} "
+              f"constituents; capping at {cap}. Set data.max_stocks in config "
+              f"to override (or raise it to fetch the full universe).")
+        return stock_codes[:cap]
+    return stock_codes
+
 
 def dataset_path(universe: str, start_date: str = None, end_date: str = None) -> str:
     """Canonical path of a pre-fetched dataset archive.
@@ -506,6 +537,13 @@ def load_real_data(
                 if config is None:
                     config = {}
 
+    # Apply optional config override for the constituent cap (data.max_stocks).
+    # Unset / null => respect each universe's real size (hs300=300, zz500=500,
+    # all_a=1000). Set to an int only when the caller explicitly trades coverage
+    # for fetch speed; the cap helper prints a WARNING whenever it truncates.
+    _max_stocks_cfg = (config or {}).get('data', {}).get('max_stocks')
+    set_max_stocks(int(_max_stocks_cfg) if _max_stocks_cfg else None)
+
     # Generate column mapping JSON for documentation (idempotent)
     _generate_column_mapping_json()
 
@@ -566,7 +604,7 @@ def load_real_data(
     if m:
         n_stocks = int(m.group(1))
     else:
-        n_stocks = {'hs300': 300, 'zz500': 500, 'all_a': 1000}.get(universe, 100)
+        n_stocks = _UNIVERSE_CAP.get(universe, 100)
     print(f"  [fallback] universe='{universe}' → n_stocks={n_stocks}")
     return _generate_synthetic_data(n_stocks, start_date, end_date)
 
@@ -605,7 +643,8 @@ def _load_from_westock(
         else:
             stocks = westock.get_all_stocks()
         
-        stock_codes = [s['code'] for s in stocks[:300]]  # cap at 300 for performance
+        stock_codes = [s['code'] for s in stocks]
+        stock_codes = cap_universe(stock_codes, universe)
         n_stocks = len(stock_codes)
         
         if n_stocks == 0:
@@ -756,31 +795,59 @@ def _load_from_tushare(
 
     try:
         # ---- 1. Get stock list for the universe ----
-        if universe == 'hs300':
+        # Prefer Tushare's NATIVE index-constituent interface so the tushare
+        # source does NOT silently depend on akshare being installed.
+        # Fallback order:
+        #   1) pro.index_member            (Tushare native, current constituents)
+        #   2) akshare index_stock_cons_csindex (free, still correct constituents)
+        #   3) pro.stock_basic             (FULL market — NOT real constituents;
+        #                                   only for all_a or hard failure, with
+        #                                   a loud WARNING so it can't be mistaken
+        #                                   for a true index universe)
+        index_code_map = {"hs300": "000300.SH", "zz500": "000905.SH"}
+        index_code = index_code_map.get(universe)
+
+        raw_codes = []
+        if index_code:
+            # 1) Tushare native index constituents (primary)
             try:
-                import akshare as ak
-                df_cons = ak.index_stock_cons_csindex(symbol="000300")
-                raw_codes = df_cons['成分券代码'].tolist()
-            except Exception:
-                df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
-                raw_codes = df_basic['ts_code'].tolist()[:300]
-        elif universe == 'zz500':
-            try:
-                import akshare as ak
-                df_cons = ak.index_stock_cons_csindex(symbol="000905")
-                raw_codes = df_cons['成分券代码'].tolist()
-            except Exception:
-                df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
-                raw_codes = df_basic['ts_code'].tolist()[:500]
-        else:
-            df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
-            raw_codes = df_basic['ts_code'].tolist()
+                df_cons = pro.index_member(index_code=index_code, is_new="Y")
+                raw_codes = df_cons["ts_code"].tolist()
+                print(f"  [tushare] index_member '{index_code}': {len(raw_codes)} constituents")
+            except Exception as e:
+                print(f"  [tushare] index_member failed ({e}); trying akshare fallback")
+
+            # 2) akshare fallback (free, correct constituents) if native failed
+            if not raw_codes:
+                try:
+                    import akshare as ak
+                    _sym = "000300" if universe == "hs300" else "000905"
+                    df_cons = ak.index_stock_cons_csindex(symbol=_sym)
+                    raw_codes = df_cons["成分券代码"].tolist()
+                    print(f"  [tushare] akshare index_stock_cons_csindex: {len(raw_codes)} constituents")
+                except Exception as e:
+                    print(f"  [tushare] akshare constituent fetch failed ({e})")
+
+        # 3) Full-market fallback — only for all_a, or as last resort when both
+        #    constituent sources failed. These are NOT the real index constituents;
+        #    warn loudly so it can never be mistaken for one.
+        if not raw_codes:
+            df_basic = pro.stock_basic(exchange="", list_status="L", fields="ts_code")
+            raw_codes = df_basic["ts_code"].tolist()
+            if index_code:
+                print(f"  [tushare] WARNING: real constituents for '{universe}' "
+                      f"unavailable (index_member + akshare both failed); "
+                      f"fell back to FULL market ({len(raw_codes)} stocks). "
+                      f"These are NOT the true index constituents.")
+            else:
+                print(f"  [tushare] all_a full market: {len(raw_codes)} stocks")
 
         if not raw_codes:
             print("  [tushare] Empty stock list")
             return None
 
-        stock_codes = [c for c in raw_codes if isinstance(c, str) and len(c) > 0][:300]
+        stock_codes = [c for c in raw_codes if isinstance(c, str) and len(c) > 0]
+        stock_codes = cap_universe(stock_codes, universe)
         n_stocks = len(stock_codes)
         print(f"  [tushare] {n_stocks} stocks to fetch")
 
@@ -1100,7 +1167,8 @@ def _load_from_akshare(
             print("  [akshare] Empty stock list")
             return None
 
-        stock_codes = [str(c).strip() for c in raw_codes if str(c).strip()][:300]
+        stock_codes = [str(c).strip() for c in raw_codes if str(c).strip()]
+        stock_codes = cap_universe(stock_codes, universe)
         n_stocks = len(stock_codes)
         if n_stocks == 0:
             return None
