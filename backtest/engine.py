@@ -44,9 +44,9 @@ class BacktestEngine:
             slippage: Slippage rate (default: 0.0, disabled)
             benchmark: Benchmark index name
             risk_free_rate: Annualized risk-free rate for Sharpe ratio (default: 0.0)
-            holding_period: Number of trading days to hold positions before rebalancing.
-                           1 = daily rebalance (T+1), 5 = weekly, 20 = monthly.
-                           On non-rebalance days, positions drift with price changes.
+        holding_period: Number of trading days to hold positions before rebalancing.
+                       1 = daily rebalance (T+1), 5 = weekly, 20 = monthly.
+                       On non-rebalance days, positions drift with price changes.
         """
         self.commission = commission
         self.slippage = slippage
@@ -99,7 +99,7 @@ class BacktestEngine:
         if hp is None:
             hp = 1  # fallback: daily rebalance
         hp = max(1, hp)  # Minimum 1 day
-        
+
         print(f"Running backtest (holding_period={hp}d)...")
         
         # Align dates
@@ -127,19 +127,19 @@ class BacktestEngine:
         for i, date in enumerate(common_dates):
             # --- Determine if this is a rebalance date ---
             is_rebalance = (i % hp == 0)
-            
+
             if is_rebalance:
                 # Use the pre-computed portfolio weights
                 target_weights = portfolios.loc[date]
                 target_weights = target_weights / target_weights.sum()
-                
+
                 # Calculate turnover vs previous holdings
                 if prev_weights is not None:
                     turnover = np.sum(np.abs(target_weights - prev_weights)) / 2
                     turnovers.append(turnover)
                     transaction_cost = turnover * (self.commission + self.slippage)
                     portfolio_value *= (1 - transaction_cost)
-                
+
                 current_weights = target_weights
                 n_rebalances += 1
             else:
@@ -155,18 +155,18 @@ class BacktestEngine:
                     # First date fallback (should not reach here with hp >= 1)
                     current_weights = portfolios.loc[date]
                     current_weights = current_weights / current_weights.sum()
-            
+
             # Calculate next-day return (always computed, regardless of rebalance)
             if i < n_dates - 1:
                 next_date = common_dates[i + 1]
                 daily_returns_pct = prices.loc[next_date] / prices.loc[date] - 1
                 portfolio_return = np.sum(current_weights * daily_returns_pct)
                 portfolio_value *= (1 + portfolio_return)
-                
+
                 daily_returns.append(portfolio_return)
                 portfolio_values.append(portfolio_value)
                 positions_list.append(current_weights)
-            
+
             prev_weights = current_weights.copy()
         
         print(f"  Rebalanced {n_rebalances} times over {n_dates} trading days")

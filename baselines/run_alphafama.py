@@ -1325,8 +1325,13 @@ def _simulate_portfolio_from_ic(
     portfolio_rows = []
     portfolio_dates = []
 
-    # Rebalance at holding_period intervals
-    rebalance_indices = list(range(0, len(unique_dates), holding_period))
+    # Build a portfolio for EVERY test date (daily resolution). The actual
+    # rebalance cadence is governed solely by `holding_period` in the
+    # BacktestEngine (it re-samples every `holding_period`-th portfolio row),
+    # exactly like all other baselines. This keeps `holding_period` as the
+    # single frequency knob and removes the old double-skip (FAMA pre-sampling
+    # at `holding_period` AND the engine re-sampling at `holding_period` again).
+    rebalance_indices = list(range(len(unique_dates)))
 
     for idx_pos, i in enumerate(rebalance_indices):
         rebal_date = unique_dates[i]
