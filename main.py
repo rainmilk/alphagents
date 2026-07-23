@@ -2068,7 +2068,7 @@ Examples:
         help='Test start date (YYYY-MM-DD, default: 2024-01-01)',
     )
     parser.add_argument(
-        '--universe', type=str, default='hs300',
+        '--universe', type=str, default=None,
         choices=['hs300', 'zz500', 'all_a'],
         help='Stock universe for real data (default: hs300)',
     )
