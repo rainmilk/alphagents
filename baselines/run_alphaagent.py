@@ -1426,10 +1426,21 @@ def simulate_factor_portfolio(
     composite = pd.DataFrame(0.0, index=factor_test.index, columns=sample.columns)
     for f in available:
         vals = factor_test[f]  # DataFrame: date x stock
+        # Winsorize each cross-section to [1%, 99%] so a single heavy-tailed
+        # Alpha101 value (e.g. ts_sum(returns,250)) cannot dominate the row std.
+        lo = vals.quantile(0.01, axis=1)
+        hi = vals.quantile(0.99, axis=1)
+        vals_w = vals.clip(lower=lo, upper=hi, axis=0)
         # Z-score across stocks (axis=1) for each date (row)
-        row_mean = vals.mean(axis=1)
-        row_std = vals.std(axis=1)
-        norm = vals.sub(row_mean, axis=0).div(row_std + 1e-10, axis=0)
+        row_mean = vals_w.mean(axis=1)
+        row_std = vals_w.std(axis=1)
+        norm = vals_w.sub(row_mean, axis=0).div(row_std + 1e-10, axis=0)
+        # Orient by the factor's mean-IC sign (fixes sign-blindness): a negative-IC
+        # factor predicts high value -> lower future return, so its scores must be
+        # flipped, otherwise it gets wrongly longed. Equal-weight so s in {-1,0,1}.
+        s = np.sign(ic_mean.get(f, 0.0))
+        if s != 0:
+            norm = s * norm
         composite = composite.add(norm, fill_value=0.0)
     composite = composite.div(len(available))
 
@@ -1567,10 +1578,21 @@ def run_alphaagent_baseline(
     test_end = test_end_date or loader.data_config.get('test_end_date', '2025-06-30')
     bundle = loader.load_data(train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end)
     price_data, fundamental_data, industry_series = bundle.full
+    train_price, train_fund, train_ind = bundle.train
+    test_price, test_fund, test_ind = bundle.test
 
     price_midx = convert_to_multindex(price_data)
     return_series = compute_returns(price_midx)
-    forward_return_series = compute_forward_returns(price_midx, forward_period=forward_period)
+    # Forward returns used as the Rank-IC TARGET. Compute SEPARATELY on the
+    # train and test slices (NOT on bundle.full): a full-series computation lets
+    # the last `forward_period` TRAIN days peek into TEST prices via
+    # shift(-forward_period) crossing the train/test boundary — a look-ahead
+    # leak in the in-sample IC target. The train-slice series leaves those
+    # boundary rows NaN; the test-slice series is used only for the OOS IC.
+    train_price_midx = convert_to_multindex(train_price)
+    test_price_midx = convert_to_multindex(test_price)
+    forward_return_series_train = compute_forward_returns(train_price_midx, forward_period=forward_period)
+    forward_return_series_test = compute_forward_returns(test_price_midx, forward_period=forward_period)
 
     # Extract prices DataFrame for BacktestEngine (close price, date x stock)
     prices = price_data.get('close')
@@ -1633,7 +1655,7 @@ def run_alphaagent_baseline(
 
     # ── 5. Compute IC and select factors ───────────────────────────
     print(f"\n[5/6] Computing Rank-IC on training set (forward_period={forward_period}d)...")
-    ic_mean, ic_df = compute_rank_ic(factor_df, forward_return_series, train_end_date)
+    ic_mean, ic_df = compute_rank_ic(factor_df, forward_return_series_train, train_end_date)
 
     print(f"  Top 10 factors by IC:")
     for i, (name, ic) in enumerate(ic_mean.head(10).items()):
@@ -1642,7 +1664,7 @@ def run_alphaagent_baseline(
     # ── 5b. Compute Rank-IC on TEST set (the number reported in tables) ──
     print(f"\n[5b/6] Computing Rank-IC on TEST set (>= {test_start_date})...")
     ic_mean_test, ic_df_test = compute_rank_ic_test(
-        factor_df, forward_return_series, test_start_date
+        factor_df, forward_return_series_test, test_start_date
     )
     print(f"  Top 10 factors by test IC:")
     for i, (name, ic) in enumerate(ic_mean_test.head(10).items()):

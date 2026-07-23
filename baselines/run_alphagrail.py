@@ -1324,12 +1324,17 @@ def run_alphagrail_baseline(
             print("  Warning: No industry or size data available, skipping neutralization")
 
     # ── Step 4: Compute forward returns ────────────────────────────────
-    print(f"\n[Step 3] Computing {forward_period}d forward returns...")
-    forward_returns = _compute_forward_returns(close, periods=[forward_period])[forward_period]
+    # Compute the TRAINING forward returns on the TRAIN slice only (NOT on
+    # bundle.full). A full-series computation lets the last `forward_period`
+    # TRAIN days peek into TEST prices via shift(-period) crossing the
+    # train/test boundary — a look-ahead leak in the factor-selection target.
+    # The last `forward_period` train rows become NaN and are dropped by
+    # evaluate_factors().
+    print(f"\n[Step 3] Computing {forward_period}d forward returns (train slice)...")
+    train_returns = _compute_forward_returns(train_price['close'], periods=[forward_period])[forward_period]
 
     # ── Step 5: Evaluate factors on training data ──────────────────────
     print("\n[Step 4] Evaluating factors on training data (comprehensive metrics)...")
-    train_returns = forward_returns.loc[forward_returns.index.isin(train_dates)]
 
     train_factors = {
         name: vals.loc[vals.index.isin(train_dates)] for name, vals in factor_library.items()
@@ -1435,7 +1440,7 @@ def run_alphagrail_baseline(
     metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
 
     # ── Step 9: Compute test-period IC for the winning factor ──────────
-    test_returns = forward_returns.loc[forward_returns.index.isin(test_dates)]
+    test_returns = _compute_forward_returns(test_price['close'], periods=[forward_period])[forward_period]
     test_factor = factor_library[winner].loc[factor_library[winner].index.isin(test_dates)]
     test_ic = _compute_rank_ic(test_factor, test_returns)
     # Also compute test ICIR from the daily Rank-IC series (reported in tables).

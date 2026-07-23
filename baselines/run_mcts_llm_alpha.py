@@ -143,11 +143,13 @@ def run_mcts_llm_alpha_baseline(
     train_dates = sorted(train_price_midx['close'].index.get_level_values('datetime').unique())
     print(f"  Train period: {train_dates[0]} → {train_dates[-1]} ({len(train_dates)} dates)")
 
-    if isinstance(return_series, pd.Series) and isinstance(return_series.index, pd.MultiIndex):
-        train_mask = return_series.index.get_level_values('datetime').isin(train_dates)
-        train_return_series = return_series[train_mask]
-    else:
-        train_return_series = return_series
+    # Build the TRAINING return series from the TRAIN slice only (NOT by masking
+    # the full-series return_series to train dates). A full-series computation
+    # lets the last `forward_period` TRAIN days peek into TEST prices via
+    # shift(-period) crossing the train/test boundary — a look-ahead leak in the
+    # MCTS/LLM search target. The train-slice computation leaves those boundary
+    # rows NaN and drops them during IC.
+    train_return_series = compute_future_returns(train_price_midx, forward_period=forward_period)
 
     print(f"  Train data: {len(train_dates)} dates (MCTS/LLM will only see this)")
 

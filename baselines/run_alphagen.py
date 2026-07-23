@@ -1457,16 +1457,19 @@ def run_alphagen_baseline(
         'vwap': (test_price['high'].values + test_price['low'].values + test_price['close'].values) / 3.0,
     }
 
-    # Compute forward returns on the FULL close (the last train day needs the
-    # next day's close for its forward return), then split by the bundle's
-    # train/test indices so the split stays centralized and behavior identical.
-    forward_returns_all = _compute_forward_returns(close, periods=[forward_period])
-    fwd_ret = forward_returns_all[forward_period].values.astype(np.float64)
-
-    train_idx = close.index.isin(train_price['close'].index)
-    train_fwd_ret = fwd_ret[train_idx]
-    test_idx = close.index.isin(test_price['close'].index)
-    test_fwd_ret = fwd_ret[test_idx]
+    # Compute forward returns SEPARATELY on the train and test close slices
+    # (NOT on bundle.full). Computing on the full series would let the LAST
+    # `forward_period` TRAINING days peek into TEST prices via shift(-period)
+    # crossing the train/test boundary — a look-ahead leak in the training
+    # target. Computing per-slice keeps each target strictly inside its own
+    # window; the last `forward_period` rows naturally become NaN and are
+    # dropped during training/eval.
+    train_fwd_ret = _compute_forward_returns(
+        train_price['close'], periods=[forward_period]
+    )[forward_period].values.astype(np.float64)
+    test_fwd_ret = _compute_forward_returns(
+        test_price['close'], periods=[forward_period]
+    )[forward_period].values.astype(np.float64)
 
     n_train_dates = train_fwd_ret.shape[0]
     print(f"  Train: {n_train_dates} dates, Test: {test_fwd_ret.shape[0]} dates")

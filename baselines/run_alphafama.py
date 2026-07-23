@@ -1297,8 +1297,14 @@ def _simulate_portfolio_from_ic(
             'n_trading_days': 0,
         }
 
-    factor_weights = train_ic[top_factor_names].abs().mean()
-    factor_weights = factor_weights / factor_weights.sum()
+    # Sign-aware weights: a factor whose mean IC is negative predicts that
+    # high factor values → LOW future returns, so it must contribute to the
+    # composite *score* with a flipped sign. Using abs() here (old code) silently
+    # inverted every negative-IC factor, randomly flipping long/short and pushing
+    # the realized annual return to extreme +/- tails.
+    mean_ic = train_ic[top_factor_names].mean()            # signed mean IC per factor
+    factor_weights = np.sign(mean_ic) * mean_ic.abs()      # signed magnitude
+    factor_weights = factor_weights / factor_weights.abs().sum()
 
     # Filter test exposures to logical test period (no context)
     test_start_ts = pd.Timestamp(test_start_date)
@@ -1336,7 +1342,13 @@ def _simulate_portfolio_from_ic(
             if f in exp.columns:
                 f_vals = exp[f].dropna()
                 if len(f_vals) > 1:
-                    f_norm = (f_vals - f_vals.mean()) / (f_vals.std() + 1e-10)
+                    # Winsorize to [1%, 99%] before z-scoring: Alpha101 factors are
+                    # extremely heavy-tailed, and a single outlier can inflate the
+                    # cross-sectional std, letting one stock dominate the ranking and
+                    # spiking turnover. Clipping first makes the score robust to tails.
+                    lo, hi = f_vals.quantile(0.01), f_vals.quantile(0.99)
+                    f_w = f_vals.clip(lower=lo, upper=hi)
+                    f_norm = (f_w - f_w.mean()) / (f_w.std() + 1e-10)
                     score.loc[f_norm.index] += factor_weights.get(f, 0.0) * f_norm
 
         # Select top-50 stocks and equal-weight
