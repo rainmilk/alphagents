@@ -574,7 +574,9 @@ def run_xgboost_baseline(
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
     run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
     os.makedirs(run_dir, exist_ok=True)
-    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+    _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+    _bm.name = 'benchmark_return'
+    bt_metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=run_dir)
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")

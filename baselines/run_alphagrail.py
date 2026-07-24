@@ -1437,7 +1437,9 @@ def run_alphagrail_baseline(
         param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
         run_dir = os.path.join(os.path.dirname(output_dir), param_dir, method_name)
         os.makedirs(run_dir, exist_ok=True)
-    metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+    _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+    _bm.name = 'benchmark_return'
+    metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=run_dir)
 
     # ── Step 9: Compute test-period IC for the winning factor ──────────
     test_returns = _compute_forward_returns(test_price['close'], periods=[forward_period])[forward_period]

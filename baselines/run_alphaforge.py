@@ -1344,7 +1344,9 @@ def stage3_evaluate_results(
         risk_free_rate=0.0,
         holding_period=config.holding_period,
     )
-    metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
+    _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+    _bm.name = 'benchmark_return'
+    metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=save_dir)
 
     # ── Compute test-period Mean IC / ICIR ──
     # Cross-sectional Spearman between the Stage-2 combined factor scores

@@ -585,7 +585,9 @@ def compute_portfolio_metrics(
             risk_free_rate=0.0,
             holding_period=holding_period,
         )
-        metrics = engine.run(portfolios, prices_aligned, save_dir=save_dir)
+        _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+        _bm.name = 'benchmark_return'
+        metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=save_dir)
 
         # Add IC info
         mean_ic_val = 0.0

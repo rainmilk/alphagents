@@ -1715,7 +1715,9 @@ def run_alphaagent_baseline(
             holding_period=holding_period if holding_period is not None
             else config.get('backtest', {}).get('holding_period', 1),  # Daily rebalance
         )
-        metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+        _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+        _bm.name = 'benchmark_return'
+        metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=run_dir)
 
         # Save portfolio values for analysis
         pv = engine.get_portfolio_values()

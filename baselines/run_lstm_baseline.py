@@ -637,7 +637,9 @@ def run_lstm_baseline(
         risk_free_rate=0.0,
         holding_period=holding_period,
     )
-    bt_metrics = engine.run(portfolios, prices_aligned, save_dir=run_dir)
+    _bm = prices_aligned.pct_change().shift(-1).mean(axis=1).dropna()
+    _bm.name = 'benchmark_return'
+    bt_metrics = engine.run(portfolios, prices_aligned, benchmark_returns=_bm, save_dir=run_dir)
 
     # -- Step 8: Compute Rank-IC on test set --
     print("\n[Step 8] Computing Rank-IC on test set...")
