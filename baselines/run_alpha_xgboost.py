@@ -726,6 +726,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f"  Backend:          {results['backend']}")
     print(f"  N Features:       {results['n_features']}")
+    print(f"  Total Return:     {results['total_return']:.4f}")
     print(f"  Annual Return:    {results['annual_return']:.4f}")
     print(f"  Sharpe Ratio:     {results['sharpe_ratio']:.4f}")
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")

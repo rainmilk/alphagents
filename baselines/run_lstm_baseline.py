@@ -799,6 +799,7 @@ if __name__ == '__main__':
     print(f"  Hidden Size:      {results['hidden_size']}")
     print(f"  Num Layers:       {results['num_layers']}")
     print(f"  Epochs:           {results['epochs']}")
+    print(f"  Total Return:     {results['total_return']:.4f}")
     print(f"  Annual Return:    {results['annual_return']:.4f}")
     print(f"  Sharpe Ratio:     {results['sharpe_ratio']:.4f}")
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")

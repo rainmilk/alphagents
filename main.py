@@ -1370,9 +1370,27 @@ class AAAI2027Pipeline:
         print(f"  Constructed {len(self.portfolios)} portfolios (test period, trading days only)")
         print("  [✓] Portfolio construction complete")
 
-    def step8_backtest(self, test_data=None):
+    def step8_backtest(self, test_data=None, output_dir=None):
         """
         Step 8: Backtest the portfolio strategy.
+
+        Args:
+            test_data: Optional test data dict (defaults to self.test_data).
+            output_dir: Directory to persist the portfolio-level daily-return
+                series (``mase_daily_returns.csv``) and equity curve
+                (``mase_portfolio_values.csv``). If None, falls back to the same
+                default used by step9_save_results
+                (``experiments/{YYYYMMDD}/results/``) so the series lands next to
+                the other MASE result files.
+
+                This mirrors what the 9 baselines do via
+                ``engine.run(..., save_dir=run_dir)``: each of them persists a
+                *portfolio* daily-return series. MASE previously saved only
+                ``portfolios.csv`` (per-stock *weights*, not returns) and
+                ``performance_metrics.csv``, leaving its portfolio daily return on
+                the table. The engine's ``self.returns`` — the very series used to
+                compute Sharpe / vol / IR — is the portfolio daily return and is
+                what we now persist for comparability.
         """
         print("\n[Step 8] Backtesting...")
 
@@ -1411,10 +1429,24 @@ class AAAI2027Pipeline:
         _test_close = _test['price_data']['close']
         _bm = _test_close.pct_change().shift(-1).mean(axis=1).dropna()
         _bm.name = 'benchmark_return'
+
+        # Persist the *portfolio-level* daily-return series (and equity curve)
+        # so MASE is directly comparable to the 9 baselines, which each save a
+        # portfolio ``daily_returns.csv`` via engine.run(save_dir=run_dir).
+        # MASE itself only saved per-stock ``portfolios.csv`` before; the
+        # engine's ``self.returns`` (used for Sharpe / vol / IR) is the portfolio
+        # daily return and is exactly what we want on disk.
+        if output_dir is None:
+            date_str = datetime.now().strftime("%Y%m%d")
+            _save_dir = config_path('experiments', os.path.join(date_str, "results"))
+        else:
+            _save_dir = output_dir
         self.performance_metrics = self.backtest_engine.run(
             portfolios=self.portfolios,
             prices=_test['price_data']['close'],
             benchmark_returns=_bm,
+            save_dir=_save_dir,
+            method_prefix=None,
         )
         
         print(f"\n  [backtest] Out-of-sample results (test period: {getattr(self, '_test_start_date', 'unknown')})")
@@ -1597,7 +1629,7 @@ class AAAI2027Pipeline:
         self.step5b_chair_synthesis()     # Chair synthesis (step 5b)
         self.step6_fuse_factors()
         self.step7_construct_portfolio(test_data=test_data)
-        self.step8_backtest(test_data=test_data)
+        self.step8_backtest(test_data=test_data, output_dir=output_dir)
         # Compute & persist the composite factor's test-period IC/ICIR so they
         # appear in the saved performance_metrics.csv (full pipeline path).
         self._compute_composite_test_ic(test_data)

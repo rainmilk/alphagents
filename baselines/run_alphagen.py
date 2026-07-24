@@ -1650,6 +1650,7 @@ def run_alphagen_baseline(
     print(f"  Test Rank IC:       {test_ic_mean:.4f}")
     print(f"  Test ICIR:          {test_icir:.4f}")
     print(f"  Forward Period:     {forward_period}d")
+    print(f"  Total Return:       {backtest_metrics.get('total_return', 0):.4f}")
     print(f"  Annual Return:      {backtest_metrics.get('annual_return', 0):.4f}")
     print(f"  Sharpe Ratio:       {backtest_metrics.get('sharpe_ratio', 0):.4f}")
     print(f"  Max Drawdown:       {backtest_metrics.get('max_drawdown', 0):.4f}")

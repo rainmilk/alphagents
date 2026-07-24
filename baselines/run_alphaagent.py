@@ -1731,6 +1731,7 @@ def run_alphaagent_baseline(
     print(f"\n{'=' * 60}")
     print(f"  AlphaAgent Baseline Results ({'LLM' if llm_used else 'Random'})")
     print(f"{'=' * 60}")
+    print(f"  Total Return:     {metrics.get('total_return', 0):.4f}")
     print(f"  Annual Return:    {metrics.get('annual_return', 0):.4f}")
     print(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):.4f}")
     print(f"  Max Drawdown:     {metrics.get('max_drawdown', 0):.4f}")

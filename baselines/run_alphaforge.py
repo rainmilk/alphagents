@@ -1376,6 +1376,7 @@ def stage3_evaluate_results(
     metrics['icir'] = _icir
 
     print(f"\n  Results (BacktestEngine):")
+    print(f"    Total Return:     {metrics.get('total_return', 0):.4f}")
     print(f"    Annual Return:    {metrics.get('annual_return', 0):.4f}")
     print(f"    Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):.4f}")
     print(f"    Max Drawdown:     {metrics.get('max_drawdown', 0):.4f}")
@@ -1709,6 +1710,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("FINAL RESULTS")
     print("="*60)
+    print(f"Total Return: {results['metrics']['total_return']:.2%}")
     print(f"Annual Return: {results['metrics']['annual_return']:.2%}")
     print(f"Sharpe Ratio: {results['metrics']['sharpe_ratio']:.4f}")
     print(f"Max Drawdown: {results['metrics']['max_drawdown']:.2%}")

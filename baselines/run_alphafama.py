@@ -1124,6 +1124,7 @@ def run_alphafama_baseline(
         'mean_rank_ic_test': float(logical_avg_ic),
         'top_ic_factors': top_factors_dict,
         'annual_return': simulated_metrics.get('annual_return', 0.0),
+        'total_return': simulated_metrics.get('total_return', 0.0),
         'sharpe_ratio': simulated_metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': simulated_metrics.get('max_drawdown', 0.0),
         'information_ratio': simulated_metrics.get('information_ratio', 0.0),
@@ -1458,6 +1459,7 @@ if __name__ == '__main__':
     print("  Final Results (BacktestEngine)")
     print("=" * 60)
     print(f"  Method:           {results['method']}")
+    print(f"  Total Return:     {results['total_return']:.4f}")
     print(f"  Annual Return:    {results['annual_return']:.4f}")
     print(f"  Sharpe Ratio:     {results['sharpe_ratio']:.4f}")
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")

@@ -1464,6 +1464,7 @@ def run_alphagrail_baseline(
         'mean_rank_ic_test': float(test_ic),
         'icir_test': float(test_icir),
         'annual_return': metrics.get('annual_return', 0.0),
+        'total_return': metrics.get('total_return', 0.0),
         'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': metrics.get('max_drawdown', 0.0),
         'information_ratio': metrics.get('information_ratio', 0.0),
@@ -1498,6 +1499,7 @@ def run_alphagrail_baseline(
     print(f"  Mean Rank-IC (train): {results['mean_rank_ic_train']:.4f}")
     print(f"  ICIR:             {results['icir']:.4f}")
     print(f"  Mean Rank-IC (test):  {results['mean_rank_ic_test']:.4f}")
+    print(f"  Total Return:     {results['total_return']:.4f}")
     print(f"  Annual Return:    {results['annual_return']:.4f}")
     print(f"  Sharpe Ratio:     {results['sharpe_ratio']:.4f}")
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")
@@ -1575,6 +1577,7 @@ if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("  Final Results (BacktestEngine)")
     print("=" * 60)
+    print(f"  Total Return:     {results['total_return']:.4f}")
     print(f"  Annual Return:    {results['annual_return']:.4f}")
     print(f"  Sharpe Ratio:     {results['sharpe_ratio']:.4f}")
     print(f"  Max Drawdown:     {results['max_drawdown']:.4f}")
