@@ -123,10 +123,11 @@ class BacktestEngine:
         
         prev_weights = None
         n_rebalances = 0
-        
+
         for i, date in enumerate(common_dates):
             # --- Determine if this is a rebalance date ---
             is_rebalance = (i % hp == 0)
+            transaction_cost = 0.0
 
             if is_rebalance:
                 # Use the pre-computed portfolio weights
@@ -138,7 +139,6 @@ class BacktestEngine:
                     turnover = np.sum(np.abs(target_weights - prev_weights)) / 2
                     turnovers.append(turnover)
                     transaction_cost = turnover * (self.commission + self.slippage)
-                    portfolio_value *= (1 - transaction_cost)
 
                 current_weights = target_weights
                 n_rebalances += 1
@@ -156,14 +156,21 @@ class BacktestEngine:
                     current_weights = portfolios.loc[date]
                     current_weights = current_weights / current_weights.sum()
 
-            # Calculate next-day return (always computed, regardless of rebalance)
+            # Calculate next-period return (always computed, regardless of rebalance).
+            # Transaction cost on a rebalance day is charged at the START of the
+            # holding period so that BOTH `daily_returns` (used for Sharpe/vol/IR)
+            # and `portfolio_values` (used for annual_return) reflect the SAME net
+            # economics. Previously the cost was stripped from `portfolio_value`
+            # only, leaving `daily_returns` gross and thus Sharpe inconsistent with
+            # the equity curve.
             if i < n_dates - 1:
                 next_date = common_dates[i + 1]
                 daily_returns_pct = prices.loc[next_date] / prices.loc[date] - 1
-                portfolio_return = np.sum(current_weights * daily_returns_pct)
-                portfolio_value *= (1 + portfolio_return)
+                gross_return = np.sum(current_weights * daily_returns_pct)
+                net_return = (1 - transaction_cost) * (1 + gross_return) - 1
+                portfolio_value *= (1 + net_return)
 
-                daily_returns.append(portfolio_return)
+                daily_returns.append(net_return)
                 portfolio_values.append(portfolio_value)
                 positions_list.append(current_weights)
 
@@ -245,8 +252,14 @@ class BacktestEngine:
         # Compute metrics using shared functions
         n_days = len(daily_returns)
         n_years = n_days / 252
-        
+
         total_ret = metrics.total_return(portfolio_values)
+        # ARR (Annualized Rate of Return) = compound annual growth rate, the
+        # standard definition of an annualized return: (1 + total_return)^(1/n_years) - 1.
+        # NOTE: ARR is geometric while sharpe_ratio is arithmetic (mean daily * sqrt(252));
+        # the two can legitimately differ in sign after a drawdown that is not fully
+        # recovered. This is a definitional difference between two standard metrics,
+        # not a bug. total_return above is the realized cumulative P&L (also geometric).
         annual_ret = metrics.annualized_return(total_ret, n_years)
         annual_vol = metrics.annualized_volatility(daily_returns)
         sharpe_ratio = metrics.annualized_sharpe(daily_returns, rf=self.risk_free_rate)
