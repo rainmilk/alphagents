@@ -703,6 +703,12 @@ class ExperimentRunner:
 
         output_dir = f"{self.output_dir}/alphafama"
 
+        # Alpha101 participation ratio from config (fallback 0.5). Overridable
+        # via the --alpha101-ratio CLI flag when running the baseline directly.
+        alpha101_ratio = float(
+            (self.config.get('alphafama') or {}).get('alpha101_ratio', 0.5)
+        )
+
         results = run_alphafama_baseline(
             config_path="config/config.yaml",
             train_start_date=start_date,
@@ -713,6 +719,7 @@ class ExperimentRunner:
             context_days=context_days,
             forward_period=forward_period,
             holding_period=holding_period,
+            alpha101_ratio=alpha101_ratio,
             output_dir=output_dir,
         )
         

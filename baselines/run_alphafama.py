@@ -24,7 +24,7 @@ Usage:
     python baselines/run_alphafama.py --no-llm          # disable LLM mining
     python baselines/run_alphafama.py --llm-iters 20    # set LLM iterations
     python baselines/run_alphafama.py --alpha101-ratio 0.5   # keep top-50% Alpha101 (default)
-    python baselines/run_alphafama.py --no-alpha101           # disable Alpha101
+    python baselines/run_alphafama.py --alpha101-ratio 0     # disable Alpha101
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 """
@@ -451,7 +451,7 @@ def _seed_clusters_from_formula_map(
     Build seed clusters + placeholder mean-IC from the base Alpha101 formula
     library.
 
-    Used when Alpha101 factor *exposures* are disabled (``use_alpha101=0.0``):
+    Used when Alpha101 factor *exposures* are disabled (``alpha101_ratio=0.0``):
     instead of clustering the (empty) Alpha101 IC matrix, we seed the LLM
     mining chains directly from the 101 handcrafted *formulas* in
     ``FORMULA_MAP``. This gives the LLM real expressions to evolve without
@@ -696,7 +696,7 @@ def run_alphafama_baseline(
     context_days: int = 30,
     output_dir: Optional[str] = None,
     use_llm: bool = True,
-    use_alpha101: float = 0.5,
+    alpha101_ratio: float = 0.5,
     llm_iters: int = 5,
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
@@ -721,20 +721,20 @@ def run_alphafama_baseline(
         context_days: Context window for factor calculation.
         output_dir: Directory for saving results.
         use_llm: Whether to run LLM alpha-mining (default True).
-        use_alpha101: Fraction of the 101 handcrafted Alpha101 factor
-            exposures to keep and merge into the factor pool (default 0.5).
-            Interpreted as a ratio in [0, 1]:
+        alpha101_ratio: Fraction of the 101 handcrafted Alpha101 factor
+            exposures to keep and merge into the factor pool. Defaults to the
+            config ``alphafama.alpha101_ratio`` key (0.5); overridable via the
+            ``--alpha101-ratio`` CLI flag. Interpreted as a ratio in [0, 1]:
               - 0.0  → Alpha101 disabled; factor pool is LLM-generated only
                        (seeded from the base Alpha101 *formula library*,
-                       FORMULA_MAP), exactly the old ``use_alpha101=False`` path.
+                       FORMULA_MAP).
               - 0.5  → compute all 101 Alpha101 factors, then keep the top 50%
                        ranked by |mean train Rank-IC|, and merge those with the
                        LLM factors (default).
-              - 1.0  → keep all 101 Alpha101 factors (old ``use_alpha101=True``).
+              - 1.0  → keep all 101 Alpha101 factors.
             The kept subset still participates in Step 8's IC-weighted top-N
             selection alongside the LLM factors, so this knob controls how much
             Alpha101 "capacity" competes with the LLM factors.
-            Accepts a bool for backward compatibility (True→1.0, False→0.0).
         llm_iters: Number of LLM mining iterations (default 10).
         forward_period: Forward return horizon (trading days) for IC evaluation.
             Defaults to config['evolution']['forward_period'] (10). Must match the
@@ -751,13 +751,8 @@ def run_alphafama_baseline(
     if use_llm:
         print("  + FAMA LLM Alpha-Mining Pipeline")
 
-    # ── Normalize use_alpha101 to a ratio in [0, 1] ───────────────────
-    # Accepts float (ratio) or legacy bool (True→1.0, False→0.0).
-    if isinstance(use_alpha101, bool):
-        _alpha101_ratio = 1.0 if use_alpha101 else 0.0
-    else:
-        _alpha101_ratio = float(use_alpha101)
-    _alpha101_ratio = max(0.0, min(1.0, _alpha101_ratio))
+    # ── Clamp alpha101_ratio to a ratio in [0, 1] ─────────────────────
+    _alpha101_ratio = max(0.0, min(1.0, float(alpha101_ratio)))
 
     print(f"  Alpha101 factor library: ratio={_alpha101_ratio:.2f} "
           f"({'DISABLED (LLM-only seeds)' if _alpha101_ratio == 0 else 'ENABLED — top-|IC| subset'})")
@@ -1144,7 +1139,7 @@ def run_alphafama_baseline(
         'n_factors': total_factors,
         'n_alpha101_factors': n_factors,
         'n_llm_factors': n_llm_factors,
-        'use_alpha101': use_alpha101,
+        'alpha101_ratio': alpha101_ratio,
         'used_llm': used_llm,
         'llm_model': llm_model,
         'llm_iters': llm_iters if used_llm else 0,
@@ -1452,12 +1447,9 @@ if __name__ == '__main__':
                         help='Disable LLM alpha-mining')
     parser.add_argument('--alpha101-ratio', type=float, default=0.5,
                         help='Fraction of the 101 Alpha101 factors to keep and '
-                             'merge (default 0.5). 0.0 disables Alpha101; 1.0 '
-                             'keeps all 101. Selected by |mean train Rank-IC|.')
-    parser.add_argument('--no-alpha101', action='store_const', dest='use_alpha101',
-                        const=0.0,
-                        help='Disable Alpha101 factors (equivalent to '
-                             '--alpha101-ratio 0).')
+                             'merge. Defaults to config alphafama.alpha101_ratio '
+                             '(0.5). 0.0 disables Alpha101; 1.0 keeps all 101. '
+                             'Selected by |mean train Rank-IC|.')
     parser.add_argument('--llm-iters', type=int, default=5,
                         help='Number of LLM mining iterations (default: 5)')
     parser.add_argument('--forward-period', type=int, default=None,
@@ -1471,6 +1463,22 @@ if __name__ == '__main__':
                              '(step 4). None=auto (cpu_count-1). 1=serial. '
                              'Env override: ALPHAFAMA_N_JOBS.')
 
+    # Seed config-driven defaults (e.g. alpha101_ratio) before final parse so
+    # the CLI flag can still override them. Pre-parse only --config first.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument('--config', default='config/config.yaml')
+    _cfg_ns, _ = _pre.parse_known_args()
+    _alpha101_default = 0.5
+    try:
+        with open(_cfg_ns.config, 'r', encoding='utf-8') as f:
+            _cfg = yaml.safe_load(f) or {}
+        _alpha101_default = float(
+            (_cfg.get('alphafama') or {}).get('alpha101_ratio', 0.5)
+        )
+    except Exception:
+        pass
+    parser.set_defaults(alpha101_ratio=_alpha101_default)
+
     args = parser.parse_args()
 
     results = run_alphafama_baseline(
@@ -1483,7 +1491,7 @@ if __name__ == '__main__':
         context_days=args.context_days,
         output_dir=args.output_dir,
         use_llm=args.use_llm,
-        use_alpha101=args.use_alpha101,
+        alpha101_ratio=args.alpha101_ratio,
         llm_iters=args.llm_iters,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
