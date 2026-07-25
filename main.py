@@ -390,7 +390,7 @@ class AAAI2027Pipeline:
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
         n_shots = evo_cfg.get('n_shots', 3)
-        eval_max_workers = int(evo_cfg.get('eval_max_workers', 0) or 0)
+
         # Alpha101 is NO LONGER generated as a seed here. It is now *retrieved
         # by score* in Step 4c (step4c_retrieve_alpha101), which scores the full
         # Alpha101 library on TRAIN data and merges the top-k into the candidate
@@ -558,6 +558,10 @@ class AAAI2027Pipeline:
         # Resolve forward_period: explicit arg > config.yaml > default 10
         if forward_period is None:
             forward_period = self.config.get('evolution', {}).get('forward_period', 10)
+        
+        # Parallel worker count for the evolution-loop backtests (0 = auto-scale
+        # to the machine: min(32, cpu_count()+4)). Plumbed into evolve().
+        eval_max_workers = int(self.config.get('evolution', {}).get('eval_max_workers', 0) or 0)
         
         print(f"\n[Step 4] Evolving factors ({n_rounds} rounds, forward={forward_period}d)...")
 
