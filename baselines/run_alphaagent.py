@@ -1425,7 +1425,7 @@ def simulate_factor_portfolio(
     sample = factor_test[available[0]]
     composite = pd.DataFrame(0.0, index=factor_test.index, columns=sample.columns)
     for f in available:
-        vals = factor_test[f]  # DataFrame: date x stock
+        vals = factor_test[f].astype(float)  # DataFrame: date x stock; cast to float (bool/int factors)
         # Winsorize each cross-section to [1%, 99%] so a single heavy-tailed
         # Alpha101 value (e.g. ts_sum(returns,250)) cannot dominate the row std.
         lo = vals.quantile(0.01, axis=1)

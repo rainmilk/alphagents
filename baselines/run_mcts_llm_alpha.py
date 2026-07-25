@@ -55,6 +55,7 @@ def run_mcts_llm_alpha_baseline(
     test_end_date: str = "2023-12-31",
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
+    seed: int = 42,                # Seeds Python's `random` (random formula init / rollouts)
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -77,6 +78,12 @@ def run_mcts_llm_alpha_baseline(
         Dict with metrics: annual_return, sharpe_ratio, max_drawdown, etc.
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # Seed Python's global RNG so the random-formula initialization / rollout
+    # tie-breaking (see _random_formula) is reproducible across runs. Without
+    # this, MCTS results jitter run-to-run even with identical data.
+    import random
+    random.seed(seed)
 
     # Date-isolated run directory (one subdir per execution, for multiple runs)
     # ── Parameter-tagged, date-isolated run directory ──
@@ -669,6 +676,16 @@ def parse_args():
                         help='Forward return period in days (default: config evolution.forward_period, 10)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Portfolio holding period in days for backtest (default: config value, 1 = daily rebalance)')
+    # Seed default from config.yaml ('seed') so the CLI honors the global field.
+    _seed_default = 42
+    try:
+        import yaml
+        with open('config/config.yaml', encoding='utf-8') as _f:
+            _seed_default = (yaml.safe_load(_f) or {}).get('seed', 42)
+    except Exception:
+        pass
+    parser.add_argument('--seed', type=int, default=_seed_default,
+                        help='Random seed for reproducibility (config: seed)')
     return parser.parse_args()
 
 
@@ -685,5 +702,6 @@ if __name__ == "__main__":
         test_end_date=args.test_end,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
+        seed=args.seed,
     )
     print("\nDone!")

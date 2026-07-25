@@ -134,7 +134,10 @@ def _create_model(n_estimators: int = 200,
             reg_alpha=0.1,
             reg_lambda=1.0,
             random_state=random_state,
-            n_jobs=-1,
+            # n_jobs=1 (not -1) for bit-reproducible results: under multiple
+            # threads XGBoost's histogram aggregation order differs run-to-run,
+            # and XGBoost does not guarantee determinism under parallelism.
+            n_jobs=1,
             tree_method='hist',
         )
     else:
@@ -154,6 +157,7 @@ def _train_predict_oneshot(
     n_estimators: int = 200,
     max_depth: int = 5,
     learning_rate: float = 0.05,
+    random_state: int = 42,
 ) -> pd.DataFrame:
     """
     Train a single model on the training slice and predict on the test slice.
@@ -205,6 +209,7 @@ def _train_predict_oneshot(
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
+        random_state=random_state,
     )
     model.fit(train_feature_vals.values, train_target_vals)
     print(f"  Model trained (one-shot on {len(train_dates)} days)")
@@ -305,6 +310,7 @@ def run_xgboost_simple(
     learning_rate: float = 0.05,
     holding_period: int = 1,
     forward_period: int = 10,
+    seed: int = 42,
     output_dir: Optional[str] = None,
 ) -> Dict:
     """
@@ -388,6 +394,7 @@ def run_xgboost_simple(
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
+        random_state=seed,
     )
     print(f"  Predictions: {predictions.shape[0]} days x "
           f"{predictions.shape[1]} stocks")
@@ -527,6 +534,7 @@ if __name__ == '__main__':
         pass
     _ev = _cli_cfg.get('evolution', {})
     _bt = _cli_cfg.get('backtest', {}).get('trading', {})
+    _seed = _cli_cfg.get('seed', 42)
 
     parser = argparse.ArgumentParser(
         description='Run simplified XGBoost baseline (close-price-only) with main DataLoader')
@@ -556,6 +564,8 @@ if __name__ == '__main__':
     parser.add_argument('--forward-period', type=int,
                         default=_ev.get('forward_period', 10),
                         help='Forward return period in days (config: evolution.forward_period)')
+    parser.add_argument('--seed', type=int, default=_seed,
+                        help='Random seed for reproducibility (config: seed)')
     parser.add_argument('--output-dir', default='experiments/xgboost_simple',
                         help='Output directory')
 
@@ -574,6 +584,7 @@ if __name__ == '__main__':
         learning_rate=args.learning_rate,
         holding_period=args.holding_period,
         forward_period=args.forward_period,
+        seed=args.seed,
         output_dir=args.output_dir,
     )
 

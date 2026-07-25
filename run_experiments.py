@@ -602,6 +602,7 @@ class ExperimentRunner:
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagrail"
+        seed = int(self.config.get('seed', 42))
 
         results = run_alphagrail_baseline(
             config_path=self.config_path,
@@ -614,6 +615,7 @@ class ExperimentRunner:
             holding_period=holding_period,
             forward_period=forward_period,
             use_llm_tournament=False,
+            seed=seed,
             output_dir=output_dir,
         )
 
@@ -656,6 +658,7 @@ class ExperimentRunner:
         # baseline's hardcoded default of 1.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/mcts_llm_alpha"
+        seed = int(self.config.get('seed', 42))
 
         results = run_mcts_llm_alpha_baseline(
             config_path="config/config.yaml",
@@ -664,6 +667,7 @@ class ExperimentRunner:
             use_llm=False,  # No LLM by default for reproducible baseline
             forward_period=forward_period,
             holding_period=holding_period,
+            seed=seed,
         )
 
         metrics = results.get('metrics', {})
@@ -708,6 +712,7 @@ class ExperimentRunner:
         alpha101_ratio = float(
             (self.config.get('alphafama') or {}).get('alpha101_ratio', 0.5)
         )
+        seed = int(self.config.get('seed', 42))
 
         results = run_alphafama_baseline(
             config_path="config/config.yaml",
@@ -720,6 +725,7 @@ class ExperimentRunner:
             forward_period=forward_period,
             holding_period=holding_period,
             alpha101_ratio=alpha101_ratio,
+            seed=seed,
             output_dir=output_dir,
         )
         
@@ -763,12 +769,13 @@ class ExperimentRunner:
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
 
         output_dir = f"{self.output_dir}/alphaagent"
+        seed = int(self.config.get('seed', 42))
 
         results = run_alphaagent_baseline(
             config_path="config/config.yaml",
             output_dir=output_dir,
             n_formulas=50,
-            seed=42,
+            seed=seed,
             train_start_date=start_date,
             test_end_date=end_date,
             train_end_date=train_end,
@@ -807,6 +814,7 @@ class ExperimentRunner:
             # forward_period / holding_period config-driven
             forward_period = self.config['evolution'].get('forward_period', 10)
             holding_period = self.config['backtest']['trading'].get('holding_period', 1)
+            seed = int(self.config.get('seed', 42))
             results = run_alphaforge_baseline(
                 config_path=self.config_path,
                 train_start_date=self.config['data'].get('train_start_date', '2023-01-01'),
@@ -814,6 +822,10 @@ class ExperimentRunner:
                 instruments=self.config['data']['universe'].get('name', 'csi300'),
                 top_n_stocks=self.config.get('backtest', {}).get('top_n_stocks', 50),
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
+                # Keep AlphaForge's 5-seed variance-reduction averaging, but
+                # base the seed list on the global config seed so it is fully
+                # reproducible and config-controlled.
+                seeds=[seed + i for i in range(5)],
                 output_dir=f"{self.output_dir}/alphaforge",
                 verbose=True,
                 use_gan=True,
@@ -876,6 +888,7 @@ class ExperimentRunner:
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
 
         output_dir = f"{self.output_dir}/xgboost"
+        seed = int(self.config.get('seed', 42))
 
         results = run_xgboost_baseline(
             config_path=self.config_path,
@@ -885,13 +898,12 @@ class ExperimentRunner:
             train_end_date=train_end,
             test_start_date=test_start,
             top_n_stocks=50,
-            train_window=250,
-            retrain_freq=5,
             n_estimators=200,
             max_depth=5,
             learning_rate=0.05,
             holding_period=holding_period,
             forward_period=forward_period,
+            random_state=seed,
             output_dir=output_dir,
         )
 
@@ -931,6 +943,7 @@ class ExperimentRunner:
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagen"
+        seed = int(self.config.get('seed', 42))
 
         results = run_alphagen_baseline(
             config_path=self.config_path,
@@ -944,7 +957,7 @@ class ExperimentRunner:
             top_n_stocks=50,
             holding_period=holding_period,
             forward_period=forward_period,
-            seed=42,
+            seed=seed,
             output_dir=output_dir,
         )
 

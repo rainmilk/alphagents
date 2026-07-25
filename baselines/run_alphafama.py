@@ -701,6 +701,7 @@ def run_alphafama_baseline(
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
     n_jobs: Optional[int] = None,
+    seed: int = 42,
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -1397,7 +1398,7 @@ def _simulate_portfolio_from_ic(
         score = pd.Series(0.0, index=exp.index)
         for f in top_factor_names:
             if f in exp.columns:
-                f_vals = exp[f].dropna()
+                f_vals = exp[f].dropna().astype(float)
                 if len(f_vals) > 1:
                     # Winsorize to [1%, 99%] before z-scoring: Alpha101 factors are
                     # extremely heavy-tailed, and a single outlier can inflate the
@@ -1487,6 +1488,9 @@ if __name__ == '__main__':
                         help='Worker processes for Alpha101 factor computation '
                              '(step 4). None=auto (cpu_count-1). 1=serial. '
                              'Env override: ALPHAFAMA_N_JOBS.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (config: seed). AlphaFAMA IC pipeline '
+                             'is deterministic; this only seeds the LLM-mining path.')
 
     # Seed config-driven defaults (e.g. alpha101_ratio) before final parse so
     # the CLI flag can still override them. Pre-parse only --config first.
@@ -1494,15 +1498,17 @@ if __name__ == '__main__':
     _pre.add_argument('--config', default='config/config.yaml')
     _cfg_ns, _ = _pre.parse_known_args()
     _alpha101_default = 0.5
+    _seed_default = 42
     try:
         with open(_cfg_ns.config, 'r', encoding='utf-8') as f:
             _cfg = yaml.safe_load(f) or {}
         _alpha101_default = float(
             (_cfg.get('alphafama') or {}).get('alpha101_ratio', 0.5)
         )
+        _seed_default = int(_cfg.get('seed', 42))
     except Exception:
         pass
-    parser.set_defaults(alpha101_ratio=_alpha101_default)
+    parser.set_defaults(alpha101_ratio=_alpha101_default, seed=_seed_default)
 
     args = parser.parse_args()
 
@@ -1521,6 +1527,7 @@ if __name__ == '__main__':
         forward_period=args.forward_period,
         holding_period=args.holding_period,
         n_jobs=args.n_jobs,
+        seed=args.seed,
     )
 
     print("\n" + "=" * 60)

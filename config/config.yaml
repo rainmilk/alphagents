@@ -5,6 +5,15 @@
 # Keys marked [UNUSED] are defined here as reference/roadmap but
 # are not yet read by any code path — they have no runtime effect.
 
+# ==================== Global Random Seed [ACTIVE] ====================
+# Single source of truth for reproducibility across ALL 9 baselines.
+# Each baseline reads this value (the CLI `--seed` flag overrides it).
+# Deterministic baselines (e.g. AlphaGrail formula evaluation) ignore it;
+# the ML/RL baselines (LSTM, XGBoost x2, AlphaGen, AlphaAgent, MCTS,
+# AlphaForge) seed their RNGs from it. Change one number to re-run the
+# whole paper under a fresh but reproducible seed.
+seed: 42
+
 # ==================== Data Configuration [ALL ACTIVE] ====================
 data:
   # Data source — loader supports westock, tushare, akshare, auto
