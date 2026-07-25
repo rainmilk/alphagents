@@ -869,8 +869,8 @@ class RiskConfig:
     min_stock_weight: float = 0.001
     max_industry_exposure: float = 0.30
     max_turnover: float = 0.50           # 单期最大单边换手率
-    min_market_cap_percentile: float = 0.10  # 市值过滤（排最低10%）
-    exclude_st: bool = True
+    min_market_cap_percentile: float = 0.0  # 市值过滤（disabled：放宽，不再剔除小市值）
+    exclude_st: bool = False
 
 
 class RiskManager:

@@ -10,6 +10,7 @@ Date: 2026-06-07
 """
 
 import os
+import argparse
 # Workaround for "OMP: Error #15: ... libiomp5md.dll already initialized" on Windows.
 # torch / xgboost / scikit-learn each ship their own copy of the OpenMP runtime;
 # loading more than one in a single process triggers the conflict. Setting this
@@ -75,7 +76,12 @@ class ExperimentRunner:
         
         self.results = {}
         self.output_dir = self.config['output']['results_dir']
-        
+
+        # CLI override for the AlphaFAMA Alpha101/LLM split ratio. None means
+        # "use config alphafama.alpha101_ratio". Set via run_all_experiments(...)
+        # (which is fed by the --alpha101-ratio CLI flag in __main__).
+        self.alpha101_ratio_override = None
+
         os.makedirs(self.output_dir, exist_ok=True)
         
         print("=" * 60)
@@ -707,11 +713,14 @@ class ExperimentRunner:
 
         output_dir = f"{self.output_dir}/alphafama"
 
-        # Alpha101 participation ratio from config (fallback 0.5). Overridable
-        # via the --alpha101-ratio CLI flag when running the baseline directly.
-        alpha101_ratio = float(
-            (self.config.get('alphafama') or {}).get('alpha101_ratio', 0.5)
-        )
+        # Alpha101 participation ratio: CLI override (set via run_all_experiments
+        # / --alpha101-ratio) takes precedence over config alphafama.alpha101_ratio.
+        if self.alpha101_ratio_override is not None:
+            alpha101_ratio = float(self.alpha101_ratio_override)
+        else:
+            alpha101_ratio = float(
+                (self.config.get('alphafama') or {}).get('alpha101_ratio', 0.5)
+            )
         seed = int(self.config.get('seed', 42))
 
         results = run_alphafama_baseline(
@@ -1168,11 +1177,19 @@ class ExperimentRunner:
 def run_all_experiments(
         start_end_dates: Dict[str, List[Tuple[str, str]]],
         data_source: str = "auto",
-        n_evolution_rounds: int = 3):
+        n_evolution_rounds: int = 3,
+        alpha101_ratio: Optional[float] = None):
     """
     Run all experiments for the AAAI 2027 paper.
+
+    Args:
+        alpha101_ratio: If provided, overrides config alphafama.alpha101_ratio
+            for the AlphaFAMA baseline (Alpha101/LLM final top-k split). Mirrors
+            the --alpha101-ratio CLI flag of baselines/run_alphafama.py.
     """
     runner = ExperimentRunner()
+    if alpha101_ratio is not None:
+        runner.alpha101_ratio_override = alpha101_ratio
     
     # Run main experiment
     # runner.run_main_experiment(n_runs=3)  # Use 3 runs for quick testing
@@ -1199,10 +1216,23 @@ def run_all_experiments(
 
 
 if __name__ == '__main__':
+    # Minimal CLI: only the knobs that are commonly swept across runs. Everything
+    # else stays config-driven. --alpha101-ratio mirrors the same flag in
+    # baselines/run_alphafama.py and overrides config alphafama.alpha101_ratio.
+    _parser = argparse.ArgumentParser(description='Run all AAAI-2027 experiments')
+    _parser.add_argument('--alpha101-ratio', type=float, default=None,
+                        help='Override config alphafama.alpha101_ratio for the '
+                             'AlphaFAMA baseline (Alpha101/LLM final top-k split). '
+                             'None = use config value.')
+    _cli = _parser.parse_args()
+
     start_end_dates = {
         'train_dates': [('20210101', '20221231'), ('20220101', '20231231'), ('20230101', '20241231')],
         'test_dates': [('20230101', '20231231'), ('20240101', '20241231'), ('20250101', '20W251231')],
     }
 
     # Run all experiments
-    results = run_all_experiments(start_end_dates)
+    results = run_all_experiments(
+        start_end_dates,
+        alpha101_ratio=_cli.alpha101_ratio,
+    )

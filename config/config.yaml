@@ -33,9 +33,9 @@ data:
     index: "hs300"  # hs300, zz500, all_a
     start_date: "2020-01-01"
     end_date: "2026-06-30"
-    min_market_cap: 5e9  # 5 billion
-    exclude_st: true
-    exclude_suspended: true
+    min_market_cap: 1e9  # 1 billion (loosened from 5e9; NOTE: loader does not currently enforce this key)
+    exclude_st: false               # do NOT drop ST stocks (per MASE config request)
+    exclude_suspended: false        # do NOT drop suspended / non-tradable stocks
   
   # Train/Test split (CRITICAL for preventing overfitting)
   # Factors are evolved on TRAIN data, backtested on TEST data.
@@ -227,9 +227,9 @@ fusion:
   portfolio:
     top_n: 50                     # number of stocks to hold
     method: "score_proportional"  # top_n | score_proportional
-    max_weight: 0.05              # single-stock weight cap
-    max_industry_exposure: 0.30   # single-industry weight cap
-    min_market_cap_percentile: 10 # exclude bottom percentile by market cap
+    max_weight: 0.50              # single-stock weight cap
+    max_industry_exposure: 0.80   # single-industry weight cap
+    min_market_cap_percentile: 0 # disabled (loosened; bottom-10% market-cap exclusion removed)
 
 # ==================== Backtest Configuration ====================
 backtest:

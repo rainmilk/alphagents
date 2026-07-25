@@ -1098,6 +1098,20 @@ def run_alphafama_baseline(
     # merged frame); derive LLM columns as the complement within mean_train_ic.
     _llm_cols = [c for c in mean_train_ic.index if c not in set(_alpha101_cols)]
 
+    # Guard: if the LLM family is empty, the ratio has nothing to split against
+    # and silently degrades to an all-Alpha101 selection. Make that explicit so
+    # a user who expected a 5+5 / 2+8 mix isn't left wondering why the ratio
+    # "does nothing". This happens when LLM mining is off (--no-llm), the LLM
+    # config has no api_key/model (Step 5b skips mining), or mining produced
+    # zero usable factors.
+    if 0.0 < _alpha101_ratio < 1.0 and len(_llm_cols) == 0:
+        print(f"\n  WARNING: alpha101_ratio={_alpha101_ratio:.2f} requested an "
+              f"Alpha101/LLM split, but 0 LLM factors are available "
+              f"(used_llm={used_llm}). The ratio is being IGNORED — all top-"
+              f"{_top_k} slots fall back to Alpha101. Enable LLM mining (valid "
+              f"api_key/model) or set alpha101_ratio to 0 or 1 for a "
+              f"deterministic single-family run.")
+
     _top_k = min(10, len(mean_train_ic))
     _n_a = int(round(_alpha101_ratio * _top_k))
     _n_a = max(0, min(_n_a, len(_alpha101_cols)))
