@@ -125,7 +125,9 @@ evolution:
   n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
   alpha101_top_k: 5             # [ACTIVE] Step 4c Alpha101 RETRIEVAL top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5.
   n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
-  use_alpha101_seeds: true       # [ACTIVE] enable Step 4c Alpha101 retrieval (score the Alpha101 library, merge top-k into the pool for Step 5). Set false to skip Step 4c entirely.
+  retrieve_alpha101: true        # [ACTIVE] enable Step 4c Alpha101 retrieval (score the Alpha101 library, merge top-k into the pool for Step 5). Set false to skip Step 4c entirely.
+  alpha101_max_workers: 0        # [ACTIVE] Step 4c parallel worker count for scoring the whole Alpha101 library (0 = auto = min(32, cpu_count()+4)). More workers = faster on multi-core, but each holds a factor panel in RAM.
+  eval_max_workers: 0            # [ACTIVE] evolution-loop parallel worker count for backtesting factors each round (0 = auto = min(32, cpu_count()+4)).
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
   n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
   max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)

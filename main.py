@@ -390,6 +390,7 @@ class AAAI2027Pipeline:
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
         n_shots = evo_cfg.get('n_shots', 3)
+        eval_max_workers = int(evo_cfg.get('eval_max_workers', 0) or 0)
         # Alpha101 is NO LONGER generated as a seed here. It is now *retrieved
         # by score* in Step 4c (step4c_retrieve_alpha101), which scores the full
         # Alpha101 library on TRAIN data and merges the top-k into the candidate
@@ -397,9 +398,9 @@ class AAAI2027Pipeline:
         # factors so the evolution seeds stay pure hypothesis + memory-augment.
         # Step 4c (retrieve Alpha101 by score) is driven by two config knobs:
         #   alpha101_top_k      -> Step 4c retrieve top-k count
-        #   use_alpha101_seeds  -> Step 4c enable/disable flag
+        #   retrieve_alpha101  -> Step 4c enable/disable flag
         alpha101_retrieve_top_k = int(evo_cfg.get('alpha101_top_k', 0))
-        alpha101_retrieval_enabled = bool(evo_cfg.get('use_alpha101_seeds', True))
+        alpha101_retrieval_enabled = bool(evo_cfg.get('retrieve_alpha101', True))
         print(f"\n[Step 3] Generating seed factors — "
               f"hypothesis: {n_seeds_hypothesis}, "
               f"memory-augment: {n_seeds_memory_augment}")
@@ -614,6 +615,7 @@ class AAAI2027Pipeline:
             backtester=backtester,
             n_rounds=n_rounds,
             val_backtester=val_backtester,
+            max_workers=eval_max_workers,
         )
 
         self.evolution_history = evolution_result.evolution_history
@@ -739,7 +741,7 @@ class AAAI2027Pipeline:
         Alpha101 factors are tagged ``_from_alpha101=True`` so Step 5's
         memory-save skips re-persisting these publicly-known library factors.
 
-        Controlled by config ``evolution.use_alpha101_seeds`` (enable/disable)
+        Controlled by config ``evolution.retrieve_alpha101`` (enable/disable)
         and ``evolution.alpha101_top_k`` (top-k count).
         """
         if not METHODS_AVAILABLE:
@@ -748,10 +750,17 @@ class AAAI2027Pipeline:
 
         evo_cfg = self.config['evolution']
         top_k = int(evo_cfg.get('alpha101_top_k', 50))
-        enabled = bool(evo_cfg.get('use_alpha101_seeds', True))
+        enabled = bool(evo_cfg.get('retrieve_alpha101', True))
+        # Parallel worker count: 0 (default) => auto-scale to the machine so we
+        # don't leave cores idle (the old hardcoded 4 wasted half an 8+ core box).
+        # Any explicit value > 0 is used as-is.
+        n_workers_cfg = int(evo_cfg.get('alpha101_max_workers', 0) or 0)
+        max_workers = (n_workers_cfg
+                       if n_workers_cfg > 0
+                       else max(1, min(32, (os.cpu_count() or 4) + 4)))
         if not enabled or top_k <= 0:
             print(f"\n[Step 4c] Skipped: Alpha101 retrieval disabled "
-                  f"(use_alpha101_seeds={enabled}, top_k={top_k})")
+                  f"(retrieve_alpha101={enabled}, top_k={top_k})")
             return
 
         if not hasattr(self, 'best_factors') or not self.best_factors:
@@ -760,7 +769,7 @@ class AAAI2027Pipeline:
             return
 
         print(f"\n[Step 4c] Retrieving Alpha101 factors "
-              f"(score all, keep top-{top_k})...")
+              f"(parallel scoring, {max_workers} workers, keep top-{top_k})...")
 
         # --- Backtester: reuse the exact evolution backtester when available ---
         backtester = getattr(self, '_train_backtester', None)
@@ -807,7 +816,7 @@ class AAAI2027Pipeline:
 
         # --- Score ALL of them on TRAIN data (parallel) ---
         metrics_list = backtester.evaluate_batch(
-            a101_factors, max_workers=4, parallel=True)
+            a101_factors, max_workers=max_workers, parallel=True)
 
         scored = []
         for f, m in zip(a101_factors, metrics_list):
@@ -2305,19 +2314,24 @@ Examples:
              'on TRAIN data and merge the top-k into the candidate pool for Step 5.',
     )
     parser.add_argument(
+        '--alpha101-max-workers', dest='alpha101_max_workers', type=int, default=None,
+        help='Step 4c parallel worker count for scoring the Alpha101 library '
+             '(default: config value; 0 = auto = min(32, cpu_count()+4)).',
+    )
+    parser.add_argument(
         '--n-seeds-memory-augment', type=int, default=None,
         help='Number of memory-augmented seed factors (default: config value)',
     )
     parser.add_argument(
-        '--use-alpha101-seeds', dest='use_alpha101_seeds', action='store_true',
+        '--retrieve-alpha101', dest='retrieve_alpha101', action='store_true',
         default=None,
         help='[DEFAULT ON] Enable Step 4c Alpha101 retrieval: score the whole '
              'Alpha101 library on TRAIN data and merge the top-k into the '
              'candidate pool for Step 5. Alpha101 is no longer seeded in Step 3. '
-             'Pass --no-use-alpha101-seeds to skip Step 4c entirely.',
+             'Pass --no-retrieve-alpha101 to skip Step 4c entirely.',
     )
     parser.add_argument(
-        '--no-use-alpha101-seeds', dest='use_alpha101_seeds', action='store_false',
+        '--no-retrieve-alpha101', dest='retrieve_alpha101', action='store_false',
         help='Disable Step 4c Alpha101 retrieval (skip scoring the library).',
     )
     parser.add_argument(
@@ -2380,10 +2394,12 @@ Examples:
             evo_overrides['n_seeds_hypothesis'] = args.n_seeds_hypothesis
         if args.alpha101_top_k is not None:
             evo_overrides['alpha101_top_k'] = args.alpha101_top_k
+        if args.alpha101_max_workers is not None:
+            evo_overrides['alpha101_max_workers'] = args.alpha101_max_workers
         if args.n_seeds_memory_augment is not None:
             evo_overrides['n_seeds_memory_augment'] = args.n_seeds_memory_augment
-        if args.use_alpha101_seeds is not None:
-            evo_overrides['use_alpha101_seeds'] = args.use_alpha101_seeds
+        if args.retrieve_alpha101 is not None:
+            evo_overrides['retrieve_alpha101'] = args.retrieve_alpha101
         if args.n_shots is not None:
             evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:

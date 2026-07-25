@@ -2623,6 +2623,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         backtester: FactorBacktester,
         n_rounds: int = 10,
         val_backtester: Optional['FactorBacktester'] = None,
+        max_workers: int = 0,
     ) -> EvolutionResult:
         """
         Evolve factors through iterative improvement.
@@ -2637,10 +2638,20 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                 *ranked* and *early-stopped* on validation IC — the standard
                 anti-overfitting recipe. When None, behaviour is unchanged
                 (selection/early-stop use train IC).
+            max_workers: Parallel worker count for backtesting factors each
+                round (passed to ``FactorBacktester.evaluate_batch``). 0 (default)
+                = auto-scale to the machine: ``min(32, os.cpu_count() + 4)``.
 
         Returns:
             Evolution result
         """
+        # Resolve parallel worker count (0 => auto). Same rationale as Step 4c:
+        # pandas C-level ops release the GIL, so threads parallelise the heavy
+        # backtest; we just stop hardcoding 4 and leaving cores idle.
+        n_workers = (max_workers
+                     if max_workers and max_workers > 0
+                     else max(1, min(32, (os.cpu_count() or 4) + 4)))
+
         val_mode = val_backtester is not None
 
         def _ic_key(f: CandidateFactor) -> float:
@@ -2666,7 +2677,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             # Evaluate current factors
             mode = "parallel" if self.parallel else "serial"
             print(f"  Evaluating {len(current_factors)} factors ({mode})...")
-            metrics_list = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
+            metrics_list = backtester.evaluate_batch(current_factors, max_workers=n_workers, parallel=self.parallel)
 
             # Validation evaluation. We evaluate on *independent probe* factors
             # (same expression, fresh objects) so the validation pass cannot
@@ -2678,7 +2689,7 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
                                           description=f.description or "")
                               for f in current_factors]
                 val_metrics_list = val_backtester.evaluate_batch(
-                    val_probes, max_workers=4, parallel=self.parallel)
+                    val_probes, max_workers=n_workers, parallel=self.parallel)
 
             evaluated_factors = []
             for i, factor in enumerate(current_factors):
@@ -2847,14 +2858,14 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
         # Evaluate the final round's improved_factors — they were generated but never assessed
         if current_factors:
             print(f"\n[evolve] Evaluating final improved factors ({len(current_factors)})...")
-            final_metrics = backtester.evaluate_batch(current_factors, max_workers=4, parallel=self.parallel)
+            final_metrics = backtester.evaluate_batch(current_factors, max_workers=n_workers, parallel=self.parallel)
             val_final_metrics = None
             if val_mode:
                 val_probes = [CandidateFactor(id=f.id, expression=f.expression,
                                           description=f.description or "")
                               for f in current_factors]
                 val_final_metrics = val_backtester.evaluate_batch(
-                    val_probes, max_workers=4, parallel=self.parallel)
+                    val_probes, max_workers=n_workers, parallel=self.parallel)
             for i, factor in enumerate(current_factors):
                 metrics = final_metrics[i]
                 factor.ic = metrics.get('ic', float('nan'))

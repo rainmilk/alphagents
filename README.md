@@ -246,6 +246,7 @@ Options:
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
   --alpha101-top-k N       Step 4c Alpha101 retrieval top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5 (default: config alpha101_top_k). Alpha101 is no longer seeded in Step 3.
+  --alpha101-max-workers N Step 4c parallel worker count for scoring the Alpha101 library (default: config alpha101_max_workers; 0 = auto = min(32, cpu_count()+4)).
   --n-seeds N              [legacy] Convenience: set alpha101_top_k (Step 4c Alpha101 retrieval top-k). Prefer --alpha101-top-k.
   --n-seeds-hypothesis N   Number of hypothesis-driven seed factors (default: config)
   --n-seeds-memory-augment N Number of memory-augmented seed factors (default: config; 0 = off)
