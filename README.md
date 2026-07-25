@@ -245,9 +245,9 @@ Options:
   --end DATE               End date for real data (default: 2024-12-31)
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
-  --n-seeds N              [legacy] Convenience: set n_seeds_single_stage (single-stage seed count). Prefer the three explicit flags below.
+  --n-seeds N              [legacy] Convenience: set n_seeds_alpha101_stage (alpha101 seed count). Prefer the three explicit flags below.
   --n-seeds-hypothesis N   Number of hypothesis-driven seed factors (default: config)
-  --n-seeds-single-stage N  Number of plain single-stage seed factors (default: config)
+  --n-seeds-alpha101-stage N  Number of plain alpha101 seed factors (default: config)
   --n-seeds-memory-augment N Number of memory-augmented seed factors (default: config; 0 = off)
   --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
   --n-best-factors N       Override evolution.n_best_factors from config

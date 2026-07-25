@@ -123,12 +123,13 @@ llm:
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
-  n_seeds_single_stage: 15       # [ACTIVE] plain single-stage seed factors
-  n_seeds_memory_augment: 20     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_seeds_alpha101_stage: 50       # [ACTIVE] plain alpha101 seed factors (derived from the Alpha101 library when use_alpha101_seeds: true)
+  n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  use_alpha101_seeds: true       # [ACTIVE] alpha101 seed factors are drawn directly from the Alpha101 formula library (methods.alpha101) instead of the LLM. Set false to use LLM alpha101 seeds.
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
   n_best_factors: 25   # [ACTIVE] top-N factors to retain per round
-  max_rounds: 15       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
-  n_improve: 20        # [ACTIVE] target number of improved factors per round (LLM generation)
+  max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
+  n_improve: 10        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
   convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
   convergence_window: 2     # [ACTIVE] number of recent rounds to check for convergence
@@ -260,7 +261,7 @@ alphafama:
   # Proportion of the FINAL top-k selected factors that come from the Alpha101
   # family (rest are LLM). 0=all LLM; 0.5=half/half; 1=all Alpha101 (default 0.5).
   # Overridable at runtime via the --alpha101-ratio CLI flag.
-  alpha101_ratio: 0.5
+  alpha101_ratio: 0
 
 # This section is defined as a placeholder for planned cross-validation / baseline
 # comparison features. No code reads these keys at runtime.

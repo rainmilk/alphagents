@@ -181,6 +181,11 @@ _GATE_ALLOWED_FUNCS = {
     'ts_zscore', 'ts_decay', 'delay', 'sign', 'abs', 'log', 'sqrt', 'if',
     'ts_pct_change',
     'ts_slope',
+    # --- Alpha101 primitives (extend DSL so MASE can express WorldQuant alphas) ---
+    'ts_argmax', 'ts_argmin', 'signedpower', 'scale', 'decay_linear',
+    'ts_product', 'correlation',
+    # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y), distinct from rolling ts_min/ts_max) ---
+    'ele_min', 'ele_max',
 }
 # LLM-frequent aliases → canonical (mirrors _FactorExprEvaluator._FUNC_ALIASES)
 _GATE_FUNC_ALIASES = {
@@ -194,6 +199,22 @@ _GATE_FUNC_ALIASES = {
     'ts_roc':       'ts_pct_change',   # rate of change = pct change
     'ts_trend':     'ts_slope',        # alias for rolling linear-regression slope
     'ts_skewness': 'ts_skew', 'ts_kurtosis': 'ts_kurt',
+    # --- Alpha101 primitive aliases ---
+    'correlation':  'ts_corr',         # Alpha101 cross-sectional corr == per-stock ts_corr
+    'ts_arg_max':   'ts_argmax',
+    'argmax':       'ts_argmax',
+    'ts_arg_min':   'ts_argmin',
+    'argmin':       'ts_argmin',
+    'signed_power': 'signedpower',
+    'spower':       'signedpower',
+    'ts_decay_linear': 'decay_linear',  # WorldQuant canonical name for decay_linear
+    'decay':        'decay_linear',
+    'product':      'ts_product',
+    # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y)) ---
+    'Min':          'ele_min',
+    'Max':          'ele_max',
+    'elementwise_min': 'ele_min',
+    'elementwise_max': 'ele_max',
 }
 
 # --- Allowed DATA FIELDS (the ONLY identifiers the evaluator accepts) ---
@@ -512,6 +533,16 @@ class _FactorExprEvaluator:
         abs(X)           — element-wise absolute value
         log(X)           — element-wise natural log
         sqrt(X)          — element-wise square root (clamped >= 0)
+        # --- Alpha101 primitives ---
+        ts_argmax(X, w)  — periods since rolling max (0=today, w-1=w days ago)
+        ts_argmin(X, w)  — periods since rolling min
+        signedpower(X, p)— sign(X) * |X|^p
+        scale(X, a)      — cross-sectional rescale so sum(|X|)=a (default 1)
+        decay_linear(X, w) — linearly-weighted moving avg (newest weighted highest)
+        ts_product(X, w) — rolling product over trailing w days
+        correlation(X, Y, w) — alias of ts_corr (per-stock rolling correlation)
+        ele_min(X, Y)     — element-wise min of two series (Alpha101 Min(x,y))
+        ele_max(X, Y)     — element-wise max of two series (Alpha101 Max(x,y))
 
     Operators: +, -, *, /, ^ and ** (power)
     """
@@ -741,7 +772,23 @@ class _FactorExprEvaluator:
         'ts_kurtosis':  'ts_kurt',
         'ts_roc':       'ts_pct_change',   # rate of change = pct change
         'ts_trend':     'ts_slope',        # common alias for rolling slope
-    }
+        # --- Alpha101 primitive aliases ---
+        'correlation':  'ts_corr',         # Alpha101 cross-sectional corr == per-stock ts_corr
+        'ts_arg_max':   'ts_argmax',
+        'argmax':       'ts_argmax',
+        'ts_arg_min':   'ts_argmin',
+        'argmin':       'ts_argmin',
+        'signed_power': 'signedpower',
+        'spower':       'signedpower',
+        'ts_decay_linear': 'decay_linear',  # WorldQuant canonical name for decay_linear
+    'decay':        'decay_linear',
+    'product':      'ts_product',
+    # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y)) ---
+    'Min':          'ele_min',
+    'Max':          'ele_max',
+    'elementwise_min': 'ele_min',
+    'elementwise_max': 'ele_max',
+}
 
     def _dispatch_func(self, name: str, args: List) -> pd.DataFrame:
         """Route function call to implementation."""
@@ -774,6 +821,17 @@ class _FactorExprEvaluator:
             'log':        (1, 1),
             'sqrt':       (1, 1),
             'if':         (3, 3),
+            # --- Alpha101 primitives ---
+            'ts_argmax':  (2, 2),
+            'ts_argmin':  (2, 2),
+            'signedpower':(1, 2),
+            'scale':      (1, 2),
+            'decay_linear':(2, 2),
+            'ts_product': (2, 2),
+            'correlation':(3, 3),
+            # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y)) ---
+            'ele_min':    (2, 2),
+            'ele_max':    (2, 2),
         }
 
         if name in arity_map:
@@ -811,6 +869,22 @@ class _FactorExprEvaluator:
         if isinstance(raw, float) and np.isnan(raw):
             return default
         return int(raw)
+
+    @staticmethod
+    def _safe_float(val, default: float = 1.0) -> float:
+        """Convert a window/scale argument (scalar DataFrame from a NUMBER token,
+        a Series, or a plain number) to float, NaN-safe. Mirrors _safe_int."""
+        if isinstance(val, pd.DataFrame):
+            raw = val.iloc[0, 0] if val.values.size > 0 else default
+        elif isinstance(val, pd.Series):
+            raw = val.iloc[0] if len(val) > 0 else default
+        elif isinstance(val, (int, float)):
+            raw = val
+        else:
+            raw = default
+        if isinstance(raw, float) and np.isnan(raw):
+            return default
+        return float(raw)
 
     # ---- Function implementations ----
 
@@ -978,6 +1052,110 @@ class _FactorExprEvaluator:
     def _fn_if(cond: pd.DataFrame, x: pd.DataFrame, y: pd.DataFrame) -> pd.DataFrame:
         """if(cond, x, y) — element-wise ternary: return x where cond!=0, else y."""
         return x.where(cond != 0, y)
+
+    # ---- Alpha101 primitive operators (added to extend the DSL) -----------
+
+    @staticmethod
+    def _fn_ts_argmax(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_argmax(x, d) — position (in periods) of the max within the trailing
+        d-day window, counting BACK from the most recent day. Mirrors WorldQuant's
+        ts_argmax: (d-1) - argmax. Returns 0 if today is the max, d-1 if the max was
+        d days ago. NaN-aware: all-NaN windows yield NaN.
+        """
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+
+        def _amax(arr):
+            a = np.asarray(arr, dtype=float)
+            return np.nan if np.isnan(a).all() else float(np.nanargmax(a))
+
+        return (w - 1) - x.rolling(window=w, min_periods=min_p).apply(_amax, raw=True)
+
+    @staticmethod
+    def _fn_ts_argmin(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_argmin(x, d) — position (in periods) of the min within the trailing
+        d-day window, counting BACK from the most recent day. Mirrors WorldQuant's
+        ts_argmin: (d-1) - argmin.
+        """
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+
+        def _amin(arr):
+            a = np.asarray(arr, dtype=float)
+            return np.nan if np.isnan(a).all() else float(np.nanargmin(a))
+
+        return (w - 1) - x.rolling(window=w, min_periods=min_p).apply(_amin, raw=True)
+
+    @staticmethod
+    def _fn_signedpower(x: pd.DataFrame, p=2) -> pd.DataFrame:
+        """signedpower(x, p) = sign(x) * |x|^p. WorldQuant Alpha101 primitive used
+        to shape a factor's distribution (e.g. alpha001, alpha013, alpha033, ...)."""
+        pval = p if isinstance(p, (int, float)) else _FactorExprEvaluator._safe_int(p)
+        return np.sign(x) * (x.abs() ** pval)
+
+    @staticmethod
+    def _fn_scale(x: pd.DataFrame, a=1) -> pd.DataFrame:
+        """scale(x, a) — rescale *cross-sectionally* (per date, across stocks) so
+        that sum(|x|) over stocks equals a (default 1). Matches WorldQuant's scale
+        semantics; used by many Alpha101 formulas to normalize magnitude.
+        """
+        aval = a if isinstance(a, (int, float)) else _FactorExprEvaluator._safe_float(a, default=1.0)
+        denom = x.abs().sum(axis=1, skipna=True).replace(0, np.nan)
+        return x.div(denom, axis=0) * aval
+
+    @staticmethod
+    def _fn_decay_linear(x: pd.DataFrame, d) -> pd.DataFrame:
+        """decay_linear(x, d) — linearly-weighted moving average over the trailing
+        d days, where the MOST RECENT day has the highest weight (1..d). WorldQuant
+        Alpha101 primitive (e.g. alpha019, alpha028, alpha047).
+        """
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+        weights = np.arange(1, w + 1, dtype=float)  # older=1 ... newest=w
+
+        def _decay(arr):
+            a = np.asarray(arr, dtype=float)
+            n = a.shape[0]
+            if n == 0 or np.isnan(a).all():
+                return np.nan
+            wsub = weights[-n:]  # align weights to the actual (warmup) window length
+            return float(np.nansum(a * wsub) / np.nansum(wsub))
+
+        return x.rolling(window=w, min_periods=min_p).apply(_decay, raw=True)
+
+    @staticmethod
+    def _fn_ts_product(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_product(x, d) — rolling product over the trailing d days, per stock.
+        WorldQuant Alpha101 primitive (e.g. alpha009, alpha022). All-NaN windows
+        yield NaN; partially-NaN windows multiply the valid entries.
+        """
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+
+        def _prod(arr):
+            a = np.asarray(arr, dtype=float)
+            return np.nan if np.isnan(a).all() else float(np.nanprod(a))
+
+        return x.rolling(window=w, min_periods=min_p).apply(_prod, raw=True)
+
+    @staticmethod
+    def _fn_ele_min(x: pd.DataFrame, y: pd.DataFrame) -> pd.DataFrame:
+        """ele_min(x, y) — element-wise minimum of two series (Alpha101 Min(x,y)).
+
+        Note: this is DISTINCT from the rolling ``ts_min``. Both arguments are
+        DataFrames (numeric literals are broadcast to scalar DataFrames by the
+        tokenizer), so clipping `x` by an upper bound of `y` yields min(x, y)
+        element-wise. NaN propagates (np.clip semantics).
+        """
+        return x.clip(upper=y)
+
+    @staticmethod
+    def _fn_ele_max(x: pd.DataFrame, y: pd.DataFrame) -> pd.DataFrame:
+        """ele_max(x, y) — element-wise maximum of two series (Alpha101 Max(x,y)).
+
+        See ``_fn_ele_min`` for the DataFrame/constant broadcast note.
+        """
+        return x.clip(lower=y)
 
 # ---------------------------------------------------------------------------
 # FactorBacktester — lightweight factor backtesting engine
@@ -1409,8 +1587,9 @@ class SelfEvolvingGenerator:
         self,
         llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
         n_seeds_hypothesis: int = 0,
-        n_seeds_single_stage: int = 20,
+        n_seeds_alpha101_stage: int = 20,
         n_seeds_memory_augment: int = 0,
+        use_alpha101_seeds: bool = True,
         n_best_factors: int = 10,
         n_improve: int = 10,
         n_mutate: int = 5,
@@ -1438,7 +1617,7 @@ class SelfEvolvingGenerator:
                 (Stage1→Stage2: LLM proposes market hypotheses, then factors
                 expressing them). Produced whenever ``n_seeds_hypothesis > 0``
                 (no separate master flag needed). 0 = none.
-            n_seeds_single_stage: Target number of **plain single-stage** seed
+            n_seeds_alpha101_stage: Target number of **plain alpha101** seed
                 factors (the legacy 撒网式 coverage prompt, no hypothesis). 0 = none.
             n_seeds_memory_augment: Target number of **memory-augmented** seed
                 factors. Consumed by ``MemoryAugmentedGenerator`` (few-shot
@@ -1482,8 +1661,9 @@ class SelfEvolvingGenerator:
         """
         self.llm_model = llm_model
         self.n_seeds_hypothesis = n_seeds_hypothesis
-        self.n_seeds_single_stage = n_seeds_single_stage
+        self.n_seeds_alpha101_stage = n_seeds_alpha101_stage
         self.n_seeds_memory_augment = n_seeds_memory_augment
+        self.use_alpha101_seeds = use_alpha101_seeds
         self.n_best_factors = n_best_factors
         self.n_improve = n_improve
         self.n_mutate = n_mutate
@@ -1987,24 +2167,24 @@ class SelfEvolvingGenerator:
 
         * ``n_seeds_hypothesis``      → Stage1→Stage2 hypothesis-driven factors.
           Produced whenever ``n_seeds_hypothesis > 0``.
-        * ``n_seeds_single_stage``   → plain single-stage (撒网式) factors.
+        * ``n_seeds_alpha101_stage``   → plain alpha101 (撒网式) factors.
         * ``n_seeds_memory_augment``  → memory-augmented factors. These are NOT
           generated here; ``main.py`` feeds this count to
           ``MemoryAugmentedGenerator`` and concatenates the result. (We only
           report the target here for logging.)
 
         Because the counts are explicit, if the hypothesis pipeline under-
-        delivers we do NOT silently re-fill those slots from single-stage — the
+        delivers we do NOT silently re-fill those slots from alpha101 — the
         produced numbers reflect exactly what was requested. Each subset still
         best-effort tops up its OWN count if the LLM under-delivers a single call.
         Falls back to rule-based generation (filling the requested total) only
         when the LLM is entirely unavailable.
         """
         n_hyp_target = self.n_seeds_hypothesis
-        n_plain_target = self.n_seeds_single_stage
+        n_plain_target = self.n_seeds_alpha101_stage
         n_mem_target = self.n_seeds_memory_augment
         print(f"Generating seed factors — hypothesis: {n_hyp_target}, "
-              f"single-stage: {n_plain_target}, memory-augment(target): {n_mem_target}")
+              f"alpha101: {n_plain_target}, memory-augment(target): {n_mem_target}")
 
         if not (self.use_llm and self.client):
             # LLM unavailable → rule-based fills the local (non-memory) total.
@@ -2020,20 +2200,20 @@ class SelfEvolvingGenerator:
                   f"hypothesis-driven seed factors")
             if not hyp_factors:
                 print("  [hypothesis] pipeline yielded nothing (those seeds dropped "
-                      "— not backfilled from single-stage to keep counts explicit)")
+                      "— not backfilled from alpha101 to keep counts explicit)")
 
-        # ── Single-stage subset ──
+        # ── Alpha101 stage subset ──
         plain_factors: List[CandidateFactor] = []
         if n_plain_target > 0:
-            plain_factors = self._generate_single_stage_factors(n_plain_target)
+            plain_factors = self._generate_alpha101_stage_factors(n_plain_target)
             print(f"  Generated {len(plain_factors)}/{n_plain_target} "
-                  f"single-stage seed factors")
+                  f"alpha101 seed factors")
 
-        # Hypothesis first, then single-stage. No trimming to a shared total —
+        # Hypothesis first, then alpha101. No trimming to a shared total —
         # the two counts are independent by design.
         result = hyp_factors + plain_factors
         print(f"Generated {len(result)} seed factors locally "
-              f"({len(hyp_factors)} hypothesis-driven, {len(plain_factors)} single-stage). "
+              f"({len(hyp_factors)} hypothesis-driven, {len(plain_factors)} alpha101). "
               f"Memory-augmented seeds (target {n_mem_target}) are added by the caller.")
         return result
 
@@ -2069,23 +2249,72 @@ class SelfEvolvingGenerator:
                 print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
         return all_factors[:n_hyp]
 
-    def _generate_single_stage_factors(self, n_plain: int) -> List[CandidateFactor]:
+    def _generate_alpha101_stage_factors(self, n_plain: int) -> List[CandidateFactor]:
         """
-        Plain single-stage (撒网式) generation, targeting ``n_plain`` factors.
+        Plain alpha101 seed factors.
 
-        Best-effort: makes a primary LLM call for ``n_plain`` factors, then a
-        single top-up call if the first under-delivered. Returns whatever was
-        produced (may be fewer than ``n_plain`` only if the LLM keeps failing).
+        When ``self.use_alpha101_seeds`` is True (default), the seeds are drawn
+        DIRECTLY from the Alpha101 formula library (``methods.alpha101``) instead
+        of calling the LLM — i.e. the alpha101 pool *becomes* canonical
+        WorldQuant Alpha101 factors expressed in the MASE DSL.         This is the
+        "Alpha101 seed" path. LLM generation remains
+        the fallback whenever the flag is off or the library yields too few valid
+        factors.
         """
         if n_plain <= 0:
             return []
+
+        # ── Alpha101-seed path (default) ──
+        if getattr(self, "use_alpha101_seeds", True):
+            a101 = self._generate_alpha101_seed_factors(n_plain)
+            if a101:
+                return a101
+
+        # ── Fallback: LLM generation (legacy 撒网式 coverage prompt) ──
         try:
             seed_factors = self._generate_factors_via_llm(n_plain)
             if seed_factors and len(seed_factors) >= 1:
                 return seed_factors[:n_plain]
         except Exception as e:
-            print(f"  [evolve] single-stage generation failed: {e}")
+            print(f"  [evolve] alpha101 LLM generation failed: {e}")
         return []
+
+    def _generate_alpha101_seed_factors(self, n_plain: int) -> List[CandidateFactor]:
+        """Draw ``n_plain`` seed factors directly from the Alpha101 library.
+
+        Deterministically samples (fixed-seed shuffle, so the same ``n_plain``
+        always yields the same subset and runs stay reproducible) from
+        ``methods.alpha101.ALPHA101_FORMULAS``, validates each expression through
+        the DSL gate, and wraps the survivors as ``CandidateFactor`` objects.
+        Family is inferred from the expression so the downstream diversity-aware
+        selection still sees variety within the Alpha101 set.
+        """
+        from .alpha101 import get_alpha101_formulas
+        formulas = get_alpha101_formulas()
+        if not formulas:
+            return []
+        ids = list(formulas.keys())
+        rng = np.random.RandomState(42)
+        rng.shuffle(ids)
+        chosen = ids[:n_plain]
+        out: List[CandidateFactor] = []
+        for fid in chosen:
+            expr = formulas[fid]
+            ok, bad = _validate_factor_expr(expr)
+            if not ok:
+                print(f"  [evolve] skipping Alpha101 seed {fid} (invalid field(s): {bad})")
+                continue
+            out.append(CandidateFactor(
+                id=f"seed_a101_{fid}",
+                expression=expr,
+                description=f"Alpha101 {fid}",
+                generation=0,
+                family=_infer_family(expr),
+            ))
+        if out:
+            print(f"  [evolve] produced {len(out)} Alpha101 seeds "
+                  f"({chosen[0]} … {chosen[-1]})")
+        return out
 
     def _generate_factors_via_llm(self, n_factors: int, hypothesis: Optional[str] = None) -> List[CandidateFactor]:
         """
@@ -2128,6 +2357,13 @@ PRIMARY OPERATOR MENU (pick a DIFFERENT one for each factor you emit):
   - ts_decay(x, w)          linearly-decaying weighted average
   - ts_mean(x, w) / ts_sum(x, w)
   - rank(x) / -rank(x)      cross-sectional rank
+  - ts_argmax(x, w) / ts_argmin(x, w)   rolling position of max/min (Alpha101)
+  - signedpower(x, p)       sign(x)*|x|^p — shape a factor's distribution
+  - scale(x, a)             cross-sectional rescale (sum|rows|=a) for magnitude control
+  - decay_linear(x, w)      linearly-decaying weighted average (recency-weighted)
+  - ts_product(x, w)        rolling product
+  - correlation(x, y, w)    cross-sectional correlation (alias of ts_corr)
+  - ele_min(x, y) / ele_max(x, y)   element-wise min/max (Alpha101 Min/Max; distinct from rolling ts_min/ts_max)
 
 DIVERSITY MANDATE (critical — factors that violate this are低 quality):
   1. SPREAD across families: Momentum, Mean-reversion, Value/Quality, Volatility, Liquidity, Growth.

@@ -388,20 +388,23 @@ class AAAI2027Pipeline:
         
         evo_cfg = self.config['evolution']
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
-        n_seeds_single_stage = evo_cfg.get('n_seeds_single_stage', 0)
+        n_seeds_alpha101_stage = evo_cfg.get('n_seeds_alpha101_stage', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
+        use_alpha101_seeds = evo_cfg.get('use_alpha101_seeds', True)
         n_shots = evo_cfg.get('n_shots', 3)
         print(f"\n[Step 3] Generating seed factors — "
               f"hypothesis: {n_seeds_hypothesis}, "
-              f"single-stage: {n_seeds_single_stage}, "
-              f"memory-augment: {n_seeds_memory_augment}")
+              f"alpha101: {n_seeds_alpha101_stage}, "
+              f"memory-augment: {n_seeds_memory_augment}, "
+              f"alpha101-seeds: {use_alpha101_seeds}")
         
         # Initialize evolving generator
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
             n_seeds_hypothesis=n_seeds_hypothesis,
-            n_seeds_single_stage=n_seeds_single_stage,
+            n_seeds_alpha101_stage=n_seeds_alpha101_stage,
             n_seeds_memory_augment=n_seeds_memory_augment,
+            use_alpha101_seeds=use_alpha101_seeds,
             n_best_factors=evo_cfg['n_best_factors'],
             n_improve=evo_cfg.get('n_improve', 10),
             n_mutate=evo_cfg.get('n_mutate', 5),
@@ -2141,7 +2144,7 @@ Examples:
     )
     parser.add_argument(
         '--n-seeds', type=int, default=None,
-        help='[legacy] Convenience: sets n_seeds_single_stage (single-stage seed '
+        help='[legacy] Convenience: sets n_seeds_alpha101_stage (alpha101 seed '
              'count). Prefer the three explicit flags below for full control.',
     )
     parser.add_argument(
@@ -2149,19 +2152,30 @@ Examples:
         help='Number of hypothesis-driven seed factors (default: config value)',
     )
     parser.add_argument(
-        '--n-seeds-single-stage', type=int, default=None,
-        help='Number of plain single-stage seed factors (default: config value)',
+        '--n-seeds-alpha101-stage', type=int, default=None,
+        help='Number of plain alpha101 seed factors (default: config value)',
     )
     parser.add_argument(
         '--n-seeds-memory-augment', type=int, default=None,
         help='Number of memory-augmented seed factors (default: config value)',
     )
     parser.add_argument(
+        '--use-alpha101-seeds', dest='use_alpha101_seeds', action='store_true',
+        default=None,
+        help='[DEFAULT ON] Alpha101 seed factors are drawn directly from the '
+             'Alpha101 formula library (methods.alpha101) instead of the LLM. '
+             'Pass --no-use-alpha101-seeds to fall back to LLM alpha101 seeds.',
+    )
+    parser.add_argument(
+        '--no-use-alpha101-seeds', dest='use_alpha101_seeds', action='store_false',
+        help='Disable Alpha101 seeds (use LLM generation instead).',
+    )
+    parser.add_argument(
         '--n-shots', type=int, default=None,
         help='Few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (default: config value)',
     )
     parser.add_argument(
-        '--n-evolution-rounds', type=int, default=5,
+        '--n-evolution-rounds', type=int, default=3,
         help='Number of evolution rounds (default: 5)',
     )
     parser.add_argument(
@@ -2214,15 +2228,17 @@ Examples:
         evo_overrides = pipeline.config['evolution']
         if args.n_seeds_hypothesis is not None:
             evo_overrides['n_seeds_hypothesis'] = args.n_seeds_hypothesis
-        if args.n_seeds_single_stage is not None:
-            evo_overrides['n_seeds_single_stage'] = args.n_seeds_single_stage
+        if args.n_seeds_alpha101_stage is not None:
+            evo_overrides['n_seeds_alpha101_stage'] = args.n_seeds_alpha101_stage
         if args.n_seeds_memory_augment is not None:
             evo_overrides['n_seeds_memory_augment'] = args.n_seeds_memory_augment
+        if args.use_alpha101_seeds is not None:
+            evo_overrides['use_alpha101_seeds'] = args.use_alpha101_seeds
         if args.n_shots is not None:
             evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:
-            # Legacy convenience: single-stage seed count.
-            evo_overrides['n_seeds_single_stage'] = args.n_seeds
+            # Legacy convenience: alpha101 seed count.
+            evo_overrides['n_seeds_alpha101_stage'] = args.n_seeds
         if args.n_evolution_rounds != 5:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
