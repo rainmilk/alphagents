@@ -204,6 +204,16 @@ fusion:
   chair_soft_reject: true        # [ACTIVE] true = rejected factors are DOWNWEIGHTED (kept in fusion with a reduced prior), not hard-dropped. Prevents a MEDIUM-confidence Chair from permanently discarding a high-IC factor.
   chair_soft_reject_weight: 0.3  # [ACTIVE] debate_score multiplier for soft-rejected factors (0 = drop the prior entirely, 1 = no penalty).
 
+  # Final cap on the number of factors that actually ENTER fusion (applied LAST,
+  # on top of Chair selection / soft-reject). 0 = no cap (legacy behaviour:
+  # fuse every Chair-surviving factor). >0 = keep only the top-K factors ranked
+  # by the fusion prior — Chair final_score when use_chair_selection is on,
+  # else the multi-agent debate_score. This is the "final Chair-screened top-K"
+  # the user wants to feed fusion.fuse(). NOTE: this is a different knob from
+  # memory.retrieval.top_k (factor-pool retrieval) and llm.chair.synthesis_top_n
+  # (how many factors get full detail in the Chair prompt).
+  top_k: 15
+
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:
     top_n: 50                     # number of stocks to hold

@@ -589,6 +589,9 @@ class AAAI2027Pipeline:
             fundamentals=train_fund,
             forward_period=forward_period,
         )
+        # Record whether a validation holdout was actually used, so step5's
+        # memory-save can correctly flag factors with a real val_ic.
+        self._val_enabled = val_backtester is not None
         print(f"  [evolution] Using TRAIN data only: {self._train_end_date}")
         evolution_result = self.evolving_generator.evolve(
             seed_factors=self.generated_factors,
@@ -831,6 +834,8 @@ class AAAI2027Pipeline:
                         sharpe=getattr(factor, 'sharpe', 0.0),
                         win_rate=getattr(factor, 'win_rate', 0.0),
                         max_drawdown=getattr(factor, 'max_drawdown', 0.0),
+                        val_ic=getattr(factor, 'val_ic', 0.0),
+                        has_val=bool(getattr(self, '_val_enabled', False)),
                         source='debate',
                     )
                     saved += 1
@@ -1072,6 +1077,36 @@ class AAAI2027Pipeline:
                     # result is a DebateResult or dict with final_score
                     score = result.final_score if hasattr(result, 'final_score') else result.get('final_score', 0.0)
                     debate_score_map[expr] = score
+
+        # ── Final top_k cap on the fusion pool (applied LAST, after Chair) ──
+        # Keep only the top-K factors (by the fusion prior) that actually enter
+        # fusion. The prior is the Chair Agent's final_score when chair selection
+        # is enabled, else the multi-agent debate_score — the same score used to
+        # build factor_infos below, so truncating train_factor_dict here keeps it
+        # perfectly aligned with factor_infos and fusion.fuse().
+        #   0  → no cap (legacy behaviour: fuse every Chair-surviving factor)
+        #   >0 → keep the K highest-prior factors (the "final Chair-screened top-K")
+        _fusion_top_k = int(self.config['fusion'].get('top_k', 0) or 0)
+        if _fusion_top_k > 0 and len(train_factor_dict) > _fusion_top_k:
+            def _fusion_prior(_name):
+                _s = debate_score_map.get(_name, 0.0)
+                if _s == 0.0:
+                    # fall back to base expression (dup-suffix / whitespace variant)
+                    _s = debate_score_map.get(_name.split('__dup')[0].strip(), 0.0)
+                return _s
+            _ranked = sorted(train_factor_dict.keys(),
+                             key=_fusion_prior, reverse=True)
+            _keep_topk = set(_ranked[:_fusion_top_k])
+            train_factor_dict = {_k: _v for _k, _v in train_factor_dict.items()
+                                 if _k in _keep_topk}
+            print(f"  Fusion top_k cap: kept top {_fusion_top_k} of "
+                  f"{len(_ranked)} factors by fusion prior "
+                  f"(prior {_fusion_prior(_ranked[0]):.2f}.."
+                  f"{_fusion_prior(_ranked[_fusion_top_k - 1]):.2f}).")
+        elif _fusion_top_k > 0:
+            print(f"  Fusion top_k={_fusion_top_k} but only "
+                  f"{len(train_factor_dict)} factors survived Chair selection; "
+                  f"no truncation needed.")
 
         # Use train_factor_dict keys (same factor names, train-period only)
         factor_infos = []
@@ -2142,6 +2177,12 @@ Examples:
         help='Override evolution.n_best_factors (default: use config value)',
     )
     parser.add_argument(
+        '--fusion-top-k', type=int, default=None,
+        help='Cap the number of factors fused (final step6 top_k). '
+             '0 or None → no cap (use config fusion.top_k). '
+             'Only takes effect in --full mode (test mode loads pre-fused factors).',
+    )
+    parser.add_argument(
         '--output-dir', type=str, default=None,
         help='Output directory (default: experiments/YYYYMMDD/results/)',
     )
@@ -2186,7 +2227,9 @@ Examples:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
             pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
-        
+        if args.fusion_top_k is not None:
+            pipeline.config.setdefault('fusion', {})['top_k'] = args.fusion_top_k
+
         metrics = pipeline.run_full_pipeline(
             train_start_date=args.train_start,
             train_end_date=args.train_end,

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pickle
 import re
 from dataclasses import dataclass, field
@@ -600,16 +601,22 @@ class StoredFactor:
     market_state: MarketState           # 生成/验证时的市场状态
 
     # 绩效指标（回测结果）
-    ic: float = 0.0                    # Information Coefficient
+    ic: float = 0.0                    # Information Coefficient (TRAIN window)
     icir: float = 0.0                  # ICIR = IC / std(IC)
     sharpe: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
+    val_ic: float = 0.0                # Validation-period Rank-IC (populated only
+                                       # when a val_backtester was supplied during
+                                       # evolution; else 0.0)
 
     # 元数据
     created_at: str = ""                # ISO 格式时间戳
     source: str = "llm"                # 'llm' | 'evolution' | 'human'
     parent_ids: list[str] = field(default_factory=list)  # 演化来源
+    has_val: bool = False              # True iff val_ic was actually computed
+                                       # (val holdout enabled). retrieval min_ic
+                                       # gate falls back to `ic` when False.
 
     # 检索统计
     retrieval_count: int = 0
@@ -638,11 +645,13 @@ class StoredFactor:
             "sharpe": self.sharpe,
             "win_rate": self.win_rate,
             "max_drawdown": self.max_drawdown,
+            "val_ic": self.val_ic,
             "created_at": self.created_at,
             "source": self.source,
             "parent_ids": self.parent_ids,
             "retrieval_count": self.retrieval_count,
             "last_retrieved": self.last_retrieved,
+            "has_val": self.has_val,
             "quality_score": self.quality_score(),
         }
 
@@ -658,11 +667,13 @@ class StoredFactor:
             sharpe=d.get("sharpe", 0.0),
             win_rate=d.get("win_rate", 0.0),
             max_drawdown=d.get("max_drawdown", 0.0),
+            val_ic=d.get("val_ic", 0.0),
             created_at=d.get("created_at", ""),
             source=d.get("source", "llm"),
             parent_ids=d.get("parent_ids", []),
             retrieval_count=d.get("retrieval_count", 0),
             last_retrieved=d.get("last_retrieved", ""),
+            has_val=d.get("has_val", False),
         )
 
     @staticmethod
@@ -725,6 +736,8 @@ class FactorMemoryBank:
         sharpe: float = 0.0,
         win_rate: float = 0.0,
         max_drawdown: float = 0.0,
+        val_ic: float = 0.0,
+        has_val: bool = False,
         source: str = "llm",
         parent_ids: Optional[list[str]] = None,
     ) -> str:
@@ -739,7 +752,7 @@ class FactorMemoryBank:
         existing = self._find_by_id(factor_id)
         if existing:
             # 更新现有因子的绩效（取历史平均）
-            self._update_existing_factor(existing, ic, icir, sharpe, win_rate, max_drawdown)
+            self._update_existing_factor(existing, ic, icir, sharpe, win_rate, max_drawdown, val_ic, has_val)
             return factor_id
 
         # 新建
@@ -754,6 +767,8 @@ class FactorMemoryBank:
             sharpe=sharpe,
             win_rate=win_rate,
             max_drawdown=max_drawdown,
+            val_ic=val_ic,
+            has_val=has_val,
             created_at=now,
             source=source,
             parent_ids=parent_ids or [],
@@ -797,7 +812,16 @@ class FactorMemoryBank:
             return []
 
         # 1. 预过滤：IC 阈值
-        candidates = [f for f in self.factors if f.ic >= min_ic]
+        # Prefer validation-period IC (val_ic) when available — it guards against
+        # train overfitting. Fall back to train IC (f.ic) when val was not computed
+        # (config evolution.val_ratio=0 → val_backtester disabled → val_ic stays 0.0).
+        def _effective_ic(f: StoredFactor) -> float:
+            v = f.val_ic
+            if f.has_val and isinstance(v, (int, float)) and not math.isnan(v):
+                return v
+            return f.ic
+
+        candidates = [f for f in self.factors if _effective_ic(f) >= min_ic]
         if not candidates:
             candidates = self.factors  # 放宽：返回所有
 
@@ -911,7 +935,7 @@ class FactorMemoryBank:
                 return f
         return None
 
-    def _update_existing_factor(self, f: StoredFactor, ic: float, icir: float, sharpe: float, win_rate: float, max_drawdown: float):
+    def _update_existing_factor(self, f: StoredFactor, ic: float, icir: float, sharpe: float, win_rate: float, max_drawdown: float, val_ic: float = 0.0, has_val: bool = False):
         """当因子已存在时，用指数移动平均更新其绩效"""
         alpha = 0.3
         f.ic = (1 - alpha) * f.ic + alpha * ic
@@ -919,6 +943,10 @@ class FactorMemoryBank:
         f.sharpe = (1 - alpha) * f.sharpe + alpha * sharpe
         f.win_rate = (1 - alpha) * f.win_rate + alpha * win_rate
         f.max_drawdown = (1 - alpha) * f.max_drawdown + alpha * max_drawdown
+        # Blend val IC only when the new observation actually carries one.
+        if has_val:
+            f.val_ic = (1 - alpha) * f.val_ic + alpha * val_ic
+            f.has_val = True
         print(f"[MemoryBank] Updated existing factor {f.factor_id}: new IC={f.ic:.4f}, new ICIR={f.icir:.4f}")
 
     def _get_embedding(self, f: StoredFactor) -> np.ndarray:

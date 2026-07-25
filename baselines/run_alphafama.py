@@ -23,6 +23,8 @@ Usage:
     python baselines/run_alphafama.py --train-start 2020-01-01 --test-end 2024-12-31 --universe hs300
     python baselines/run_alphafama.py --no-llm          # disable LLM mining
     python baselines/run_alphafama.py --llm-iters 20    # set LLM iterations
+    python baselines/run_alphafama.py --alpha101-ratio 0.5   # keep top-50% Alpha101 (default)
+    python baselines/run_alphafama.py --no-alpha101           # disable Alpha101
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
 """
@@ -449,7 +451,7 @@ def _seed_clusters_from_formula_map(
     Build seed clusters + placeholder mean-IC from the base Alpha101 formula
     library.
 
-    Used when Alpha101 factor *exposures* are disabled (``use_alpha101=False``):
+    Used when Alpha101 factor *exposures* are disabled (``use_alpha101=0.0``):
     instead of clustering the (empty) Alpha101 IC matrix, we seed the LLM
     mining chains directly from the 101 handcrafted *formulas* in
     ``FORMULA_MAP``. This gives the LLM real expressions to evolve without
@@ -694,7 +696,7 @@ def run_alphafama_baseline(
     context_days: int = 30,
     output_dir: Optional[str] = None,
     use_llm: bool = True,
-    use_alpha101: bool = False,
+    use_alpha101: float = 0.5,
     llm_iters: int = 5,
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
@@ -719,13 +721,20 @@ def run_alphafama_baseline(
         context_days: Context window for factor calculation.
         output_dir: Directory for saving results.
         use_llm: Whether to run LLM alpha-mining (default True).
-        use_alpha101: Whether to pre-compute the 101 handcrafted Alpha101
-            factor exposures as the starting factor pool (default False).
-            When False, Step 4 skips the (expensive) all-Alpha101 computation
-            and the factor pool is LLM-generated only — seeded from the base
-            Alpha101 *formula library* (FORMULA_MAP) instead of from the
-            pre-computed factor ICs. Set True to reproduce the original
-            AlphaFAMA behaviour (Alpha101 factors + LLM fusion).
+        use_alpha101: Fraction of the 101 handcrafted Alpha101 factor
+            exposures to keep and merge into the factor pool (default 0.5).
+            Interpreted as a ratio in [0, 1]:
+              - 0.0  → Alpha101 disabled; factor pool is LLM-generated only
+                       (seeded from the base Alpha101 *formula library*,
+                       FORMULA_MAP), exactly the old ``use_alpha101=False`` path.
+              - 0.5  → compute all 101 Alpha101 factors, then keep the top 50%
+                       ranked by |mean train Rank-IC|, and merge those with the
+                       LLM factors (default).
+              - 1.0  → keep all 101 Alpha101 factors (old ``use_alpha101=True``).
+            The kept subset still participates in Step 8's IC-weighted top-N
+            selection alongside the LLM factors, so this knob controls how much
+            Alpha101 "capacity" competes with the LLM factors.
+            Accepts a bool for backward compatibility (True→1.0, False→0.0).
         llm_iters: Number of LLM mining iterations (default 10).
         forward_period: Forward return horizon (trading days) for IC evaluation.
             Defaults to config['evolution']['forward_period'] (10). Must match the
@@ -741,7 +750,17 @@ def run_alphafama_baseline(
     print("  AlphaFAMA Baseline — A-Share (via Main DataLoader)")
     if use_llm:
         print("  + FAMA LLM Alpha-Mining Pipeline")
-    print(f"  Alpha101 factor library: {'ENABLED' if use_alpha101 else 'DISABLED (LLM-only seeds)'}")
+
+    # ── Normalize use_alpha101 to a ratio in [0, 1] ───────────────────
+    # Accepts float (ratio) or legacy bool (True→1.0, False→0.0).
+    if isinstance(use_alpha101, bool):
+        _alpha101_ratio = 1.0 if use_alpha101 else 0.0
+    else:
+        _alpha101_ratio = float(use_alpha101)
+    _alpha101_ratio = max(0.0, min(1.0, _alpha101_ratio))
+
+    print(f"  Alpha101 factor library: ratio={_alpha101_ratio:.2f} "
+          f"({'DISABLED (LLM-only seeds)' if _alpha101_ratio == 0 else 'ENABLED — top-|IC| subset'})")
     print("=" * 60)
 
     # ── Step 1: Load data via main DataLoader ──────────────────────────
@@ -841,16 +860,28 @@ def run_alphafama_baseline(
     print(f"  IC target rows: train={len(train_returns)}, test={len(test_returns)}")
 
     # ── Step 4: Generate Alpha101 factors ──────────────────────────────
-    if use_alpha101:
+    if _alpha101_ratio > 0:
         print("\n[Step 4] Generating Alpha101 factors...")
-        train_exposures = _compute_factors(train_df, n_jobs=n_jobs)
-        test_exposures = _compute_factors(test_df, n_jobs=n_jobs)
+        _all_train = _compute_factors(train_df, n_jobs=n_jobs)
+        _all_test = _compute_factors(test_df, n_jobs=n_jobs)
+        n_factors_all = len(_all_train.columns)   # typically 101
 
-        n_factors = len(train_exposures.columns)
-        print(f"  Generated {n_factors} factors")
+        # Keep the top `ratio` fraction of Alpha101 factors, ranked by
+        # |mean train Rank-IC| — the most informative ones — so the merged
+        # pool's IC-weighted selection (Step 8) starts from a strong subset.
+        _all_ic = compute_ic_matrix(_all_train, train_returns, n_jobs=n_jobs).mean()
+        k = int(round(_alpha101_ratio * n_factors_all))
+        k = max(1, min(k, n_factors_all))
+        _keep = _all_ic.abs().nlargest(k).index
+        train_exposures = _all_train[_keep]
+        test_exposures = _all_test[_keep]
+        n_factors = k
+        print(f"  Generated {n_factors_all} factors; selected top {n_factors} "
+              f"(ratio={_alpha101_ratio:.2f}) by |IC|")
     else:
-        print("\n[Step 4] Alpha101 factors DISABLED — skipping all-Alpha101 "
-              "computation (LLM will seed from the base formula library).")
+        print("\n[Step 4] Alpha101 factors DISABLED (ratio=0) — skipping "
+              "all-Alpha101 computation (LLM will seed from the base formula "
+              "library).")
         # Empty exposure frames keep the downstream merge / IC logic uniform.
         # train_returns / test_returns are already computed in Step 3 (they
         # depend only on price, so LLM-generated factors still have a valid
@@ -920,7 +951,7 @@ def run_alphafama_baseline(
             #   LLM real expressions to evolve without ever computing the 101
             #   factor exposures — and is what makes the Alpha101-OFF mode
             #   produce factors at all.
-            if use_alpha101 and n_factors > 0:
+            if _alpha101_ratio > 0 and n_factors > 0:
                 n_clusters = min(8, n_factors)
                 clusters = _cluster_factors(train_ic, n_clusters=n_clusters)
                 mining_mean_ic = mean_train_ic
@@ -1419,12 +1450,14 @@ if __name__ == '__main__':
                         help='Enable LLM alpha-mining (default: enabled)')
     parser.add_argument('--no-llm', action='store_false', dest='use_llm',
                         help='Disable LLM alpha-mining')
-    parser.add_argument('--use-alpha101', action='store_true', default=True,
-                        help='Enable the 101 handcrafted Alpha101 factor '
-                             'exposures as the starting pool (default: OFF — '
-                             'LLM seeds from the base formula library only)')
-    parser.add_argument('--no-alpha101', action='store_false', dest='use_alpha101',
-                        help='Disable Alpha101 factors (default)')
+    parser.add_argument('--alpha101-ratio', type=float, default=0.5,
+                        help='Fraction of the 101 Alpha101 factors to keep and '
+                             'merge (default 0.5). 0.0 disables Alpha101; 1.0 '
+                             'keeps all 101. Selected by |mean train Rank-IC|.')
+    parser.add_argument('--no-alpha101', action='store_const', dest='use_alpha101',
+                        const=0.0,
+                        help='Disable Alpha101 factors (equivalent to '
+                             '--alpha101-ratio 0).')
     parser.add_argument('--llm-iters', type=int, default=5,
                         help='Number of LLM mining iterations (default: 5)')
     parser.add_argument('--forward-period', type=int, default=None,
