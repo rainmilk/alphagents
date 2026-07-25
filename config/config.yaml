@@ -245,8 +245,8 @@ backtest:
 
 # ==================== Experiment Configuration [UNUSED — future roadmap] ====================
 alphafama:
-  # Fraction of the 101 handcrafted Alpha101 factors to keep and merge into
-  # the final factor pool (0=LLM-only seeds; 1=keep all 101; default 0.5).
+  # Proportion of the FINAL top-k selected factors that come from the Alpha101
+  # family (rest are LLM). 0=all LLM; 0.5=half/half; 1=all Alpha101 (default 0.5).
   # Overridable at runtime via the --alpha101-ratio CLI flag.
   alpha101_ratio: 0.5
 

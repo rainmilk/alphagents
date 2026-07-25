@@ -721,20 +721,21 @@ def run_alphafama_baseline(
         context_days: Context window for factor calculation.
         output_dir: Directory for saving results.
         use_llm: Whether to run LLM alpha-mining (default True).
-        alpha101_ratio: Fraction of the 101 handcrafted Alpha101 factor
-            exposures to keep and merge into the factor pool. Defaults to the
-            config ``alphafama.alpha101_ratio`` key (0.5); overridable via the
-            ``--alpha101-ratio`` CLI flag. Interpreted as a ratio in [0, 1]:
-              - 0.0  → Alpha101 disabled; factor pool is LLM-generated only
+        alpha101_ratio: Proportion of the FINAL top-k selected factors that
+            should come from the Alpha101 family (vs the LLM family). Defaults
+            to the config ``alphafama.alpha101_ratio`` key (0.5); overridable
+            via the ``--alpha101-ratio`` CLI flag. Interpreted as a ratio in
+            [0, 1]; the final top-k (Step 8) is split as
+            ``round(ratio*k)`` Alpha101 + the rest LLM, each family picked by
+            its own |mean train Rank-IC|:
+              - 0.0  → Alpha101 disabled; all k factors are LLM-generated
                        (seeded from the base Alpha101 *formula library*,
                        FORMULA_MAP).
-              - 0.5  → compute all 101 Alpha101 factors, then keep the top 50%
-                       ranked by |mean train Rank-IC|, and merge those with the
-                       LLM factors (default).
-              - 1.0  → keep all 101 Alpha101 factors.
-            The kept subset still participates in Step 8's IC-weighted top-N
-            selection alongside the LLM factors, so this knob controls how much
-            Alpha101 "capacity" competes with the LLM factors.
+              - 0.5  → of the final top-k, ~half Alpha101 + ~half LLM (default).
+              - 1.0  → all k factors are Alpha101 (LLM still seeds, but its
+                       factors are not selected into the final set).
+            Note: Step 4 keeps ALL 101 Alpha101 factors in the candidate pool;
+            this ratio only governs the final top-k family split.
         llm_iters: Number of LLM mining iterations (default 10).
         forward_period: Forward return horizon (trading days) for IC evaluation.
             Defaults to config['evolution']['forward_period'] (10). Must match the
@@ -861,18 +862,14 @@ def run_alphafama_baseline(
         _all_test = _compute_factors(test_df, n_jobs=n_jobs)
         n_factors_all = len(_all_train.columns)   # typically 101
 
-        # Keep the top `ratio` fraction of Alpha101 factors, ranked by
-        # |mean train Rank-IC| — the most informative ones — so the merged
-        # pool's IC-weighted selection (Step 8) starts from a strong subset.
-        _all_ic = compute_ic_matrix(_all_train, train_returns, n_jobs=n_jobs).mean()
-        k = int(round(_alpha101_ratio * n_factors_all))
-        k = max(1, min(k, n_factors_all))
-        _keep = _all_ic.abs().nlargest(k).index
-        train_exposures = _all_train[_keep]
-        test_exposures = _all_test[_keep]
-        n_factors = k
-        print(f"  Generated {n_factors_all} factors; selected top {n_factors} "
-              f"(ratio={_alpha101_ratio:.2f}) by |IC|")
+        # Keep ALL Alpha101 factors in the candidate pool. The Alpha101/LLM
+        # split is decided later, at the final top-k selection (Step 8), via
+        # alpha101_ratio — so the ratio no longer pre-filters the 101 here.
+        train_exposures = _all_train
+        test_exposures = _all_test
+        n_factors = n_factors_all
+        print(f"  Generated {n_factors_all} Alpha101 factors "
+              f"(all kept; Step-8 split at ratio={_alpha101_ratio:.2f})")
     else:
         print("\n[Step 4] Alpha101 factors DISABLED (ratio=0) — skipping "
               "all-Alpha101 computation (LLM will seed from the base formula "
@@ -1090,12 +1087,39 @@ def run_alphafama_baseline(
     if len(logical_test_ic) > 0:
         print(f"  Mean Rank-IC (test, no context): {logical_avg_ic:.4f}")
 
-    # ── Step 8: Top IC factors ─────────────────────────────────────────
-    top_n = min(10, len(mean_train_ic))
-    top_factors = mean_train_ic.abs().nlargest(top_n)
+    # ── Step 8: Final top-k selection with Alpha101/LLM split ─────────
+    # alpha101_ratio controls the proportion of the final top-k that come from
+    # the Alpha101 family vs the LLM family. e.g. k=10, ratio=0.5 → 5 Alpha101
+    # + 5 LLM. This is the single point where the ratio takes effect; Step 4
+    # already kept all 101 Alpha101 factors in the pool.
+    _alpha101_cols = list(train_exposures.columns) if _alpha101_ratio > 0 else []
+    # train_exposures still holds only Alpha101 columns (test_exposures is the
+    # merged frame); derive LLM columns as the complement within mean_train_ic.
+    _llm_cols = [c for c in mean_train_ic.index if c not in set(_alpha101_cols)]
+
+    _top_k = min(10, len(mean_train_ic))
+    _n_a = int(round(_alpha101_ratio * _top_k))
+    _n_a = max(0, min(_n_a, len(_alpha101_cols)))
+    _n_l = _top_k - _n_a
+    _n_l = max(0, min(_n_l, len(_llm_cols)))
+    # Reallocate any shortfall (a family with too few factors) to the other.
+    _shortfall = _top_k - (_n_a + _n_l)
+    if _shortfall > 0:
+        if _n_a < len(_alpha101_cols):
+            _n_a = min(len(_alpha101_cols), _n_a + _shortfall)
+        elif _n_l < len(_llm_cols):
+            _n_l = min(len(_llm_cols), _n_l + _shortfall)
+
+    _top_a = (mean_train_ic.reindex(_alpha101_cols).abs().nlargest(_n_a)
+              if _n_a > 0 else pd.Series(dtype=float))
+    _top_l = (mean_train_ic.reindex(_llm_cols).abs().nlargest(_n_l)
+              if _n_l > 0 else pd.Series(dtype=float))
+    top_factors = pd.concat([_top_a, _top_l])
+    top_factors = top_factors[~top_factors.index.duplicated()]
     top_factors_dict = {k: float(v) for k, v in top_factors.items()}
 
-    print(f"\n  Top-{top_n} factors by |IC| (train):")
+    print(f"\n  Final top-{_top_k} selection (Alpha101={_n_a}, LLM={_n_l}, "
+          f"ratio={_alpha101_ratio:.2f}):")
     for f, ic_val in top_factors_dict.items():
         label = f if len(f) <= 60 else f[:57] + "..."
         print(f"    {label}: {ic_val:.4f}")
@@ -1133,12 +1157,13 @@ def run_alphafama_baseline(
     )
 
     # ── Step 10: Compile results ───────────────────────────────────────
-    total_factors = n_factors + n_llm_factors
+    # Report the FINAL selected counts (the Step-8 split), not the pool sizes.
+    total_factors = len(top_factors)
     results = {
         'method': 'AlphaFAMA' + ('+LLM' if used_llm else ''),
         'n_factors': total_factors,
-        'n_alpha101_factors': n_factors,
-        'n_llm_factors': n_llm_factors,
+        'n_alpha101_factors': _n_a,
+        'n_llm_factors': _n_l,
         'alpha101_ratio': alpha101_ratio,
         'used_llm': used_llm,
         'llm_model': llm_model,
