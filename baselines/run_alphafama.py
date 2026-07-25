@@ -1099,6 +1099,9 @@ def run_alphafama_baseline(
     # merged frame); derive LLM columns as the complement within mean_train_ic.
     _llm_cols = [c for c in mean_train_ic.index if c not in set(_alpha101_cols)]
 
+    # Final selection slot count (also referenced by the guard warning below).
+    _top_k = min(10, len(mean_train_ic))
+
     # Guard: if the LLM family is empty, the ratio has nothing to split against
     # and silently degrades to an all-Alpha101 selection. Make that explicit so
     # a user who expected a 5+5 / 2+8 mix isn't left wondering why the ratio
@@ -1113,7 +1116,6 @@ def run_alphafama_baseline(
               f"api_key/model) or set alpha101_ratio to 0 or 1 for a "
               f"deterministic single-family run.")
 
-    _top_k = min(10, len(mean_train_ic))
     _n_a = int(round(_alpha101_ratio * _top_k))
     _n_a = max(0, min(_n_a, len(_alpha101_cols)))
     _n_l = _top_k - _n_a
