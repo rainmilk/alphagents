@@ -24,6 +24,7 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 
 # ── Path setup ────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -482,7 +483,7 @@ def compute_portfolio_metrics(
     end_date: str,
     split_date: str,
     alpha_repository: list,
-    top_n_stocks: int = 30,
+    top_n_stocks: int = 50,
     selected_params: Optional[Dict] = None,
     save_dir: Optional[str] = None,
     holding_period: int = 1,
@@ -561,7 +562,7 @@ def compute_portfolio_metrics(
             top = scores.nlargest(top_n_stocks)
             if len(top) == 0:
                 continue
-            w = pd.Series(1.0 / len(top), index=top.index)
+            w = allocate_score_proportional(top)
             portfolio_rows.append(w)
             portfolio_dates.append(date)
 

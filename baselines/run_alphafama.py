@@ -41,6 +41,7 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 import numpy as np
 import yaml
 import warnings
@@ -1423,13 +1424,13 @@ def _simulate_portfolio_from_ic(
                     f_norm = (f_w - f_w.mean()) / (f_w.std() + 1e-10)
                     score.loc[f_norm.index] += factor_weights.get(f, 0.0) * f_norm
 
-        # Select top-50 stocks and equal-weight
+        # Select top-50 stocks; weight score-proportionally (MASE-consistent)
         top_stocks = score.nlargest(min(50, len(score)))
         if len(top_stocks) == 0:
             # No stocks selected: emit a zero-weight row (BacktestEngine handles this)
             continue
 
-        w = pd.Series(1.0 / len(top_stocks), index=top_stocks.index)
+        w = allocate_score_proportional(top_stocks)
         portfolio_rows.append(w)
         portfolio_dates.append(rebal_date)
 

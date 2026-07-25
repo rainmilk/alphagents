@@ -227,8 +227,8 @@ fusion:
   portfolio:
     top_n: 50                     # number of stocks to hold
     method: "score_proportional"  # top_n | score_proportional
-    max_weight: 0.50              # single-stock weight cap
-    max_industry_exposure: 0.80   # single-industry weight cap
+    max_weight: 0.2              # single-stock weight cap
+    max_industry_exposure: 0.50   # single-industry weight cap
     min_market_cap_percentile: 0 # disabled (loosened; bottom-10% market-cap exclusion removed)
 
 # ==================== Backtest Configuration ====================

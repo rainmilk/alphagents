@@ -39,6 +39,7 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 
 # ── Path setup ────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1380,7 +1381,7 @@ def simulate_factor_portfolio(
     test_start_date: str,
     end_date: str,
     top_n_factors: int = 10,
-    top_n_stocks: int = 30,
+    top_n_stocks: int = 50,
 ) -> pd.DataFrame:
     """
     Construct daily portfolio weights from factor scores.
@@ -1453,12 +1454,12 @@ def simulate_factor_portfolio(
         if scores.empty:
             continue
 
-        # Select top-N stocks and equal-weight
+        # Select top-N stocks; weight score-proportionally (MASE-consistent)
         top = scores.nlargest(top_n_stocks)
         if len(top) == 0:
             continue
 
-        w = pd.Series(1.0 / len(top), index=top.index)
+        w = allocate_score_proportional(top)
         portfolio_rows.append(w)
         date_index.append(date)
 

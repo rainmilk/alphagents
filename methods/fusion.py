@@ -38,6 +38,12 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+from .portfolio_utils import (
+    allocate_score_proportional,
+    apply_caps,
+    _apply_industry_cap as _apply_industry_cap_static,
+)
+
 # Safe import of MarketState types from memory module (no heavy deps)
 try:
     from methods.memory import MarketState, TrendRegime, VolRegime
@@ -776,55 +782,36 @@ class PortfolioConstructor:
         date: str,
         industry: Optional[pd.Series],
     ) -> pd.Series:
-        """根据配置分配个股权重（含风控约束）"""
+        """根据配置分配个股权重（含风控约束）
+
+        权重方案与上限逻辑统一走 ``methods.portfolio_utils``，
+        MASE 与 9 个 baseline 共用同一实现，保证组合构建逐位一致。
+        """
         method = self.config.method
-        stocks = top_scores.index.tolist()
-        n = len(stocks)
+        n = len(top_scores)
 
-        if method == "equal" or n <= 1:
-            weights = pd.Series(1.0 / n, index=top_scores.index)
+        if method == "score_proportional":
+            return allocate_score_proportional(
+                top_scores,
+                max_weight=self.config.max_weight,
+                max_industry_exposure=self.config.max_industry_exposure,
+                min_weight=self.config.min_weight,
+                industry=industry,
+            )
 
-        elif method == "score_proportional":
-            raw = top_scores - top_scores.min() + 1e-6  # 平移为正
-            weights = raw / raw.sum()
-
-        elif method == "top_n":
-            weights = pd.Series(1.0 / n, index=top_scores.index)
-
-        else:
-            weights = pd.Series(1.0 / n, index=top_scores.index)
-
-        # 风控约束：个股权重上限
-        weights = weights.clip(upper=self.config.max_weight)
-        weights = weights / weights.sum()  # renormalize
-
-        # 风控约束：最小权重
-        weights = weights[weights >= self.config.min_weight]
-        if len(weights) > 0:
-            weights = weights / weights.sum()
-
-        # 风控约束：行业暴露
-        if industry is not None and self.config.max_industry_exposure < 1.0:
-            weights = self._apply_industry_cap(weights, industry)
-
-        return weights
+        # equal / top_n / fallback → 1/n 等权，再施加相同上限
+        weights = pd.Series(1.0 / n, index=top_scores.index)
+        return apply_caps(
+            weights,
+            max_weight=self.config.max_weight,
+            max_industry_exposure=self.config.max_industry_exposure,
+            min_weight=self.config.min_weight,
+            industry=industry,
+        )
 
     def _apply_industry_cap(self, weights: pd.Series, industry: pd.Series) -> pd.Series:
-        """限制单行业最大权重"""
-        common = weights.index.intersection(industry.index)
-        if len(common) == 0:
-            return weights
-
-        w = weights[common].copy()
-        for ind in industry[common].unique():
-            mask = industry[common] == ind
-            ind_weight = w[mask].sum()
-            if ind_weight > self.config.max_industry_exposure:
-                scale = self.config.max_industry_exposure / ind_weight
-                w[mask] *= scale
-
-        w = w / w.sum()
-        return w
+        """限制单行业最大权重（委托给共享实现，保持向后兼容）"""
+        return _apply_industry_cap_static(weights, industry, self.config.max_industry_exposure)
 
     @staticmethod
     def _get_rebalance_dates(scores: pd.DataFrame) -> list:

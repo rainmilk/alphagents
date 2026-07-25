@@ -59,6 +59,7 @@ import itertools
 
 import numpy as np
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 import yaml
 
 warnings.filterwarnings('ignore')
@@ -1298,9 +1299,12 @@ def build_portfolios_from_ensemble(
             top_local = np.argsort(valid_vals)[-top_n:]
             selected = valid_idx[top_local]
 
-        # Equal weight
+        # MASE-consistent: score-proportional weights (not equal-weight)
         if len(selected) > 0:
-            portfolios.iloc[t, selected] = 1.0 / len(selected)
+            sel_codes = portfolios.columns[selected]
+            sel_scores = pd.Series(day_values[selected], index=sel_codes)
+            w = allocate_score_proportional(sel_scores)
+            portfolios.iloc[t, selected] = w.values
 
     return portfolios
 

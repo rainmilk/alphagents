@@ -29,6 +29,7 @@ import json
 
 import numpy as np
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 import yaml
 
 warnings.filterwarnings('ignore')
@@ -1299,12 +1300,12 @@ def stage3_evaluate_results(
         n_stocks = min(len(pred), len(stock_names))
         scores = pd.Series(pred[:n_stocks], index=stock_names[:n_stocks])
 
-        # Select top-N stocks and equal-weight
+        # Select top-N stocks; weight score-proportionally (MASE-consistent)
         top = scores.dropna().nlargest(config.top_n_stocks)
         if len(top) == 0:
             continue
 
-        w = pd.Series(1.0 / len(top), index=top.index)
+        w = allocate_score_proportional(top)
         portfolio_rows.append(w)
         date_index.append(date)
 

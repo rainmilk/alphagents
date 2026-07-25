@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from methods.portfolio_utils import allocate_score_proportional
 import yaml
 
 warnings.filterwarnings('ignore')
@@ -1157,7 +1158,8 @@ def build_portfolios_from_factor(
 
         # Select top-N stocks (highest factor value = most bullish)
         top_stocks = scores.nlargest(n)
-        weights = pd.Series(1.0 / n, index=top_stocks.index)
+        # MASE-consistent: score-proportional weights (no industry cap passed here)
+        weights = allocate_score_proportional(top_stocks)
 
         portfolio_rows.append(weights)
         portfolio_dates.append(date)

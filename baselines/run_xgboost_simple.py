@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataloader.loader import DataLoader
 from backtest.engine import BacktestEngine
+from methods.portfolio_utils import allocate_score_proportional
 
 # -- Model backend: prefer XGBoost, fall back to sklearn --
 _MODEL_BACKEND = "unknown"
@@ -242,7 +243,8 @@ def _train_predict_oneshot(
 
 def _build_portfolios(predictions: pd.DataFrame,
                       prices: pd.DataFrame,
-                      top_n: int = 50) -> pd.DataFrame:
+                      top_n: int = 50,
+                      industry: Optional[pd.Series] = None) -> pd.DataFrame:
     """
     Build long-only equal-weighted portfolios from model predictions.
 
@@ -271,7 +273,8 @@ def _build_portfolios(predictions: pd.DataFrame,
         n_select = min(top_n, len(scores))
         top_stocks = scores.nlargest(n_select)
 
-        weights = pd.Series(1.0 / n_select, index=top_stocks.index)
+        # MASE-consistent: score-proportional weights (caps applied in helper)
+        weights = allocate_score_proportional(top_stocks, industry=industry)
         portfolio_rows.append(weights)
         portfolio_dates.append(date)
 
@@ -400,11 +403,12 @@ def run_xgboost_simple(
           f"{predictions.shape[1]} stocks")
 
     # -- Step 6: Build portfolios --
-    print(f"\n[Step 6] Building portfolios (top-{top_n_stocks} long, equal-weight)...")
+    print(f"\n[Step 6] Building portfolios (top-{top_n_stocks} long, score-proportional)...")
     portfolios = _build_portfolios(
         predictions=predictions,
         prices=close,
         top_n=top_n_stocks,
+        industry=test_ind,
     )
     print(f"  Portfolios: {portfolios.shape[0]} days x "
           f"{portfolios.shape[1]} stocks")
