@@ -13,7 +13,9 @@ Date: 2026-06-07
 """
 
 import os
+import sys
 import json
+import types
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
@@ -41,8 +43,66 @@ def _load_cache(cache_file: str):
     """Load data from a pickle cache. Returns None if cache doesn't exist."""
     if os.path.exists(cache_file):
         with open(cache_file, 'rb') as f:
-            return pd.read_pickle(f)
+            return safe_read_pickle(f)
     return None
+
+
+def _ensure_numpy_pickle_compat():
+    """Allow pickles written by numpy >= 2.0 to load under numpy < 2.0.
+
+    numpy 2.0 renamed the public ``numpy.core`` package to the private
+    ``numpy._core``. Pickles embed the module path of array types
+    (e.g. ``numpy.core.numeric``), so a file written by numpy 2.x references
+    ``numpy._core.numeric`` and raises
+    ``ModuleNotFoundError: No module named 'numpy._core.numeric'`` when read
+    under numpy 1.x.
+
+    This registers a ``numpy._core`` package alias that resolves to the
+    real ``numpy.core`` modules, so version-mismatched archives stay readable
+    without re-fetching data or changing environments. Idempotent and cheap.
+    """
+    if getattr(np, '_core', None) is not None:
+        return  # numpy >= 2.0 already provides the target; nothing to do
+    fake = types.ModuleType('numpy._core')
+    try:
+        # Point the alias package's __path__ at numpy.core's directory so that
+        # any not-yet-imported submodule (numpy._core.<x>) resolves to the
+        # real numpy/core/<x>.py during import.
+        fake.__path__ = list(getattr(np.core, '__path__', []))
+    except Exception:
+        fake.__path__ = []
+    np._core = fake
+    sys.modules['numpy._core'] = fake
+    # Seed sys.modules with already-loaded numpy.core.* submodules so pickle's
+    # direct module lookup (which prefers sys.modules) finds them on first try.
+    prefix = 'numpy.core.'
+    for name, mod in list(sys.modules.items()):
+        if name.startswith(prefix):
+            sys.modules['numpy._core.' + name[len(prefix):]] = mod
+
+
+def safe_read_pickle(src):
+    """Read a pickle, transparently working around numpy major-version drift.
+
+    On ``ModuleNotFoundError`` (e.g. numpy 2.x pickle under numpy 1.x), install
+    the ``numpy._core`` compatibility alias and retry. If ``src`` is a file
+    object it is rewound before the retry.
+    """
+    try:
+        return pd.read_pickle(src)
+    except ModuleNotFoundError:
+        _ensure_numpy_pickle_compat()
+        if hasattr(src, 'seek'):
+            try:
+                src.seek(0)
+            except Exception:
+                pass
+        return pd.read_pickle(src)
+
+
+# Install the numpy._core compatibility alias at import time so that any
+# version-mismatched pickle (archive or cache) is readable on first attempt.
+_ensure_numpy_pickle_compat()
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +251,7 @@ def retrieve_dataset(
             f"never hits the network)"
         )
     with open(path, 'rb') as f:
-        full = pd.read_pickle(f)
+        full = safe_read_pickle(f)
 
     # Resolve train/test windows. When a bound is omitted we fall back to the
     # full span so callers that don't care about splitting still get a usable
