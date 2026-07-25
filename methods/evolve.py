@@ -17,6 +17,8 @@ import re
 import ast
 import difflib
 import warnings
+from functools import lru_cache
+import threading
 import os
 import json
 import logging
@@ -466,8 +468,16 @@ _TOKEN_RE = re.compile(
     r')'
 )
 
+@lru_cache(maxsize=512)
 def _tokenize(expr: str) -> List[tuple]:
-    """Tokenize a factor expression string into (type, value) pairs."""
+    """Tokenize a factor expression string into (type, value) pairs.
+
+    Memoized: identical expressions reuse the token stream instead of
+    re-scanning the string on every ``evaluate()`` call (e.g. train vs val
+    backtester, or repeated evolution rounds over the same seeds). The
+    returned list is never mutated by the parser — only the evaluator's
+    ``_pos`` index advances — so sharing it across calls is safe.
+    """
     tokens = []
     pos = 0
     while pos < len(expr):
@@ -1256,7 +1266,12 @@ class FactorBacktester:
 
         # ---- Expression evaluator (lazy init) ----
         self._evaluator = None
-        self._metric_cache = {}      # expression → metrics dict
+        # Caches. A SINGLE lock guards both dicts; the (expensive) factor
+        # computation happens OUTSIDE the lock, so worker threads overlap that
+        # pandas/numpy C-level work rather than serialising on the lock.
+        self._metric_cache = {}      # expression → metrics dict (no factor_values)
+        self._factor_cache = {}      # expression → factor_values DataFrame
+        self._cache_lock = threading.Lock()
 
     @property
     def evaluator(self) -> _FactorExprEvaluator:
@@ -1300,20 +1315,24 @@ class FactorBacktester:
         """
         expr = factor.expression
 
-        # Check cache
-        if expr in self._metric_cache:
-            cached = self._metric_cache[expr].copy()
-            # Update the factor object
-            factor.ic = cached['ic']
-            factor.icir = cached.get('icir', 0.0)
-            factor.sharpe = cached['sharpe']
-            factor.win_rate = cached['win_rate']
-            factor.max_drawdown = cached.get('max_drawdown', 0.0)
-            return cached
+        # Fast path: full metrics already cached for this expression.
+        with self._cache_lock:
+            cached_metrics = self._metric_cache.get(expr)
+        if cached_metrics is not None:
+            out = cached_metrics.copy()
+            # Re-attach the (cached) factor_values so callers that need the raw
+            # panel still get it on a cache hit.
+            out['factor_values'] = self._get_factor_values(expr)
+            factor.ic = out['ic']
+            factor.icir = out.get('icir', 0.0)
+            factor.sharpe = out['sharpe']
+            factor.win_rate = out['win_rate']
+            factor.max_drawdown = out.get('max_drawdown', 0.0)
+            return out
 
         try:
-            # Step 1: Compute factor values
-            factor_values = self.evaluator.evaluate(expr)
+            # Step 1: Compute factor values (cached + thread-safe).
+            factor_values = self._get_factor_values(expr)
             if factor_values.isna().all().all():
                 return self._empty_metrics()
 
@@ -1352,9 +1371,12 @@ class FactorBacktester:
             factor.win_rate = metrics['win_rate']
             factor.max_drawdown = metrics['max_drawdown']
 
-            # Cache
-            self._metric_cache[expr] = {k: v for k, v in metrics.items()
-                                         if k not in ('long_short_ret', 'factor_values')}
+            # Cache metrics (without the heavy factor_values / long_short_ret).
+            with self._cache_lock:
+                self._metric_cache[expr] = {
+                    k: v for k, v in metrics.items()
+                    if k not in ('long_short_ret', 'factor_values')
+                }
 
             return metrics
 
@@ -1390,8 +1412,10 @@ class FactorBacktester:
         }
 
     def clear_cache(self):
-        """Clear cached metrics."""
-        self._metric_cache.clear()
+        """Clear cached metrics AND cached factor values."""
+        with self._cache_lock:
+            self._metric_cache.clear()
+            self._factor_cache.clear()
 
     def evaluate_batch(
         self,
@@ -1427,34 +1451,15 @@ class FactorBacktester:
 
         # --- Parallel path ---
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
-
-        cache_lock = threading.Lock()
 
         def _evaluate_one(factor):
-            expr = factor.expression
-
-            with cache_lock:
-                if expr in self._metric_cache:
-                    cached = self._metric_cache[expr].copy()
-                    factor.ic = cached['ic']
-                    factor.icir = cached.get('icir', 0.0)
-                    factor.sharpe = cached['sharpe']
-                    factor.win_rate = cached['win_rate']
-                    factor.max_drawdown = cached.get('max_drawdown', 0.0)
-                    return cached
-
+            # All caching (metric + factor_values, thread-safe) lives inside
+            # self.evaluate(), which guards both dicts with self._cache_lock.
+            # Delegating here keeps a single source of truth for the cache logic.
             try:
-                metrics = self.evaluate(factor)
-                with cache_lock:
-                    if expr not in self._metric_cache:
-                        self._metric_cache[expr] = {
-                            k: v for k, v in metrics.items()
-                            if k not in ('long_short_ret', 'factor_values')
-                        }
-                return metrics
+                return self.evaluate(factor)
             except Exception as e:
-                logger.warning("Batch eval failed for '%s': %s", expr, e)
+                logger.warning("Batch eval failed for '%s': %s", factor.expression, e)
                 return self._empty_metrics()
 
         results = [None] * len(factors)
@@ -1468,7 +1473,7 @@ class FactorBacktester:
                 idx = future_to_idx[future]
                 try:
                     results[idx] = future.result()
-                except Exception as e:
+                except Exception:
                     results[idx] = self._empty_metrics()
 
         return results
@@ -1522,7 +1527,7 @@ class FactorBacktester:
             fv_valid = fv[mask]
             fr_valid = fr[mask]
 
-            # Assign quantile labels (1 = lowest, n_quantiles = highest)
+            # Assign quantile labels (0 = lowest, n_quantiles-1 = highest)
             try:
                 labels = pd.qcut(fv_valid, q=n_quantiles, labels=False, duplicates='drop')
             except ValueError:
@@ -1541,6 +1546,7 @@ class FactorBacktester:
             return 0.0, 0.5, 0.0, pd.Series(dtype=float)
 
         ls_series = pd.Series(long_short_rets, name='long_short')
+
         # Annualize using the ACTUAL holding period, not daily. ls_series
         # entries are forward_period-day returns (sampled daily), so the
         # annualization factor must be sqrt(252 / forward_period). Using the
@@ -1561,10 +1567,48 @@ class FactorBacktester:
     # Factor computation helpers
     # ------------------------------------------------------------------
 
+    def _get_factor_values(self, expr: str) -> pd.DataFrame:
+        """
+        Thread-safe, cached raw factor computation.
+
+        ``factor_values`` depends ONLY on the price/fundamental data
+        (``self._data_map``) — never on ``forward_returns`` — so it is safe to
+        memoize for the lifetime of the backtester. This is the dominant cost
+        of evaluation (parse + pandas panel math), so caching pays off when the
+        same expression is evaluated repeatedly (seeds / survivors across
+        evolution rounds, or duplicate expressions inside one batch).
+
+        The underlying ``_FactorExprEvaluator`` comes from the ``self.evaluator``
+        property, which returns a FRESH instance per call (mutable parse state,
+        see its docstring), so concurrent workers never share parser state. The
+        cached DataFrame is returned by reference and MUST be treated as
+        read-only by callers (downstream code only slices/reads it).
+
+        Uses double-checked locking: the expensive compute happens OUTSIDE the
+        lock, and a second check on store prevents two racing threads from both
+        computing the same expression.
+        """
+        with self._cache_lock:
+            cached = self._factor_cache.get(expr)
+            if cached is not None:
+                return cached
+
+        # Compute outside the lock so worker threads overlap this work.
+        computed = self.evaluator.evaluate(expr)
+
+        with self._cache_lock:
+            # Second check: if another thread already stored this expr while we
+            # were computing, keep the first result and discard ours.
+            existing = self._factor_cache.get(expr)
+            if existing is None:
+                self._factor_cache[expr] = computed
+                return computed
+            return existing
+
     def compute_factor_values(self, expression: str) -> pd.DataFrame:
-        """Compute raw factor values for a given expression."""
+        """Compute raw factor values for a given expression (cached)."""
         try:
-            return self.evaluator.evaluate(expression)
+            return self._get_factor_values(expression)
         except ValueError as e:
             raise ValueError(
                 f"Failed to compute factor values for '{expression}': {e}"
@@ -2771,7 +2815,14 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             if self.use_llm and self.client:
                 try:
                     llm_factors = self._generate_improvements_via_llm(top_factors, round_id, reflection_notes)
-                    if llm_factors and len(llm_factors) >= len(top_factors) // 2:
+                    # Acceptance floor: the LLM must return at least the
+                    # configured budget (n_improve), but never more than that
+                    # floor derived from half the top set. Using
+                    # min(n_improve, len(top_factors)//2) keeps n_improve
+                    # authoritative while still guarding against a near-empty
+                    # LLM response silently degrading to rule-based.
+                    _min_llm = min(self.n_improve, len(top_factors) // 2) if top_factors else 0
+                    if llm_factors and len(llm_factors) >= _min_llm:
                         improved_factors = llm_factors
                         print(f"  [evolve] Generated {len(improved_factors)} improved factors via LLM")
                 except Exception as e:
@@ -3231,8 +3282,17 @@ Please generate improved factors now. Return only the JSON object, no other text
                 # Observability must never break generation.
                 pass
 
+            # Enforce the configured budget. The LLM prompt only *asks* for
+            # n_improve factors ("exactly N entries"); some models ignore this
+            # and emit many more. Without this cap the next round evaluates
+            # every factor the model returned — an unbounded, recurring
+            # backtest cost. Capping AFTER the diversity guard keeps n_improve
+            # meaningful and the per-round factor count predictable.
+            if self.n_improve and len(improved_factors) > self.n_improve:
+                improved_factors = improved_factors[: self.n_improve]
+
             return improved_factors
-            
+
         except json.JSONDecodeError as e:
             print(f"  [evolve] Failed to parse LLM response as JSON: {e}")
             print(f"  [evolve] Raw response: {raw[:200] if 'raw' in locals() else 'N/A'}")

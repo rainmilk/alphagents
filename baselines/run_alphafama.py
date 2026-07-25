@@ -1503,7 +1503,7 @@ if __name__ == '__main__':
                              'merge. Defaults to config alphafama.alpha101_ratio '
                              '(0.5). 0.0 disables Alpha101; 1.0 keeps all 101. '
                              'Selected by |mean train Rank-IC|.')
-    parser.add_argument('--llm-iters', type=int, default=5,
+    parser.add_argument('--llm-iters', type=int, default=2,
                         help='Number of LLM mining iterations (default: 5)')
     parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return horizon (trading days) for IC evaluation. '

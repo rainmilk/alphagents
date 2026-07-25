@@ -85,7 +85,7 @@ data:
 llm:
   # Factor generation → used by step4_evolve_factors
   generator:
-    model: "deepseek-v4-flash"
+    model: "deepseek-ai/DeepSeek-V3.2"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.7
@@ -97,7 +97,7 @@ llm:
     
   # Multi-agent debate evaluation → used by step5_evaluate_factors
   evaluator:
-    model: "tencent/Hunyuan-A13B-Instruct"
+    model: "deepseek-ai/DeepSeek-V3.2"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.3
@@ -141,7 +141,7 @@ evolution:
   max_drawdown: -1.0       # [ACTIVE] quality filter: drop factors with drawdown worse than this. Cumsum-based after fix (single-sided 10d LS returns); -0.20 was too strict for 2023-2024 A-share bear market — even decent factors easily exceed -20% cumulative.
   originality_gate: true    # [ACTIVE] static AST gate: reject structural near-duplicates + trivial/no-data/constant-dominated factors before they enter the pool
   dedup_similarity: 0.90    # [ACTIVE] canonical-signature similarity above which a factor is treated as a near-duplicate of an accepted one
-  improve_temperature: 0.6  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
+  improve_temperature: 0.3  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
   elitism_carry: 3          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
 
 # ==================== Memory Bank Configuration ====================
@@ -226,13 +226,13 @@ fusion:
 
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:
-    top_n: 50                     # number of stocks to hold
-    method: "score_proportional"  # score_proportional | equal_weight | equal | top_n
+    top_n: 50                    # number of stocks to hold
+    method: "score_proportional"       # score_proportional | equal_weight | equal | top_n
                                  # Single knob for both MASE (step7) and the 9 baselines
                                  # (run_experiments reads this same value). Set to "equal_weight"
                                  # to make every method hold an equal 1/n portfolio.
-    max_weight: 0.2              # single-stock weight cap
-    max_industry_exposure: 0.50   # single-industry weight cap
+    max_weight: 0.1              # single-stock weight cap
+    max_industry_exposure: 0.80   # single-industry weight cap
     min_market_cap_percentile: 0 # disabled (loosened; bottom-10% market-cap exclusion removed)
 
 # ==================== Backtest Configuration ====================
