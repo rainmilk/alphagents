@@ -245,9 +245,9 @@ Options:
   --end DATE               End date for real data (default: 2024-12-31)
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
-  --n-seeds N              [legacy] Convenience: set n_seeds_alpha101_stage (alpha101 seed count). Prefer the three explicit flags below.
+  --alpha101-top-k N       Step 4c Alpha101 retrieval top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5 (default: config alpha101_top_k). Alpha101 is no longer seeded in Step 3.
+  --n-seeds N              [legacy] Convenience: set alpha101_top_k (Step 4c Alpha101 retrieval top-k). Prefer --alpha101-top-k.
   --n-seeds-hypothesis N   Number of hypothesis-driven seed factors (default: config)
-  --n-seeds-alpha101-stage N  Number of plain alpha101 seed factors (default: config)
   --n-seeds-memory-augment N Number of memory-augmented seed factors (default: config; 0 = off)
   --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
   --n-best-factors N       Override evolution.n_best_factors from config

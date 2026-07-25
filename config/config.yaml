@@ -85,7 +85,7 @@ data:
 llm:
   # Factor generation → used by step4_evolve_factors
   generator:
-    model: "deepseek-ai/DeepSeek-V3.2"
+    model: "deepseek-ai/DeepSeek-V3.1-Terminus"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.7
@@ -97,7 +97,7 @@ llm:
     
   # Multi-agent debate evaluation → used by step5_evaluate_factors
   evaluator:
-    model: "deepseek-ai/DeepSeek-V3.2"
+    model: "glm-4.6v"
     base_url: "http://35.220.164.252:3888/v1"
     api_key: "sk-ve5dVPQ75DgivlLDKl1At0eac5MdYtwr1ztKqRsb78d9mQit"
     temperature: 0.3
@@ -123,11 +123,11 @@ llm:
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
-  n_seeds_alpha101_stage: 50       # [ACTIVE] plain alpha101 seed factors (derived from the Alpha101 library when use_alpha101_seeds: true)
+  alpha101_top_k: 5             # [ACTIVE] Step 4c Alpha101 RETRIEVAL top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5.
   n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
-  use_alpha101_seeds: true       # [ACTIVE] alpha101 seed factors are drawn directly from the Alpha101 formula library (methods.alpha101) instead of the LLM. Set false to use LLM alpha101 seeds.
+  use_alpha101_seeds: true       # [ACTIVE] enable Step 4c Alpha101 retrieval (score the Alpha101 library, merge top-k into the pool for Step 5). Set false to skip Step 4c entirely.
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
-  n_best_factors: 25   # [ACTIVE] top-N factors to retain per round
+  n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
   max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
   n_improve: 10        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)

@@ -1631,9 +1631,7 @@ class SelfEvolvingGenerator:
         self,
         llm_model: str = "deepseek-ai/DeepSeek-V4-Pro",
         n_seeds_hypothesis: int = 0,
-        n_seeds_alpha101_stage: int = 20,
         n_seeds_memory_augment: int = 0,
-        use_alpha101_seeds: bool = True,
         n_best_factors: int = 10,
         n_improve: int = 10,
         n_mutate: int = 5,
@@ -1661,8 +1659,6 @@ class SelfEvolvingGenerator:
                 (Stage1→Stage2: LLM proposes market hypotheses, then factors
                 expressing them). Produced whenever ``n_seeds_hypothesis > 0``
                 (no separate master flag needed). 0 = none.
-            n_seeds_alpha101_stage: Target number of **plain alpha101** seed
-                factors (the legacy 撒网式 coverage prompt, no hypothesis). 0 = none.
             n_seeds_memory_augment: Target number of **memory-augmented** seed
                 factors. Consumed by ``MemoryAugmentedGenerator`` (few-shot
                 examples from the memory bank). 0 = memory augmentation off.
@@ -1705,9 +1701,7 @@ class SelfEvolvingGenerator:
         """
         self.llm_model = llm_model
         self.n_seeds_hypothesis = n_seeds_hypothesis
-        self.n_seeds_alpha101_stage = n_seeds_alpha101_stage
         self.n_seeds_memory_augment = n_seeds_memory_augment
-        self.use_alpha101_seeds = use_alpha101_seeds
         self.n_best_factors = n_best_factors
         self.n_improve = n_improve
         self.n_mutate = n_mutate
@@ -2211,7 +2205,6 @@ class SelfEvolvingGenerator:
 
         * ``n_seeds_hypothesis``      → Stage1→Stage2 hypothesis-driven factors.
           Produced whenever ``n_seeds_hypothesis > 0``.
-        * ``n_seeds_alpha101_stage``   → plain alpha101 (撒网式) factors.
         * ``n_seeds_memory_augment``  → memory-augmented factors. These are NOT
           generated here; ``main.py`` feeds this count to
           ``MemoryAugmentedGenerator`` and concatenates the result. (We only
@@ -2225,14 +2218,13 @@ class SelfEvolvingGenerator:
         when the LLM is entirely unavailable.
         """
         n_hyp_target = self.n_seeds_hypothesis
-        n_plain_target = self.n_seeds_alpha101_stage
         n_mem_target = self.n_seeds_memory_augment
         print(f"Generating seed factors — hypothesis: {n_hyp_target}, "
-              f"alpha101: {n_plain_target}, memory-augment(target): {n_mem_target}")
+              f"memory-augment(target): {n_mem_target}")
 
         if not (self.use_llm and self.client):
             # LLM unavailable → rule-based fills the local (non-memory) total.
-            total = n_hyp_target + n_plain_target
+            total = n_hyp_target
             print(f"  [evolve] LLM unavailable -> rule-based generation of {total}.")
             return self._generate_factors_rule_based(total)
 
@@ -2243,21 +2235,15 @@ class SelfEvolvingGenerator:
             print(f"  Generated {len(hyp_factors)}/{n_hyp_target} "
                   f"hypothesis-driven seed factors")
             if not hyp_factors:
-                print("  [hypothesis] pipeline yielded nothing (those seeds dropped "
-                      "— not backfilled from alpha101 to keep counts explicit)")
+                print("  [hypothesis] pipeline yielded nothing.")
 
-        # ── Alpha101 stage subset ──
-        plain_factors: List[CandidateFactor] = []
-        if n_plain_target > 0:
-            plain_factors = self._generate_alpha101_stage_factors(n_plain_target)
-            print(f"  Generated {len(plain_factors)}/{n_plain_target} "
-                  f"alpha101 seed factors")
-
-        # Hypothesis first, then alpha101. No trimming to a shared total —
-        # the two counts are independent by design.
-        result = hyp_factors + plain_factors
+        # Alpha101 factors are NO LONGER generated as seeds here — they are
+        # retrieved by score in Step 4c (main.step4c_retrieve_alpha101), which
+        # scores the full Alpha101 library on TRAIN data and merges the top-k
+        # into the candidate pool for Step 5.
+        result = hyp_factors
         print(f"Generated {len(result)} seed factors locally "
-              f"({len(hyp_factors)} hypothesis-driven, {len(plain_factors)} alpha101). "
+              f"({len(hyp_factors)} hypothesis-driven). "
               f"Memory-augmented seeds (target {n_mem_target}) are added by the caller.")
         return result
 
@@ -2293,72 +2279,6 @@ class SelfEvolvingGenerator:
                 print(f"  [hypothesis] Factor generation for H{i+1} failed: {e}")
         return all_factors[:n_hyp]
 
-    def _generate_alpha101_stage_factors(self, n_plain: int) -> List[CandidateFactor]:
-        """
-        Plain alpha101 seed factors.
-
-        When ``self.use_alpha101_seeds`` is True (default), the seeds are drawn
-        DIRECTLY from the Alpha101 formula library (``methods.alpha101``) instead
-        of calling the LLM — i.e. the alpha101 pool *becomes* canonical
-        WorldQuant Alpha101 factors expressed in the MASE DSL.         This is the
-        "Alpha101 seed" path. LLM generation remains
-        the fallback whenever the flag is off or the library yields too few valid
-        factors.
-        """
-        if n_plain <= 0:
-            return []
-
-        # ── Alpha101-seed path (default) ──
-        if getattr(self, "use_alpha101_seeds", True):
-            a101 = self._generate_alpha101_seed_factors(n_plain)
-            if a101:
-                return a101
-
-        # ── Fallback: LLM generation (legacy 撒网式 coverage prompt) ──
-        try:
-            seed_factors = self._generate_factors_via_llm(n_plain)
-            if seed_factors and len(seed_factors) >= 1:
-                return seed_factors[:n_plain]
-        except Exception as e:
-            print(f"  [evolve] alpha101 LLM generation failed: {e}")
-        return []
-
-    def _generate_alpha101_seed_factors(self, n_plain: int) -> List[CandidateFactor]:
-        """Draw ``n_plain`` seed factors directly from the Alpha101 library.
-
-        Deterministically samples (fixed-seed shuffle, so the same ``n_plain``
-        always yields the same subset and runs stay reproducible) from
-        ``methods.alpha101.ALPHA101_FORMULAS``, validates each expression through
-        the DSL gate, and wraps the survivors as ``CandidateFactor`` objects.
-        Family is inferred from the expression so the downstream diversity-aware
-        selection still sees variety within the Alpha101 set.
-        """
-        from .alpha101 import get_alpha101_formulas
-        formulas = get_alpha101_formulas()
-        if not formulas:
-            return []
-        ids = list(formulas.keys())
-        rng = np.random.RandomState(42)
-        rng.shuffle(ids)
-        chosen = ids[:n_plain]
-        out: List[CandidateFactor] = []
-        for fid in chosen:
-            expr = formulas[fid]
-            ok, bad = _validate_factor_expr(expr)
-            if not ok:
-                print(f"  [evolve] skipping Alpha101 seed {fid} (invalid field(s): {bad})")
-                continue
-            out.append(CandidateFactor(
-                id=f"seed_a101_{fid}",
-                expression=expr,
-                description=f"Alpha101 {fid}",
-                generation=0,
-                family=_infer_family(expr),
-            ))
-        if out:
-            print(f"  [evolve] produced {len(out)} Alpha101 seeds "
-                  f"({chosen[0]} … {chosen[-1]})")
-        return out
 
     def _generate_factors_via_llm(self, n_factors: int, hypothesis: Optional[str] = None) -> List[CandidateFactor]:
         """

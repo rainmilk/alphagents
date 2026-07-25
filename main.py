@@ -388,23 +388,32 @@ class AAAI2027Pipeline:
         
         evo_cfg = self.config['evolution']
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
-        n_seeds_alpha101_stage = evo_cfg.get('n_seeds_alpha101_stage', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
-        use_alpha101_seeds = evo_cfg.get('use_alpha101_seeds', True)
         n_shots = evo_cfg.get('n_shots', 3)
+        # Alpha101 is NO LONGER generated as a seed here. It is now *retrieved
+        # by score* in Step 4c (step4c_retrieve_alpha101), which scores the full
+        # Alpha101 library on TRAIN data and merges the top-k into the candidate
+        # pool for Step 5. We deliberately seed the generator with 0 Alpha101
+        # factors so the evolution seeds stay pure hypothesis + memory-augment.
+        # Step 4c (retrieve Alpha101 by score) is driven by two config knobs:
+        #   alpha101_top_k      -> Step 4c retrieve top-k count
+        #   use_alpha101_seeds  -> Step 4c enable/disable flag
+        alpha101_retrieve_top_k = int(evo_cfg.get('alpha101_top_k', 0))
+        alpha101_retrieval_enabled = bool(evo_cfg.get('use_alpha101_seeds', True))
         print(f"\n[Step 3] Generating seed factors — "
               f"hypothesis: {n_seeds_hypothesis}, "
-              f"alpha101: {n_seeds_alpha101_stage}, "
-              f"memory-augment: {n_seeds_memory_augment}, "
-              f"alpha101-seeds: {use_alpha101_seeds}")
-        
-        # Initialize evolving generator
+              f"memory-augment: {n_seeds_memory_augment}")
+        print(f"  [Step 3] Alpha101 factors are NOT seeded here; they will be "
+              f"retrieved in Step 4c (enabled={alpha101_retrieval_enabled}, "
+              f"top_k={alpha101_retrieve_top_k}).")
+
+        # Initialize evolving generator (Alpha101 is NOT seeded here — it is
+        # retrieved by score in Step 4c, so evolution seeds stay pure
+        # hypothesis + memory-augment).
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
             n_seeds_hypothesis=n_seeds_hypothesis,
-            n_seeds_alpha101_stage=n_seeds_alpha101_stage,
             n_seeds_memory_augment=n_seeds_memory_augment,
-            use_alpha101_seeds=use_alpha101_seeds,
             n_best_factors=evo_cfg['n_best_factors'],
             n_improve=evo_cfg.get('n_improve', 10),
             n_mutate=evo_cfg.get('n_mutate', 5),
@@ -592,6 +601,10 @@ class AAAI2027Pipeline:
             fundamentals=train_fund,
             forward_period=forward_period,
         )
+        # Keep a handle on the EXACT backtester used for evolution (TRAIN window,
+        # val_split-aware) so Step 4c can score the Alpha101 library on identical
+        # data — apples-to-apples with the evolved factors' ICs.
+        self._train_backtester = backtester
         # Record whether a validation holdout was actually used, so step5's
         # memory-save can correctly flag factors with a real val_ic.
         self._val_enabled = val_backtester is not None
@@ -706,7 +719,134 @@ class AAAI2027Pipeline:
             print("  No relevant factors found in memory")
 
         print("  [✓] Memory retrieval complete")
-        
+
+    def step4c_retrieve_alpha101(self):
+        """
+        Step 4c: Retrieve Alpha101 factors by SCORE and merge the top-k into the
+        candidate pool before Step 5 (debate).
+
+        Unlike the old behaviour (Alpha101 factors were blindly injected as
+        *seeds* in Step 3), this step:
+          1. Builds a CandidateFactor for EVERY expression in the Alpha101
+             library (methods.alpha101).
+          2. Scores each one on the SAME TRAIN backtester used by evolution
+             (so its IC is directly comparable to the evolved factors' ICs,
+             including the val_split-aware train window).
+          3. Ranks by train Rank-IC and keeps the top-k.
+          4. Merges them into ``self.best_factors`` (deduped by expression) so
+             they are debate-evaluated in Step 5 and can flow into fusion.
+
+        Alpha101 factors are tagged ``_from_alpha101=True`` so Step 5's
+        memory-save skips re-persisting these publicly-known library factors.
+
+        Controlled by config ``evolution.use_alpha101_seeds`` (enable/disable)
+        and ``evolution.alpha101_top_k`` (top-k count).
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 4c] Skipped: methods modules not available")
+            return
+
+        evo_cfg = self.config['evolution']
+        top_k = int(evo_cfg.get('alpha101_top_k', 50))
+        enabled = bool(evo_cfg.get('use_alpha101_seeds', True))
+        if not enabled or top_k <= 0:
+            print(f"\n[Step 4c] Skipped: Alpha101 retrieval disabled "
+                  f"(use_alpha101_seeds={enabled}, top_k={top_k})")
+            return
+
+        if not hasattr(self, 'best_factors') or not self.best_factors:
+            print("\n[Step 4c] Skipped: no evolved factors yet "
+                  f"(run Step 4 first)")
+            return
+
+        print(f"\n[Step 4c] Retrieving Alpha101 factors "
+              f"(score all, keep top-{top_k})...")
+
+        # --- Backtester: reuse the exact evolution backtester when available ---
+        backtester = getattr(self, '_train_backtester', None)
+        if backtester is None:
+            # Fallback: build a fresh TRAIN backtester (full window) so Step 4c
+            # still works even if Step 4 did not store one.
+            try:
+                from methods.evolve import FactorBacktester
+                train_price = self.train_data['price_data']
+                train_fund = self.train_data.get('fundamental_data', {})
+                backtester = FactorBacktester(
+                    prices=train_price,
+                    fundamentals=train_fund,
+                    forward_period=getattr(self, '_forward_period', 10),
+                )
+            except Exception as e:
+                print(f"  [Step 4c] Cannot build backtester ({e}); skipping.")
+                return
+
+        # --- Build CandidateFactors for the whole Alpha101 library ---
+        try:
+            from methods.alpha101 import get_alpha101_formulas
+            from methods.evolve import _infer_family
+        except Exception as e:
+            print(f"  [Step 4c] Cannot import Alpha101 library ({e}); skipping.")
+            return
+
+        formulas = get_alpha101_formulas()
+        if not formulas:
+            print("  [Step 4c] Alpha101 library is empty; skipping.")
+            return
+
+        a101_factors = [
+            CandidateFactor(
+                id=f"a101_{fid}",
+                expression=expr,
+                description=f"Alpha101 {fid}",
+                generation=0,
+                family=_infer_family(expr),
+            )
+            for fid, expr in formulas.items()
+        ]
+        print(f"  Built {len(a101_factors)} Alpha101 candidates from library")
+
+        # --- Score ALL of them on TRAIN data (parallel) ---
+        metrics_list = backtester.evaluate_batch(
+            a101_factors, max_workers=4, parallel=True)
+
+        scored = []
+        for f, m in zip(a101_factors, metrics_list):
+            f.ic = m.get('ic', float('nan'))
+            f.icir = m.get('icir', float('nan'))
+            f.sharpe = m.get('sharpe', 0.0)
+            f.is_valid = m.get('is_valid', True)
+            if f.is_valid and not np.isnan(f.ic):
+                scored.append(f)
+
+        if not scored:
+            print("  [Step 4c] No valid Alpha101 factors scored; skipping.")
+            return
+
+        # Rank by train IC (signed — matches evolution's ranking convention;
+        # the backtester already direction-aligns quantile metrics by sign(IC),
+        # so reverse factors remain usable downstream).
+        scored.sort(key=lambda x: x.ic, reverse=True)
+        top = scored[:top_k]
+
+        # --- Merge into the candidate pool (dedup by expression) ---
+        existing = set()
+        for f in self.best_factors:
+            existing.add(getattr(f, 'expression', '') or '')
+        added = 0
+        for f in top:
+            if f.expression not in existing:
+                f._from_alpha101 = True
+                self.best_factors.append(f)
+                existing.add(f.expression)
+                added += 1
+
+        print(f"  Scored {len(scored)} valid Alpha101 factors; "
+              f"selected top-{top_k} by train IC.")
+        print(f"  Added {added} new Alpha101 factors to pool "
+              f"(skipped {len(top) - added} duplicates already present).")
+        print(f"  Factor pool size after merge: {len(self.best_factors)}")
+        print("  [✓] Alpha101 retrieval complete")
+
     def step5_evaluate_factors(self):
         """
         Step 5: Evaluate ALL candidate factors via multi-agent debate.
@@ -810,16 +950,23 @@ class AAAI2027Pipeline:
                     expr = factor.get('expression', '')
                     desc = factor.get('description', '')
                     is_from_memory = factor.get('_from_memory', False)
+                    is_from_alpha101 = factor.get('_from_alpha101', False)
                     factor_ic = factor.get('ic')
                 else:
                     expr = getattr(factor, 'expression', '')
                     desc = getattr(factor, 'description', '')
                     is_from_memory = getattr(factor, '_from_memory', False)
+                    is_from_alpha101 = getattr(factor, '_from_alpha101', False)
                     factor_ic = getattr(factor, 'ic', None)
                 if not expr:
                     continue
                 # Skip factors retrieved from memory — they're already stored there
                 if is_from_memory:
+                    continue
+                # Skip Alpha101 library factors — they are publicly-known formulas
+                # re-scored each run (Step 4c), so persisting them to the memory
+                # bank would just accumulate library noise.
+                if is_from_alpha101:
                     continue
                 # Quality gate: don't persist factors below the IC floor, otherwise
                 # the bank accumulates noise that Step 4b retrieval feeds back into
@@ -1663,7 +1810,8 @@ class AAAI2027Pipeline:
         self.step3_generate_factors()
         self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
         self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
-        self.step5_evaluate_factors()        # debate ALL candidates (incl. memory factors)
+        self.step4c_retrieve_alpha101()      # score Alpha101 library, merge top-k into pool
+        self.step5_evaluate_factors()        # debate ALL candidates (incl. memory + alpha101 factors)
         self.step5b_chair_synthesis()     # Chair synthesis (step 5b)
         self.step6_fuse_factors()
         self.step7_construct_portfolio(test_data=test_data)
@@ -2144,16 +2292,17 @@ Examples:
     )
     parser.add_argument(
         '--n-seeds', type=int, default=None,
-        help='[legacy] Convenience: sets n_seeds_alpha101_stage (alpha101 seed '
-             'count). Prefer the three explicit flags below for full control.',
+        help='[legacy] Convenience: sets alpha101_top_k (Step 4c Alpha101 '
+             'retrieval top-k). Prefer --alpha101-top-k for clarity.',
     )
     parser.add_argument(
         '--n-seeds-hypothesis', type=int, default=None,
         help='Number of hypothesis-driven seed factors (default: config value)',
     )
     parser.add_argument(
-        '--n-seeds-alpha101-stage', type=int, default=None,
-        help='Number of plain alpha101 seed factors (default: config value)',
+        '--alpha101-top-k', dest='alpha101_top_k', type=int, default=None,
+        help='Step 4c Alpha101 retrieval top-k: score the whole Alpha101 library '
+             'on TRAIN data and merge the top-k into the candidate pool for Step 5.',
     )
     parser.add_argument(
         '--n-seeds-memory-augment', type=int, default=None,
@@ -2162,20 +2311,21 @@ Examples:
     parser.add_argument(
         '--use-alpha101-seeds', dest='use_alpha101_seeds', action='store_true',
         default=None,
-        help='[DEFAULT ON] Alpha101 seed factors are drawn directly from the '
-             'Alpha101 formula library (methods.alpha101) instead of the LLM. '
-             'Pass --no-use-alpha101-seeds to fall back to LLM alpha101 seeds.',
+        help='[DEFAULT ON] Enable Step 4c Alpha101 retrieval: score the whole '
+             'Alpha101 library on TRAIN data and merge the top-k into the '
+             'candidate pool for Step 5. Alpha101 is no longer seeded in Step 3. '
+             'Pass --no-use-alpha101-seeds to skip Step 4c entirely.',
     )
     parser.add_argument(
         '--no-use-alpha101-seeds', dest='use_alpha101_seeds', action='store_false',
-        help='Disable Alpha101 seeds (use LLM generation instead).',
+        help='Disable Step 4c Alpha101 retrieval (skip scoring the library).',
     )
     parser.add_argument(
         '--n-shots', type=int, default=None,
         help='Few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (default: config value)',
     )
     parser.add_argument(
-        '--n-evolution-rounds', type=int, default=3,
+        '--n-evolution-rounds', type=int, default=5,
         help='Number of evolution rounds (default: 5)',
     )
     parser.add_argument(
@@ -2228,8 +2378,8 @@ Examples:
         evo_overrides = pipeline.config['evolution']
         if args.n_seeds_hypothesis is not None:
             evo_overrides['n_seeds_hypothesis'] = args.n_seeds_hypothesis
-        if args.n_seeds_alpha101_stage is not None:
-            evo_overrides['n_seeds_alpha101_stage'] = args.n_seeds_alpha101_stage
+        if args.alpha101_top_k is not None:
+            evo_overrides['alpha101_top_k'] = args.alpha101_top_k
         if args.n_seeds_memory_augment is not None:
             evo_overrides['n_seeds_memory_augment'] = args.n_seeds_memory_augment
         if args.use_alpha101_seeds is not None:
@@ -2237,8 +2387,8 @@ Examples:
         if args.n_shots is not None:
             evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:
-            # Legacy convenience: alpha101 seed count.
-            evo_overrides['n_seeds_alpha101_stage'] = args.n_seeds
+            # Legacy convenience: Step 4c Alpha101 retrieval top-k.
+            evo_overrides['alpha101_top_k'] = args.n_seeds
         if args.n_evolution_rounds != 5:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
