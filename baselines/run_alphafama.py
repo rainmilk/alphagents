@@ -490,7 +490,7 @@ def _run_llm_mining(
     llm_config: Dict,
     n_iters: int = 10,
     max_chain_len: int = 15,
-) -> Tuple[List[str], Dict[str, float]]:
+) -> Tuple[List[str], Dict[str, float], Dict[str, pd.Series]]:
     """
     Run LLM alpha-mining iterations.
 
@@ -522,7 +522,9 @@ def _run_llm_mining(
     # Build initial chains
     chains = _build_cluster_chains(clusters, formula_map, mean_ic, max_chain_len=5)
     if not chains:
-        return [], {}
+        # Keep the 3-tuple contract (expressions, rankic, train_exposure_cache)
+        # so the caller's unpacking never breaks when mining is a no-op.
+        return [], {}, {}
 
     # Initialize rankic dict with original factors' IC
     rankic = {}
