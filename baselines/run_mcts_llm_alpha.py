@@ -24,13 +24,13 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
-from methods.portfolio_utils import allocate_score_proportional
 
 # ── Path setup ────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "baselines" / "mcts-llm-alpha" / "src"))
 
+from methods.portfolio_utils import allocate_score_proportional
 from dataloader.loader import DataLoader
 from baselines.mcts_llm_alpha.src.mcts_llm_alpha.evaluation.pandas_evaluator import (
     convert_to_multindex,

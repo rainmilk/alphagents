@@ -39,13 +39,13 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
-from methods.portfolio_utils import allocate_score_proportional
 
 # ── Path setup ────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "baselines" / "AlphaAgent"))
 
+from methods.portfolio_utils import allocate_score_proportional
 from dataloader.loader import DataLoader
 
 logger = logging.getLogger(__name__)

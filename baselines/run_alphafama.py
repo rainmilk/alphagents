@@ -41,15 +41,20 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
 import pandas as pd
-from methods.portfolio_utils import allocate_score_proportional
 import numpy as np
 import yaml
 import warnings
 warnings.filterwarnings('ignore')
 
 # ── Path setup: add project root to sys.path ──────────────────────────
+# Must run BEFORE any project-local imports (methods.*, dataloader.*,
+# baselines.*) so they resolve when this script is invoked directly via
+# `python baselines/run_alphafama.py` (which otherwise only puts the
+# script's own directory on sys.path[0]).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from methods.portfolio_utils import allocate_score_proportional
 
 from dataloader.loader import DataLoader
 from baselines.AlphaFAMA.src.data_bridge import (
