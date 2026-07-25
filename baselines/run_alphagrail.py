@@ -54,7 +54,7 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1120,6 +1120,7 @@ def build_portfolios_from_factor(
     factor_values: pd.DataFrame,
     top_n: int = 50,
     test_start_date: Optional[str] = None,
+    portfolio_method: str = "score_proportional",
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from factor scores.
@@ -1160,7 +1161,7 @@ def build_portfolios_from_factor(
         # Select top-N stocks (highest factor value = most bullish)
         top_stocks = scores.nlargest(n)
         # MASE-consistent: score-proportional weights (no industry cap passed here)
-        weights = allocate_score_proportional(top_stocks)
+        weights = allocate_portfolio_weights(top_stocks, method=portfolio_method)
 
         portfolio_rows.append(weights)
         portfolio_dates.append(date)
@@ -1207,6 +1208,7 @@ def run_alphagrail_baseline(
                                # factor path uses no RNG (only the optional
                                # LLM tournament consumes it).
     output_dir: Optional[str] = None,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run AlphaGrail baseline using the main project's DataLoader.
@@ -1393,6 +1395,7 @@ def run_alphagrail_baseline(
         test_factor_values,
         top_n=top_n_stocks,
         test_start_date=test_start,
+        portfolio_method=portfolio_method,
     )
 
     if portfolios.empty:

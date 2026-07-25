@@ -610,7 +610,9 @@ class ExperimentRunner:
         output_dir = f"{self.output_dir}/alphagrail"
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_alphagrail_baseline(
+            portfolio_method=method,
             config_path=self.config_path,
             train_start_date=start_date,
             test_end_date=end_date,
@@ -666,7 +668,9 @@ class ExperimentRunner:
         output_dir = f"{self.output_dir}/mcts_llm_alpha"
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_mcts_llm_alpha_baseline(
+            portfolio_method=method,
             config_path="config/config.yaml",
             output_dir=output_dir,
             iterations=20,
@@ -723,7 +727,9 @@ class ExperimentRunner:
             )
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_alphafama_baseline(
+            portfolio_method=method,
             config_path="config/config.yaml",
             train_start_date=start_date,
             test_end_date=end_date,
@@ -780,7 +786,9 @@ class ExperimentRunner:
         output_dir = f"{self.output_dir}/alphaagent"
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_alphaagent_baseline(
+            portfolio_method=method,
             config_path="config/config.yaml",
             output_dir=output_dir,
             n_formulas=50,
@@ -824,7 +832,9 @@ class ExperimentRunner:
             forward_period = self.config['evolution'].get('forward_period', 10)
             holding_period = self.config['backtest']['trading'].get('holding_period', 1)
             seed = int(self.config.get('seed', 42))
+            method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
             results = run_alphaforge_baseline(
+                portfolio_method=method,
                 config_path=self.config_path,
                 train_start_date=self.config['data'].get('train_start_date', '2023-01-01'),
                 test_end_date=self.config['data'].get('test_end_date', '2025-06-30'),
@@ -899,7 +909,9 @@ class ExperimentRunner:
         output_dir = f"{self.output_dir}/xgboost"
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_xgboost_baseline(
+            portfolio_method=method,
             config_path=self.config_path,
             train_start_date=start_date,
             test_end_date=end_date,
@@ -954,7 +966,9 @@ class ExperimentRunner:
         output_dir = f"{self.output_dir}/alphagen"
         seed = int(self.config.get('seed', 42))
 
+        method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         results = run_alphagen_baseline(
+            portfolio_method=method,
             config_path=self.config_path,
             train_start_date=start_date,
             test_end_date=end_date,

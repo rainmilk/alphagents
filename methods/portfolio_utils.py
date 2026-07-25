@@ -11,13 +11,20 @@ requirement for a fair paper comparison.
 
 The scheme mirrors ``config.yaml -> fusion.portfolio``:
 
-    method                : "score_proportional"
+    method                : "score_proportional" | "equal_weight"
     max_weight            : 0.50   (single-stock cap)
     max_industry_exposure : 0.80   (industry cap)
     min_weight            : 0.001  (single-stock floor)
 
 If ``fusion.portfolio`` values change, update the ``DEFAULT_*`` constants below
 as well (baselines that do not thread the full config dict through rely on them).
+
+Supported ``method`` values (selectable via ``allocate_portfolio_weights`` or
+``PortfolioConfig.method``):
+
+    - "score_proportional" / "score_prop": weight ∝ shifted composite score.
+    - "equal_weight" / "equal" / "top_n":  1/n equal weight across selected
+      stocks (same caps applied for consistency; inert at typical settings).
 """
 from __future__ import annotations
 
@@ -28,9 +35,15 @@ import pandas as pd
 
 # Defaults mirror config.yaml -> fusion.portfolio. Kept here so baselines that do
 # not pass the full config dict can still stay bit-for-bit consistent with MASE.
-DEFAULT_MAX_WEIGHT = 0.50
-DEFAULT_MAX_INDUSTRY_EXPOSURE = 0.80
+DEFAULT_MAX_WEIGHT = 0.20
+DEFAULT_MAX_INDUSTRY_EXPOSURE = 0.50
 DEFAULT_MIN_WEIGHT = 0.001
+
+# Canonical method names -> internal dispatch keys.
+METHOD_SCORE_PROPORTIONAL = "score_proportional"
+METHOD_EQUAL_WEIGHT = "equal_weight"
+_SCORE_ALIASES = ("score_proportional", "score_prop")
+_EQUAL_ALIASES = ("equal_weight", "equal", "top_n")
 
 
 def allocate_score_proportional(
@@ -61,6 +74,32 @@ def allocate_score_proportional(
     return apply_caps(
         weights, max_weight, max_industry_exposure, min_weight, industry
     )
+
+
+def allocate_equal_weight(
+    top_scores: pd.Series,
+    max_weight: float = DEFAULT_MAX_WEIGHT,
+    max_industry_exposure: float = DEFAULT_MAX_INDUSTRY_EXPOSURE,
+    min_weight: float = DEFAULT_MIN_WEIGHT,
+    industry: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Equal-weight (1/n) portfolio, with the same caps as score-proportional.
+
+    Every selected stock receives weight ``1/n``. The cap logic (single-stock
+    max, min-weight floor, industry exposure) is applied via :func:`apply_caps`
+    so the scheme stays consistent with MASE's ``PortfolioConstructor`` and the
+    score-proportional path. At typical settings (<=50 stocks, ``max_weight``
+    >= 0.2) the caps are inert, so this is effectively pure 1/n.
+
+    This mirrors the previously-inline ``equal`` branch in
+    ``PortfolioConstructor._allocate_weights`` and is now the single source of
+    truth for the equal-weight strategy.
+    """
+    n = len(top_scores)
+    if n == 0:
+        return pd.Series(dtype=float)
+    weights = pd.Series(1.0 / n, index=top_scores.index)
+    return apply_caps(weights, max_weight, max_industry_exposure, min_weight, industry)
 
 
 def apply_caps(
@@ -111,3 +150,37 @@ def _apply_industry_cap(
 
     w = w / w.sum()
     return w
+
+
+def allocate_portfolio_weights(
+    top_scores: pd.Series,
+    method: str = METHOD_SCORE_PROPORTIONAL,
+    max_weight: float = DEFAULT_MAX_WEIGHT,
+    max_industry_exposure: float = DEFAULT_MAX_INDUSTRY_EXPOSURE,
+    min_weight: float = DEFAULT_MIN_WEIGHT,
+    industry: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Single dispatch point for portfolio weight allocation.
+
+    Routes ``method`` to the matching allocator so MASE and all 9 baselines
+    share one implementation (the hard requirement for a fair paper comparison):
+
+        - score_proportional / score_prop -> :func:`allocate_score_proportional`
+        - equal_weight / equal / top_n      -> :func:`allocate_equal_weight`
+
+    Unknown / unrecognised values fall back to ``score_proportional`` (this
+    matches ``PortfolioConstructor``'s historical fallback-to-1/n behaviour,
+    but logs nothing — callers should validate ``method`` upstream if strict).
+    """
+    if method in _SCORE_ALIASES:
+        return allocate_score_proportional(
+            top_scores, max_weight, max_industry_exposure, min_weight, industry
+        )
+    if method in _EQUAL_ALIASES:
+        return allocate_equal_weight(
+            top_scores, max_weight, max_industry_exposure, min_weight, industry
+        )
+    # Unknown method -> fall back to score-proportional for robustness.
+    return allocate_score_proportional(
+        top_scores, max_weight, max_industry_exposure, min_weight, industry
+    )

@@ -54,7 +54,7 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 
 from dataloader.loader import DataLoader
 from baselines.AlphaFAMA.src.data_bridge import (
@@ -710,6 +710,7 @@ def run_alphafama_baseline(
     holding_period: Optional[int] = None,
     n_jobs: Optional[int] = None,
     seed: int = 42,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -1179,6 +1180,7 @@ def run_alphafama_baseline(
         prices=prices,
         holding_period=holding_period,
         save_dir=run_dir,
+        portfolio_method=portfolio_method,
     )
 
     # ── Step 10: Compile results ───────────────────────────────────────
@@ -1328,6 +1330,7 @@ def _simulate_portfolio_from_ic(
     prices: pd.DataFrame,
     holding_period: int = 1,
     save_dir: Optional[str] = None,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Simulate an IC-weighted portfolio using the unified BacktestEngine.
@@ -1439,7 +1442,7 @@ def _simulate_portfolio_from_ic(
             # No stocks selected: emit a zero-weight row (BacktestEngine handles this)
             continue
 
-        w = allocate_score_proportional(top_stocks)
+        w = allocate_portfolio_weights(top_stocks, method=portfolio_method)
         portfolio_rows.append(w)
         portfolio_dates.append(rebal_date)
 

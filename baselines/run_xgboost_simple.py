@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataloader.loader import DataLoader
 from backtest.engine import BacktestEngine
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 
 # -- Model backend: prefer XGBoost, fall back to sklearn --
 _MODEL_BACKEND = "unknown"
@@ -244,7 +244,8 @@ def _train_predict_oneshot(
 def _build_portfolios(predictions: pd.DataFrame,
                       prices: pd.DataFrame,
                       top_n: int = 50,
-                      industry: Optional[pd.Series] = None) -> pd.DataFrame:
+                      industry: Optional[pd.Series] = None,
+                      portfolio_method: str = "score_proportional") -> pd.DataFrame:
     """
     Build long-only equal-weighted portfolios from model predictions.
 
@@ -274,7 +275,7 @@ def _build_portfolios(predictions: pd.DataFrame,
         top_stocks = scores.nlargest(n_select)
 
         # MASE-consistent: score-proportional weights (caps applied in helper)
-        weights = allocate_score_proportional(top_stocks, industry=industry)
+        weights = allocate_portfolio_weights(top_stocks, industry=industry, method=portfolio_method)
         portfolio_rows.append(weights)
         portfolio_dates.append(date)
 
@@ -315,6 +316,7 @@ def run_xgboost_simple(
     forward_period: int = 10,
     seed: int = 42,
     output_dir: Optional[str] = None,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run simplified XGBoost baseline (close-price-only) via main DataLoader.
@@ -409,6 +411,7 @@ def run_xgboost_simple(
         prices=close,
         top_n=top_n_stocks,
         industry=test_ind,
+        portfolio_method=portfolio_method,
     )
     print(f"  Portfolios: {portfolios.shape[0]} days x "
           f"{portfolios.shape[1]} stocks")

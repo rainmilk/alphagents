@@ -40,6 +40,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from .portfolio_utils import (
     allocate_score_proportional,
+    allocate_equal_weight,
+    allocate_portfolio_weights,
     apply_caps,
     _apply_industry_cap as _apply_industry_cap_static,
 )
@@ -660,7 +662,7 @@ class FactorFusion:
 class PortfolioConfig:
     """组合构建超参数"""
     top_n: int = 50                     # 持仓股票数量
-    method: str = "score_proportional"  # top_n | score_proportional | equal
+    method: str = "score_proportional"  # score_proportional | equal_weight | equal | top_n
     long_only: bool = True
     max_weight: float = 0.05            # 单只股票最大权重
     min_weight: float = 0.001           # 单只股票最小权重
@@ -684,10 +686,9 @@ class PortfolioConstructor:
     组合构建器。
 
     基于复合得分（composite_scores），在每个调仓日构建投资组合。
-    支持：
-      - top_n: 等权持有 Top-N
+    支持（method，详见 methods.portfolio_utils.allocate_portfolio_weights）：
       - score_proportional: 按复合得分比例分配权重
-      - equal: 等权持有所有（兜底）
+      - equal_weight / equal / top_n: 1/n 等权持有（与 baselines 共用同一实现）
     """
 
     def __init__(self, config: Optional[PortfolioConfig] = None):
@@ -786,23 +787,14 @@ class PortfolioConstructor:
 
         权重方案与上限逻辑统一走 ``methods.portfolio_utils``，
         MASE 与 9 个 baseline 共用同一实现，保证组合构建逐位一致。
+        ``method`` 取值见 ``allocate_portfolio_weights`` 的调度表
+        （score_proportional / equal_weight / equal / top_n）。
         """
         method = self.config.method
-        n = len(top_scores)
 
-        if method == "score_proportional":
-            return allocate_score_proportional(
-                top_scores,
-                max_weight=self.config.max_weight,
-                max_industry_exposure=self.config.max_industry_exposure,
-                min_weight=self.config.min_weight,
-                industry=industry,
-            )
-
-        # equal / top_n / fallback → 1/n 等权，再施加相同上限
-        weights = pd.Series(1.0 / n, index=top_scores.index)
-        return apply_caps(
-            weights,
+        return allocate_portfolio_weights(
+            top_scores,
+            method=method,
             max_weight=self.config.max_weight,
             max_industry_exposure=self.config.max_industry_exposure,
             min_weight=self.config.min_weight,

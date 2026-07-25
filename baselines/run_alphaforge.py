@@ -29,7 +29,7 @@ import json
 
 import numpy as np
 import pandas as pd
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 import yaml
 
 warnings.filterwarnings('ignore')
@@ -1223,6 +1223,7 @@ def stage3_evaluate_results(
     test_start: Optional[str] = None,
     test_end: Optional[str] = None,
     holding_period: Optional[int] = None,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1305,7 +1306,7 @@ def stage3_evaluate_results(
         if len(top) == 0:
             continue
 
-        w = allocate_score_proportional(top)
+        w = allocate_portfolio_weights(top, method=portfolio_method)
         portfolio_rows.append(w)
         date_index.append(date)
 
@@ -1439,6 +1440,7 @@ def run_alphaforge_baseline(
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     context_days: int = 30,
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run complete AlphaForge baseline (all 3 stages).
@@ -1641,6 +1643,7 @@ def run_alphaforge_baseline(
         train_start=train_start, train_end=train_end,
         test_start=test_start, test_end=test_end,
         holding_period=holding_period,
+        portfolio_method=portfolio_method,
     )
     
     return {

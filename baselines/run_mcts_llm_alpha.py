@@ -30,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "baselines" / "mcts-llm-alpha" / "src"))
 
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 from dataloader.loader import DataLoader
 from baselines.mcts_llm_alpha.src.mcts_llm_alpha.evaluation.pandas_evaluator import (
     convert_to_multindex,
@@ -57,6 +57,7 @@ def run_mcts_llm_alpha_baseline(
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     seed: int = 42,                # Seeds Python's `random` (random formula init / rollouts)
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -368,6 +369,7 @@ def run_mcts_llm_alpha_baseline(
             selected_params=best_selected_params,
             save_dir=run_dir,
             holding_period=holding_period if holding_period is not None else mcts_config.holding_period,
+            portfolio_method=portfolio_method,
         )
 
     # ── Save results ──────────────────────────────────────────────
@@ -487,6 +489,7 @@ def compute_portfolio_metrics(
     selected_params: Optional[Dict] = None,
     save_dir: Optional[str] = None,
     holding_period: int = 1,
+    portfolio_method: str = "score_proportional",
 ) -> Dict[str, float]:
     """
     Compute portfolio-level metrics using the unified BacktestEngine.
@@ -562,7 +565,7 @@ def compute_portfolio_metrics(
             top = scores.nlargest(top_n_stocks)
             if len(top) == 0:
                 continue
-            w = allocate_score_proportional(top)
+            w = allocate_portfolio_weights(top, method=portfolio_method)
             portfolio_rows.append(w)
             portfolio_dates.append(date)
 

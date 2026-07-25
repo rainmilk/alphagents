@@ -226,7 +226,10 @@ fusion:
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:
     top_n: 50                     # number of stocks to hold
-    method: "score_proportional"  # top_n | score_proportional
+    method: "score_proportional"  # score_proportional | equal_weight | equal | top_n
+                                 # Single knob for both MASE (step7) and the 9 baselines
+                                 # (run_experiments reads this same value). Set to "equal_weight"
+                                 # to make every method hold an equal 1/n portfolio.
     max_weight: 0.2              # single-stock weight cap
     max_industry_exposure: 0.50   # single-industry weight cap
     min_market_cap_percentile: 0 # disabled (loosened; bottom-10% market-cap exclusion removed)

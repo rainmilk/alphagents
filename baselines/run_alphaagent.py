@@ -45,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "baselines" / "AlphaAgent"))
 
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 from dataloader.loader import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -1382,6 +1382,7 @@ def simulate_factor_portfolio(
     end_date: str,
     top_n_factors: int = 10,
     top_n_stocks: int = 50,
+    portfolio_method: str = "score_proportional",
 ) -> pd.DataFrame:
     """
     Construct daily portfolio weights from factor scores.
@@ -1459,7 +1460,7 @@ def simulate_factor_portfolio(
         if len(top) == 0:
             continue
 
-        w = allocate_score_proportional(top)
+        w = allocate_portfolio_weights(top, method=portfolio_method)
         portfolio_rows.append(w)
         date_index.append(date)
 
@@ -1500,6 +1501,7 @@ def run_alphaagent_baseline(
     use_llm: bool = True,
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['holding_period'] or 1
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run AlphaAgent baseline using the main project's DataLoader.
@@ -1691,6 +1693,7 @@ def run_alphaagent_baseline(
         ic_mean=ic_mean,
         test_start_date=test_start_date,
         end_date=test_end_date,
+        portfolio_method=portfolio_method,
     )
 
     if portfolios.empty:

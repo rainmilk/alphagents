@@ -67,7 +67,7 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from methods.portfolio_utils import allocate_score_proportional
+from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1263,6 +1263,7 @@ def build_portfolios_from_ensemble(
     close: pd.DataFrame,
     top_n: int = 50,
     test_start_date: Optional[str] = None,
+    portfolio_method: str = "score_proportional",
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from ensemble factor values.
@@ -1304,7 +1305,7 @@ def build_portfolios_from_ensemble(
         if len(selected) > 0:
             sel_codes = portfolios.columns[selected]
             sel_scores = pd.Series(day_values[selected], index=sel_codes)
-            w = allocate_score_proportional(sel_scores)
+            w = allocate_portfolio_weights(sel_scores, method=portfolio_method)
             portfolios.iloc[t, selected] = w.values
 
     return portfolios
@@ -1358,6 +1359,7 @@ def run_alphagen_baseline(
     ent_coef: float = 0.01,
     device: str = 'cpu',
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
+    portfolio_method: str = "score_proportional",
 ) -> Dict:
     """
     Run AlphaGen baseline — RL-based token factor generation.
@@ -1617,6 +1619,7 @@ def run_alphagen_baseline(
     # Reconstruct full close timeline for portfolio building
     portfolios = build_portfolios_from_ensemble(
         ensemble_test, test_price['close'], top_n=top_n_stocks,
+        portfolio_method=portfolio_method,
     )
     print(f"  Portfolios: {portfolios.shape}")
 
