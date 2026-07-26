@@ -127,9 +127,11 @@ def compute_forward_returns(
 
     For forward_period=N:  return[t] = close[t+N] / close[t] - 1
 
-    This aligns AlphaForge's IC evaluation with other baselines that use
-    forward_period-day forward returns (MCTS-LLM-Alpha, AlphaGrail, XGBoost,
-    LSTM, XGBoost-Simple, AlphaAgent all default to forward_period=10).
+    This aligns AlphaForge's IC evaluation with the factor-method baselines
+    that use forward_period-day forward returns (MCTS-LLM-Alpha, AlphaGrail,
+    XGBoost, AlphaAgent all default to forward_period=10). The ML daily
+    predictors (LSTM, XGBoost-Simple, AlphaXGBoost) instead use a FIXED 1-day
+    horizon, decoupled from evolution.forward_period.
 
     Args:
         prices_multindex: MultiIndex DataFrame with OHLCV data

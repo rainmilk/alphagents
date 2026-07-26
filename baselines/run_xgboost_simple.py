@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataloader.loader import DataLoader
 from backtest.engine import BacktestEngine
-from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
+from methods.portfolio_utils import build_portfolios_from_scores, DEFAULT_TOP_N
 
 # -- Model backend: prefer XGBoost, fall back to sklearn --
 _MODEL_BACKEND = "unknown"
@@ -85,7 +85,7 @@ def _build_features(close: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
-def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFrame:
+def _build_targets(close: pd.DataFrame, forward_period: int = 1) -> pd.DataFrame:
     """
     Build forward-period returns as the prediction target.
 
@@ -94,7 +94,7 @@ def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFram
 
     Args:
         close: Close price DataFrame (date x stock)
-        forward_period: Number of days ahead for return calculation (default 10).
+        forward_period: Number of days ahead for return calculation (default 1).
 
     Returns:
         DataFrame, MultiIndex (date, stock), column 'forward_return'
@@ -243,57 +243,38 @@ def _train_predict_oneshot(
 
 def _build_portfolios(predictions: pd.DataFrame,
                       prices: pd.DataFrame,
-                      top_n: int = 50,
+                      top_n: int = DEFAULT_TOP_N,
                       industry: Optional[pd.Series] = None,
-                      portfolio_method: str = "score_proportional") -> pd.DataFrame:
+                      portfolio_method: str = "equal_weight",
+                      max_weight: float = 0.1,
+                      max_industry_exposure: float = 0.80,
+                      min_weight: float = 0.001,
+                      test_start_date: Optional[str] = None) -> pd.DataFrame:
     """
-    Build long-only equal-weighted portfolios from model predictions.
+    Build long-only portfolios from model predictions.
 
-    Each day, select the top-N stocks by predicted forward return and
-    equal-weight them.
+    LSTM / XGBoost / AlphaXGBoost are end-to-end ML models, NOT factor methods,
+    so they never pass through FactorFusion. Their predicted forward-return
+    panel is fed directly to the shared portfolio layer
+    (:func:`build_portfolios_from_scores`), so the construction — top-N
+    selection, weight caps, date×stock shaping, ffill, test-period crop — is
+    bit-for-bit identical to MASE's factor baselines.
+
+    Each day, select the top-N stocks by predicted forward return and weight
+    them equally (1/n) via ``portfolio_method`` (default equal_weight), with the
+    same single-stock / industry caps every other baseline uses.
     """
-    common_stocks = predictions.columns.intersection(prices.columns)
-    predictions = predictions[common_stocks]
-    prices_aligned = prices.loc[predictions.index, common_stocks]
-
-    portfolio_rows = []
-    portfolio_dates = []
-
-    for date in predictions.index:
-        scores = predictions.loc[date].dropna()
-        if len(scores) == 0:
-            continue
-
-        valid_prices = prices_aligned.loc[date].dropna()
-        valid_stocks = scores.index.intersection(valid_prices.index)
-        scores = scores.loc[valid_stocks]
-
-        if len(scores) == 0:
-            continue
-
-        n_select = min(top_n, len(scores))
-        top_stocks = scores.nlargest(n_select)
-
-        # MASE-consistent: score-proportional weights (caps applied in helper)
-        weights = allocate_portfolio_weights(top_stocks, industry=industry, method=portfolio_method)
-        portfolio_rows.append(weights)
-        portfolio_dates.append(date)
-
-    if not portfolio_rows:
-        raise ValueError("No portfolio rows generated. Check predictions and prices.")
-
-    all_stocks = pd.Index(set().union(*(w.index for w in portfolio_rows)))
-    portfolios = pd.DataFrame(
-        index=pd.DatetimeIndex(portfolio_dates),
-        columns=all_stocks,
-        dtype=float,
+    return build_portfolios_from_scores(
+        composite_scores=predictions,
+        prices=prices,
+        top_n=top_n,
+        method=portfolio_method,
+        max_weight=max_weight,
+        max_industry_exposure=max_industry_exposure,
+        min_weight=min_weight,
+        industry=industry,
+        test_start_date=test_start_date,
     )
-    for i, w in enumerate(portfolio_rows):
-        portfolios.loc[portfolio_dates[i], w.index] = w.values
-    portfolios = portfolios.fillna(0.0)
-    portfolios = portfolios.div(portfolios.sum(axis=1), axis=0).fillna(0.0)
-
-    return portfolios
 
 
 # ===========================================================================
@@ -313,10 +294,10 @@ def run_xgboost_simple(
     max_depth: int = 5,
     learning_rate: float = 0.05,
     holding_period: int = 1,
-    forward_period: int = 10,
+    forward_period: int = 1,  # FIXED at 1 day for ML daily predictors (ignored in body)
     seed: int = 42,
     output_dir: Optional[str] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",  # FIXED: ML baseline uses equal-weight 1/n
 ) -> Dict:
     """
     Run simplified XGBoost baseline (close-price-only) via main DataLoader.
@@ -340,15 +321,29 @@ def run_xgboost_simple(
     # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
 
-    # -- Resolve forward_period: explicit arg > config.yaml > default 10 --
-    if not forward_period or forward_period <= 0:
-        forward_period = loader.config.get('evolution', {}).get('forward_period', 10)
+    # -- ML daily predictor: forward horizon FIXED at 1 day ------------
+    # Predicts the next-day return for every test day. Intentionally
+    # decoupled from factor-method evolution.forward_period (default 10);
+    # the forward_period arg is ignored on purpose.
+    forward_period = 1
+
+    # -- Portfolio method FIXED to equal-weight (1/n) for ML baselines ----
+    # These end-to-end predictors are NOT factor methods, so for a fair paper
+    # comparison they hold the top-N selected stocks equally (1/n) rather
+    # than score-proportionally. The portfolio_method argument is ignored.
+    portfolio_method = "equal_weight"
 
     # -- Resolve top_n_stocks (portfolio size knob) from config --
     # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
     # Single knob shared by MASE step7 and all 9 baselines.
     if top_n_stocks is None:
         top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
+
+    # Portfolio caps shared with MASE step7 + the factor baselines.
+    _pf_cfg = loader.config.get('fusion', {}).get('portfolio', {})
+    _pf_max_weight = float(_pf_cfg.get('max_weight', 0.1))
+    _pf_max_industry = float(_pf_cfg.get('max_industry_exposure', 0.80))
+    _pf_min_weight = float(_pf_cfg.get('min_weight', 0.001))
 
     # -- Step 2: Determine train/test split (config-backed) --
     train_start = train_start_date or loader.data_config.get(
@@ -411,13 +406,17 @@ def run_xgboost_simple(
           f"{predictions.shape[1]} stocks")
 
     # -- Step 6: Build portfolios --
-    print(f"\n[Step 6] Building portfolios (top-{top_n_stocks} long, score-proportional)...")
+    print(f"\n[Step 6] Building portfolios (top-{top_n_stocks} long, equal-weight 1/n)...")
     portfolios = _build_portfolios(
         predictions=predictions,
         prices=close,
         top_n=top_n_stocks,
         industry=test_ind,
         portfolio_method=portfolio_method,
+        max_weight=_pf_max_weight,
+        max_industry_exposure=_pf_max_industry,
+        min_weight=_pf_min_weight,
+        test_start_date=test_start,
     )
     print(f"  Portfolios: {portfolios.shape[0]} days x "
           f"{portfolios.shape[1]} stocks")
@@ -535,9 +534,9 @@ def run_xgboost_simple(
 # ===========================================================================
 
 if __name__ == '__main__':
-    # Seed CLI defaults from config.yaml so --forward-period / --holding-period
-    # track evolution.forward_period / backtest.trading.holding_period unless
-    # explicitly overridden on the command line.
+    # Seed CLI defaults from config.yaml. --holding-period tracks
+    # backtest.trading.holding_period. (--forward-period is fixed at 1 for the
+    # ML daily predictor and is ignored in the run function.)
     _cli_cfg = {}
     try:
         import yaml
@@ -545,7 +544,6 @@ if __name__ == '__main__':
             _cli_cfg = yaml.safe_load(_f) or {}
     except Exception:
         pass
-    _ev = _cli_cfg.get('evolution', {})
     _bt = _cli_cfg.get('backtest', {}).get('trading', {})
     _seed = _cli_cfg.get('seed', 42)
 
@@ -574,8 +572,8 @@ if __name__ == '__main__':
                         default=_bt.get('holding_period', 1),
                         help='Holding period (config: backtest.trading.holding_period)')
     parser.add_argument('--forward-period', type=int,
-                        default=_ev.get('forward_period', 10),
-                        help='Forward return period in days (config: evolution.forward_period)')
+                        default=1,
+                        help='Forward return period in days. FIXED at 1 for the ML daily predictor (ignored in run function); kept for CLI compatibility.')
     parser.add_argument('--seed', type=int, default=_seed,
                         help='Random seed for reproducibility (config: seed)')
     parser.add_argument('--output-dir', default='experiments/xgboost_simple',

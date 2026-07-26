@@ -923,7 +923,9 @@ class ExperimentRunner:
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
         top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_xgboost_baseline(
-            portfolio_method=method,
+            # ML baseline: equal-weight (1/n) portfolios — fixed by design in
+            # run_xgboost_baseline; the shared `method` above does not apply.
+            portfolio_method="equal_weight",
             config_path=self.config_path,
             train_start_date=start_date,
             test_end_date=end_date,
