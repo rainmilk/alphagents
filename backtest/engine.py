@@ -343,7 +343,6 @@ if __name__ == '__main__':
     print("=== Backtest Engine Demo ===\n")
     
     # Generate mock data
-    np.random.seed(42)
     n_dates = 100
     n_stocks = 50
     

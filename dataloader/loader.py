@@ -801,7 +801,6 @@ def _load_from_westock(
                 pass
         except Exception:
             industries = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Materials']
-            np.random.seed(42)
             industry_series = pd.Series(
                 np.random.choice(industries, size=n_stocks),
                 index=stock_codes
@@ -1148,7 +1147,6 @@ def _load_from_tushare(
                           '汽车', '食品饮料', '家用电器', '建筑材料', '建筑装饰',
                           '有色金属', '钢铁', '国防军工', '农林牧渔', '纺织服饰',
                           '轻工制造', '商贸零售', '社会服务', '综合', '公用事业']
-        np.random.seed(42)
         for code in stock_codes:
             if code not in industry_dict:
                 industry_dict[code] = np.random.choice(all_industries)
@@ -1580,7 +1578,6 @@ def _load_from_akshare(
                           '汽车', '食品饮料', '家用电器', '建筑材料', '建筑装饰',
                           '有色金属', '钢铁', '国防军工', '农林牧渔', '纺织服饰',
                           '轻工制造', '商贸零售', '社会服务', '综合', '公用事业']
-        np.random.seed(42)
         for code in stock_codes:
             if code not in industry_dict:
                 industry_dict[code] = np.random.choice(all_industries)
@@ -1614,7 +1611,6 @@ def _generate_synthetic_data(
     
     This is a fallback for when westock/AkShare/Tushare are all unavailable.
     """
-    np.random.seed(42)
     dates = pd.date_range(start_date, end_date, freq='B')
     n_days = len(dates)
     stock_codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
@@ -2175,7 +2171,6 @@ def load_sample_data(n_stocks: int = 100, n_days: int = 1000) -> Tuple[pd.DataFr
     Returns:
         Tuple of (price_data, fundamental_data, industry_series)
     """
-    np.random.seed(42)
     
     # Generate dates
     dates = pd.date_range('2023-01-01', periods=n_days, freq='B')

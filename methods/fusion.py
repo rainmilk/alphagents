@@ -1104,7 +1104,6 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # ---- Mock Data ----
-    np.random.seed(42)
     n_dates = 120
     n_stocks = 200
     dates = pd.date_range("2024-01-01", periods=n_dates, freq="B")

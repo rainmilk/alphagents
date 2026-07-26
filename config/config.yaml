@@ -199,7 +199,7 @@ fusion:
 
   # Weighting strategy → used by FactorFusion in step6_fuse_factors
   weighting:
-    strategy: "icir_weighted"  # equal | ic_weighted | icir_weighted | decay_weighted | icir2_shrinkage
+    strategy: "icir2_shrinkage"  # equal | ic_weighted | icir_weighted | decay_weighted | icir2_shrinkage
     corr_penalty: true           # whether to apply correlation-based redundancy penalty
     corr_threshold: 0.7          # correlation threshold for redundancy detection
     # ICIR² shrinkage hyperparameters (for icir2_shrinkage strategy)

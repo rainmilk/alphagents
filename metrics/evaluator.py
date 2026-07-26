@@ -439,7 +439,6 @@ if __name__ == '__main__':
     print("=== Metrics Evaluation Demo ===\n")
     
     # Generate mock data
-    np.random.seed(42)
     n_stocks = 100
     n_days = 100
     

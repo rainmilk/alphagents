@@ -4116,7 +4116,6 @@ Please generate improved factors now. Return only the JSON object, no other text
         Generates up to `n_mutate` variations per top factor using diverse strategies.
         """
         import random
-        random.seed(42)
 
         # --- Family gap (mirror the LLM improve path) ---
         # When the strongest set is missing entire families, we still want the
@@ -4307,7 +4306,6 @@ if __name__ == '__main__':
     """Quick smoke test for expression evaluator and backtester."""
     print("=== Factor Evaluator Smoke Test ===\n")
 
-    np.random.seed(42)
     n_dates, n_stocks = 252, 50
     dates = pd.date_range('2024-01-01', periods=n_dates, freq='B')
     codes = [f'STOCK_{i:04d}' for i in range(n_stocks)]
