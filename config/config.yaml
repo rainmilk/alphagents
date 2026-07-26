@@ -122,20 +122,21 @@ llm:
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
-  n_seeds_hypothesis: 5        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  use_fama101_bridge: true     # [ACTIVE] Step 4c: use FAMA's OWN Alpha101 code (convert_price_data_to_alphafama + AlphaFactory.all_alphas) as the Stage-1 Alpha101 library, injected as precomputed panels so MASE's Alpha101 factors are bit-for-bit identical to FAMA's. All 101 factors enter the pool and are selected by |ICIR| (mirrors FAMA). Set false to revert to MASE's legacy 98-formula DSL library.
+  n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
   alpha101_top_k: 20            # [ACTIVE] Step 4c: number of Stage-1 Alpha101 library factors (top by |IC|) returned alongside the LLM-mined Stage-2 factors for joint evaluation in the pool. 0 = return LLM-mined factors only (legacy behavior). Revived: previously deprecated when Step 4c was LLM-mining-only.
-  n_seeds_memory_augment: 20     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
   retrieve_alpha101: true        # [ACTIVE] enable Step 4c: LLM mining of Alpha101-inspired factors. Scores the library on TRAIN data, builds inspiration chains, and uses LLM to evolve novel expressions. The top-k Alpha101 library factors (evolution.alpha101_top_k) AND the LLM-generated factors both enter the pool for joint evaluation. Set false to skip Step 4c entirely.
   alpha101_ratio: 1.0           # [ACTIVE] Step 4c Alpha101 library scoring knob — INDEPENDENT of alphafama.alpha101_ratio. 0 = load Alpha101 formulas WITHOUT scoring (IC=0.0 placeholder, cheap — skips the 98-factor eval, like FAMA's _seed_clusters_from_formula_map); >0 = load + score the library on TRAIN data and build IC-ranked inspiration chains. Because Step 4c only returns LLM-generated factors (not the Alpha101 formulas themselves), this value acts as a score/skip TOGGLE, not a pool proportion.
   alpha101_max_workers: 0        # [ACTIVE] Step 4c parallel worker count for scoring the Alpha101 library inside llm_mine_alpha101_inspired (0 = auto = min(32, cpu_count()+4)). More workers = faster on multi-core, but each holds a factor panel in RAM.
   alpha101_llm_mining: false     # [DEPRECATED] Step 4c is now LLM-mining-only; controlled by retrieve_alpha101 above. Kept for backward config compat (ignored).
-  alpha101_llm_mining_iters: 5   # [ACTIVE] number of LLM mining iterations (each walks every family chain once).
+  alpha101_llm_mining_iters: 0   # [ACTIVE] number of LLM mining iterations (each walks every family chain once).
   alpha101_llm_mining_per_iter: 1  # [ACTIVE] number of new factors to request per LLM call per family chain.
   alpha101_llm_mining_max_chain: 5 # [ACTIVE] max chain length per family (top-N Alpha101 expressions by |IC| used as LLM inspiration).
   eval_max_workers: 0            # [ACTIVE] evolution-loop parallel worker count for backtesting factors each round (0 = auto = min(32, cpu_count()+4)).
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
   n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
-  n_best4debate: 20     # [ACTIVE] Step 4d: pre-step5 filter — keep top-N factors by |train IC| from the combined pool (evolved + memory + alpha101-llm). 0 = disabled (pass all to Step 5). Set to match fusion.top_k to avoid wasting debate API calls on factors that will be cut.
+  n_best4debate: 15     # [ACTIVE] Step 4d: pre-step5 filter — keep top-N factors by |train IC| from the combined pool (evolved + memory + alpha101-llm). 0 = disabled (pass all to Step 5). Set to match fusion.top_k to avoid wasting debate API calls on factors that will be cut.
   max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
   n_improve: 15        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
@@ -194,7 +195,7 @@ fusion:
   # Normalization → used by FactorNormalizer in step6 (FactorFusion) and step7 (portfolio)
   normalization:
     method: "zscore"  # zscore | rank | minmax
-    neutralize_industry: true  # cross-sectional industry-dummy residualization
+    neutralize_industry: tarue  # cross-sectional industry-dummy residualization
 
   # Weighting strategy → used by FactorFusion in step6_fuse_factors
   weighting:

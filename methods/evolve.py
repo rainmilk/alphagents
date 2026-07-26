@@ -1747,27 +1747,50 @@ class FactorBacktester:
     # Main evaluation entry point
     # ------------------------------------------------------------------
 
-    def evaluate(self, factor: 'CandidateFactor') -> Dict:
+    def evaluate(
+        self,
+        factor: 'CandidateFactor',
+        factor_values: Optional[pd.DataFrame] = None,
+        cache_key: Optional[str] = None,
+    ) -> Dict:
         """
         Evaluate a candidate factor.
 
         Args:
             factor: CandidateFactor with .expression set.
+            factor_values: Optional precomputed (date×ticker) exposure panel.
+                When supplied, the expression evaluator is **bypassed** and this
+                panel is used directly for Rank-IC + quantile-sharpe scoring.
+                This is the path used by the FAMA-101 bridge (see
+                ``methods/fama_alpha101_bridge.py``): those factors have no
+                MASE-DSL expression, so their values are computed by FAMA's own
+                code and injected here. The IC target is still
+                ``self._forward_returns`` — identical to the expression path.
+            cache_key: Optional cache key. Defaults to ``factor.expression``.
+                Pass a stable id (e.g. the FAMA factor id) when ``factor_values``
+                is injected, since the expression is not a real MASE formula.
 
         Returns:
             Dict with keys: ic, ic_ir, sharpe, win_rate, max_drawdown,
                             long_short_ret, factor_values.
         """
         expr = factor.expression
+        # Cache + lookup key. For precomputed (FAMA-101) factors the expression
+        # is a synthetic id, so allow an explicit key; default to the expression.
+        key = cache_key if cache_key is not None else expr
 
-        # Fast path: full metrics already cached for this expression.
+        # Fast path: full metrics already cached for this key.
         with self._cache_lock:
-            cached_metrics = self._metric_cache.get(expr)
+            cached_metrics = self._metric_cache.get(key)
         if cached_metrics is not None:
             out = cached_metrics.copy()
             # Re-attach the (cached) factor_values so callers that need the raw
-            # panel still get it on a cache hit.
-            out['factor_values'] = self._get_factor_values(expr)
+            # panel still get it on a cache hit. Prefer the injected panel when
+            # present (it may differ from what the expression evaluator yields).
+            if factor_values is not None:
+                out['factor_values'] = factor_values
+            else:
+                out['factor_values'] = self._get_factor_values(expr)
             factor.ic = out['ic']
             factor.icir = out.get('icir', 0.0)
             factor.sharpe = out['sharpe']
@@ -1776,8 +1799,10 @@ class FactorBacktester:
             return out
 
         try:
-            # Step 1: Compute factor values (cached + thread-safe).
-            factor_values = self._get_factor_values(expr)
+            # Step 1: Compute factor values (cached + thread-safe) — unless a
+            # precomputed panel was injected (FAMA-101 bridge path).
+            if factor_values is None:
+                factor_values = self._get_factor_values(expr)
             if factor_values.isna().all().all():
                 return self._empty_metrics()
 
@@ -1817,8 +1842,10 @@ class FactorBacktester:
             factor.max_drawdown = metrics['max_drawdown']
 
             # Cache metrics (without the heavy factor_values / long_short_ret).
+            # Use ``key`` (not ``expr``) so precomputed FAMA-101 panels cache
+            # under their stable id rather than a non-evaluable expression.
             with self._cache_lock:
-                self._metric_cache[expr] = {
+                self._metric_cache[key] = {
                     k: v for k, v in metrics.items()
                     if k not in ('long_short_ret', 'factor_values')
                 }
@@ -2913,6 +2940,7 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
         temperature: float = 0.7,
         alpha101_ratio: float = 1.0,
         alpha101_top_k: int = 5,
+        fama101_library: Optional[List['CandidateFactor']] = None,
     ) -> List[CandidateFactor]:
         """Generate NEW factor expressions via LLM chain evolution.
 
@@ -2968,91 +2996,115 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
             return []
 
         # --- 0. Load Alpha101 library + optionally score it ---
-        inspiration_source = "Alpha101 library"
-        try:
-            from methods.alpha101 import get_alpha101_formulas
-        except Exception as e:
-            print(f"  [alpha101-mining] Cannot import Alpha101 "
-                  f"library ({e}).")
-            return []
-
-        formulas = get_alpha101_formulas()
-        if not formulas:
-            print("  [alpha101-mining] Alpha101 library is empty; "
-                  "skipping.")
-            return []
-
-        if alpha101_ratio > 0:
-            # Score all formulas on TRAIN data for IC-ranked chains
-            a101_factors = [
-                CandidateFactor(
-                    id=f"a101_{fid}",
-                    expression=expr,
-                    description=f"Alpha101 {fid}",
-                    generation=0,
-                    family=_infer_family(expr),
-                )
-                for fid, expr in formulas.items()
+        # FAMA-101 bridge path: when the caller passes a precomputed, already-
+        # scored FAMA library (bit-for-bit identical to FAMA), reuse it directly
+        # as the Stage-1 library + the LLM inspiration source. The 101 factors
+        # are added to the pool by the caller (step4c); here they feed ONLY the
+        # inspiration chains and are NOT returned (top_k_lib = [] below), so the
+        # pool never double-counts them.
+        if fama101_library is not None:
+            inspiration_source = "FAMA-101 bridge library"
+            lib_factors = list(fama101_library)
+            scored_expressions = [
+                (f.expression, getattr(f, 'ic', float('nan')))
+                for f in lib_factors
+                if not np.isnan(getattr(f, 'ic', float('nan')))
             ]
-            print(f"  [alpha101-mining] Loaded {len(a101_factors)} Alpha101 "
-                  f"expressions; scoring on TRAIN data...")
-
-            _mw = (max_workers if max_workers > 0
-                   else max(1, min(32, (os.cpu_count() or 4) + 4)))
-            metrics_list = backtester.evaluate_batch(
-                a101_factors, max_workers=_mw, parallel=True)
-
-            scored_expressions: List[Tuple[str, float]] = []
-            for f, m in zip(a101_factors, metrics_list):
-                ic = m.get('ic', float('nan'))
-                if not np.isnan(ic):
-                    scored_expressions.append((f.expression, ic))
-
-            # Stage-1 library factors (raw Alpha101 formulas) — scored and kept
-            # for joint evaluation with the LLM-mined Stage-2 factors.
-            lib_factors = []
-            for f, m in zip(a101_factors, metrics_list):
-                ic = m.get('ic', float('nan'))
-                if not np.isnan(ic):
-                    f.ic = ic
-                    lib_factors.append(f)
-
             if not scored_expressions:
-                print("  [alpha101-mining] No valid Alpha101 factors "
-                      "scored; skipping mining.")
+                print("  [alpha101-mining] FAMA-101 library has no scored "
+                      "factors; skipping mining.")
+                return []
+            print(f"  [alpha101-mining] Using FAMA-101 bridge library "
+                  f"({len(lib_factors)} factors, already scored) as "
+                  f"inspiration source.")
+        else:
+            inspiration_source = "Alpha101 library"
+            try:
+                from methods.alpha101 import get_alpha101_formulas
+            except Exception as e:
+                print(f"  [alpha101-mining] Cannot import Alpha101 "
+                      f"library ({e}).")
                 return []
 
-            print(f"  [alpha101-mining] {len(scored_expressions)} valid "
-                  f"scored expressions → building inspiration chains...")
-        else:
-            # Skip scoring — use all formulas with IC=0.0 placeholder
-            # (matches FAMA's _seed_clusters_from_formula_map)
-            scored_expressions = [
-                (expr, 0.0) for expr in formulas.values()
-            ]
-            # Stage-1 library factors (raw Alpha101 formulas) — IC=0.0
-            # placeholder; returned for joint eval if alpha101_top_k > 0.
-            lib_factors = [
-                CandidateFactor(
-                    id=f"a101_{fid}",
-                    expression=expr,
-                    description=f"Alpha101 {fid}",
-                    generation=0,
-                    family=_infer_family(expr),
-                )
-                for fid, expr in formulas.items()
-            ]
-            print(f"  [alpha101-mining] alpha101_ratio=0: loaded "
-                  f"{len(scored_expressions)} Alpha101 formulas "
-                  f"(scoring skipped, IC=0.0 placeholder) → building "
-                  f"inspiration chains...")
+            formulas = get_alpha101_formulas()
+            if not formulas:
+                print("  [alpha101-mining] Alpha101 library is empty; "
+                      "skipping.")
+                return []
+
+            if alpha101_ratio > 0:
+                # Score all formulas on TRAIN data for IC-ranked chains
+                a101_factors = [
+                    CandidateFactor(
+                        id=f"a101_{fid}",
+                        expression=expr,
+                        description=f"Alpha101 {fid}",
+                        generation=0,
+                        family=_infer_family(expr),
+                    )
+                    for fid, expr in formulas.items()
+                ]
+                print(f"  [alpha101-mining] Loaded {len(a101_factors)} Alpha101 "
+                      f"expressions; scoring on TRAIN data...")
+
+                _mw = (max_workers if max_workers > 0
+                       else max(1, min(32, (os.cpu_count() or 4) + 4)))
+                metrics_list = backtester.evaluate_batch(
+                    a101_factors, max_workers=_mw, parallel=True)
+
+                scored_expressions: List[Tuple[str, float]] = []
+                for f, m in zip(a101_factors, metrics_list):
+                    ic = m.get('ic', float('nan'))
+                    if not np.isnan(ic):
+                        scored_expressions.append((f.expression, ic))
+
+                # Stage-1 library factors (raw Alpha101 formulas) — scored and kept
+                # for joint evaluation with the LLM-mined Stage-2 factors.
+                lib_factors = []
+                for f, m in zip(a101_factors, metrics_list):
+                    ic = m.get('ic', float('nan'))
+                    if not np.isnan(ic):
+                        f.ic = ic
+                        lib_factors.append(f)
+
+                if not scored_expressions:
+                    print("  [alpha101-mining] No valid Alpha101 factors "
+                          "scored; skipping mining.")
+                    return []
+
+                print(f"  [alpha101-mining] {len(scored_expressions)} valid "
+                      f"scored expressions → building inspiration chains...")
+            else:
+                # Skip scoring — use all formulas with IC=0.0 placeholder
+                # (matches FAMA's _seed_clusters_from_formula_map)
+                scored_expressions = [
+                    (expr, 0.0) for expr in formulas.values()
+                ]
+                # Stage-1 library factors (raw Alpha101 formulas) — IC=0.0
+                # placeholder; returned for joint eval if alpha101_top_k > 0.
+                lib_factors = [
+                    CandidateFactor(
+                        id=f"a101_{fid}",
+                        expression=expr,
+                        description=f"Alpha101 {fid}",
+                        generation=0,
+                        family=_infer_family(expr),
+                    )
+                    for fid, expr in formulas.items()
+                ]
+                print(f"  [alpha101-mining] alpha101_ratio=0: loaded "
+                      f"{len(scored_expressions)} Alpha101 formulas "
+                      f"(scoring skipped, IC=0.0 placeholder) → building "
+                      f"inspiration chains...")
 
         # --- Select top-k Stage-1 Alpha101 library factors to return ---
         # Raw Alpha101 formulas returned for joint evaluation with the
         # LLM-mined Stage-2 factors. alpha101_top_k <= 0 disables returning
         # library factors (LLM-mined only, as before).
+        # In FAMA-101 bridge mode the 101 library factors are ALREADY in the
+        # pool (added by step4c), so they must NOT be returned again here.
         _top_k = int(alpha101_top_k)
-        if _top_k > 0 and lib_factors:
+        if _top_k > 0 and lib_factors and fama101_library is None:
             lib_factors.sort(
                 key=lambda x: abs(getattr(x, 'ic', 0.0) or 0.0), reverse=True)
             top_k_lib = lib_factors[:_top_k]
@@ -3064,11 +3116,29 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
 
         # --- 1. Group by family and build initial chains ---
         from collections import defaultdict
+        # Map a FAMA-101 factor id back to its real AlphaFAMA-DSL formula text
+        # so family bucketing uses the genuine operator keywords (volume,
+        # returns, …) instead of bucketing every "fama101_alphaNNN" as "Other".
+        _fama_formula_map = None
+        if any(e.startswith("fama101_") for e, _ in scored_expressions):
+            try:
+                from baselines.AlphaFAMA.src.constants.formula_map import FORMULA_MAP
+                _fama_formula_map = FORMULA_MAP
+            except Exception:
+                _fama_formula_map = None
+
+        def _family_of(expr: str) -> str:
+            if expr.startswith("fama101_"):
+                _fid = expr[len("fama101_"):]
+                _text = _fama_formula_map.get(_fid, expr) if _fama_formula_map else expr
+                return _infer_family(_text)
+            return _infer_family(expr)
+
         family_buckets: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
         for expr, ic in scored_expressions:
             if np.isnan(ic):
                 continue
-            fam = _infer_family(expr)
+            fam = _family_of(expr)
             family_buckets[fam].append((expr, ic))
 
         # Sort each family by |IC| desc, keep top max_chain_len
@@ -3132,7 +3202,12 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
                     f"create novel expressions:\n\n"
                 )
                 for i, (expr, ic) in enumerate(chain[:max_chain_len]):
-                    user_prompt += f"  Factor {i+1} (IC={ic:+.4f}): {expr}\n"
+                    # Show the LLM the REAL FAMA formula text (not the opaque
+                    # "fama101_alphaNNN" id) so the inspiration is meaningful.
+                    _disp = expr
+                    if expr.startswith("fama101_") and _fama_formula_map is not None:
+                        _disp = _fama_formula_map.get(expr[len("fama101_"):], expr)
+                    user_prompt += f"  Factor {i+1} (IC={ic:+.4f}): {_disp}\n"
 
                 user_prompt += (
                     f"\nGenerate {n_per_iter} NEW expressions. Each must be "
