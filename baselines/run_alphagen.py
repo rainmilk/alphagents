@@ -1264,6 +1264,7 @@ def build_portfolios_from_ensemble(
     top_n: int = 50,
     test_start_date: Optional[str] = None,
     portfolio_method: str = "equal_weight",
+    test_end_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from ensemble factor values.
@@ -1280,12 +1281,17 @@ def build_portfolios_from_ensemble(
     portfolios = pd.DataFrame(0.0, index=close.index, columns=close.columns)
     stocks = close.columns.tolist()
 
+    # Bound the loop to [test_start, test_end] (searchsorted: no KeyError,
+    # works whether `close` is the full series or an already-split test slice)
+    start_idx = 0
     if test_start_date is not None:
-        start_idx = close.index.get_loc(test_start_date)
-    else:
-        start_idx = 0
+        start_idx = int(close.index.searchsorted(pd.Timestamp(test_start_date), side="left"))
+    end_idx = close.shape[0]
+    if test_end_date is not None:
+        end_idx = int(close.index.searchsorted(pd.Timestamp(test_end_date), side="right"))
+        end_idx = min(end_idx, close.shape[0])
 
-    for t in range(max(start_idx, 1), close.shape[0]):
+    for t in range(max(start_idx, 1), end_idx):
         day_values = ensemble_values[t]
         day_prices = close.iloc[t].values
 
@@ -1629,6 +1635,7 @@ def run_alphagen_baseline(
     # Reconstruct full close timeline for portfolio building
     portfolios = build_portfolios_from_ensemble(
         ensemble_test, test_price['close'], top_n=top_n_stocks,
+        test_start_date=test_start, test_end_date=test_end,
         portfolio_method=portfolio_method,
     )
     print(f"  Portfolios: {portfolios.shape}")

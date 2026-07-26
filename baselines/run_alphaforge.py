@@ -1269,6 +1269,12 @@ def stage3_evaluate_results(
         test_mask = [d >= test_start_ts for d in prediction_dates]
         test_predictions = [p for p, m in zip(predictions, test_mask) if m]
         test_pred_dates = [d for d, m in zip(prediction_dates, test_mask) if m]
+        # Upper-bound the test window (fixes OOS overrun past test_end)
+        if test_end is not None:
+            test_end_ts = pd.Timestamp(test_end)
+            up_mask = [d <= test_end_ts for d in test_pred_dates]
+            test_predictions = [p for p, m in zip(test_predictions, up_mask) if m]
+            test_pred_dates = [d for d, m in zip(test_pred_dates, up_mask) if m]
         print(f"  Filtered predictions: {len(test_predictions)} / {len(predictions)} "
               f"(test_start={test_start_ts.date()})")
     else:

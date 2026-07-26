@@ -560,10 +560,13 @@ def compute_portfolio_metrics(
         # Convert to wide DataFrame (date x stock) for portfolio construction
         factor_df = factor_series.unstack(fill_value=np.nan)
 
-        # Only use OOS period for backtest
-        oos_dates = factor_df.index[factor_df.index >= split_date]
-        if len(oos_dates) < 10:
-            oos_dates = factor_df.index
+        # Only use OOS period for backtest (bound BOTH ends — fixes window overrun)
+        split_ts = pd.Timestamp(split_date)
+        end_ts = pd.Timestamp(end_date) if end_date else None
+        oos_mask = factor_df.index >= split_ts
+        if end_ts is not None:
+            oos_mask = oos_mask & (factor_df.index <= end_ts)
+        oos_dates = factor_df.index[oos_mask]
         factor_oos = factor_df.loc[oos_dates]
 
         # Build portfolios: select top-N stocks by factor score each day
@@ -617,7 +620,11 @@ def compute_portfolio_metrics(
         daily_ic = []
         try:
             oos_df = pd.concat([factor_series.rename("factor"), return_series], axis=1).dropna()
-            oos_df = oos_df[oos_df.index.get_level_values("datetime") >= split_date]
+            _dt = oos_df.index.get_level_values("datetime")
+            _mask = _dt >= split_date
+            if end_date:
+                _mask = _mask & (_dt <= pd.Timestamp(end_date))
+            oos_df = oos_df[_mask]
             for _, group in oos_df.groupby(level="datetime"):
                 if len(group) >= 5:
                     ic = group["factor"].corr(group.iloc[:, -1], method="spearman")

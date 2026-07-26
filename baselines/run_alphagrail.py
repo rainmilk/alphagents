@@ -1121,6 +1121,7 @@ def build_portfolios_from_factor(
     top_n: int = 50,
     test_start_date: Optional[str] = None,
     portfolio_method: str = "equal_weight",
+    test_end_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from factor scores.
@@ -1134,10 +1135,13 @@ def build_portfolios_from_factor(
     Returns:
         Portfolio weights DataFrame (date × stock), each row sums to 1.0
     """
-    # Filter to test period
+    # Filter to test period (BOTH bounds — fixes OOS window overrun)
     if test_start_date is not None:
         test_start_ts = pd.Timestamp(test_start_date)
         factor_values = factor_values[factor_values.index >= test_start_ts]
+    if test_end_date is not None:
+        test_end_ts = pd.Timestamp(test_end_date)
+        factor_values = factor_values[factor_values.index <= test_end_ts]
 
     if factor_values.empty:
         return pd.DataFrame()
@@ -1405,6 +1409,7 @@ def run_alphagrail_baseline(
         test_factor_values,
         top_n=top_n_stocks,
         test_start_date=test_start,
+        test_end_date=test_end,
         portfolio_method=portfolio_method,
     )
 

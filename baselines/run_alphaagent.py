@@ -1417,9 +1417,13 @@ def simulate_factor_portfolio(
     if not available:
         raise RuntimeError("No valid factors found for portfolio construction")
 
-    # Align to test period
+    # Align to test period (BOTH bounds — fixes OOS window overrun)
     test_start_ts = pd.Timestamp(test_start_date)
-    factor_test = factor_df[factor_df.index >= test_start_ts]
+    test_end_ts = pd.Timestamp(end_date) if end_date is not None else None
+    mask = factor_df.index >= test_start_ts
+    if test_end_ts is not None:
+        mask = mask & (factor_df.index <= test_end_ts)
+    factor_test = factor_df[mask]
     if factor_test.empty:
         return pd.DataFrame()
 
