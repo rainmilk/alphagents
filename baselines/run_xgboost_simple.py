@@ -85,7 +85,7 @@ def _build_features(close: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
-def _build_targets(close: pd.DataFrame, forward_period: int = 1) -> pd.DataFrame:
+def _build_targets(close: pd.DataFrame, forward_period: int = 10) -> pd.DataFrame:
     """
     Build forward-period returns as the prediction target.
 
@@ -94,7 +94,7 @@ def _build_targets(close: pd.DataFrame, forward_period: int = 1) -> pd.DataFrame
 
     Args:
         close: Close price DataFrame (date x stock)
-        forward_period: Number of days ahead for return calculation (default 1).
+        forward_period: Number of days ahead for return calculation (default 10).
 
     Returns:
         DataFrame, MultiIndex (date, stock), column 'forward_return'
@@ -294,7 +294,7 @@ def run_xgboost_simple(
     max_depth: int = 5,
     learning_rate: float = 0.05,
     holding_period: int = 1,
-    forward_period: int = 1,  # FIXED at 1 day for ML daily predictors (ignored in body)
+    forward_period: Optional[int] = None,  # resolved from config (evolution.forward_period) if None
     seed: int = 42,
     output_dir: Optional[str] = None,
     portfolio_method: str = "equal_weight",  # FIXED: ML baseline uses equal-weight 1/n
@@ -321,11 +321,12 @@ def run_xgboost_simple(
     # (config-backed); no manual end-date extension is needed here.
     loader = DataLoader(config_path=config_path)
 
-    # -- ML daily predictor: forward horizon FIXED at 1 day ------------
-    # Predicts the next-day return for every test day. Intentionally
-    # decoupled from factor-method evolution.forward_period (default 10);
-    # the forward_period arg is ignored on purpose.
-    forward_period = 1
+    # -- Forward horizon: align with all other baselines ------------
+    # Resolve from the passed argument; fall back to config
+    # (evolution.forward_period, e.g. 5). Do NOT hardcode — keep the ML
+    # predictors consistent with MASE / factor baselines.
+    if forward_period is None or forward_period <= 0:
+        forward_period = loader.config.get('evolution', {}).get('forward_period', 10)
 
     # -- Portfolio method FIXED to equal-weight (1/n) for ML baselines ----
     # These end-to-end predictors are NOT factor methods, so for a fair paper
@@ -572,8 +573,8 @@ if __name__ == '__main__':
                         default=_bt.get('holding_period', 1),
                         help='Holding period (config: backtest.trading.holding_period)')
     parser.add_argument('--forward-period', type=int,
-                        default=1,
-                        help='Forward return period in days. FIXED at 1 for the ML daily predictor (ignored in run function); kept for CLI compatibility.')
+                        default=None,
+                        help='Forward return period in days. Resolved from config (evolution.forward_period) when None; kept for CLI compatibility.')
     parser.add_argument('--seed', type=int, default=_seed,
                         help='Random seed for reproducibility (config: seed)')
     parser.add_argument('--output-dir', default='experiments/xgboost_simple',
