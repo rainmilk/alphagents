@@ -123,9 +123,9 @@ llm:
 evolution:
   forward_period: 5   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   use_fama101_bridge: true     # [ACTIVE] Step 3: use FAMA's OWN Alpha101 code (convert_price_data_to_alphafama + AlphaFactory.all_alphas) as the Stage-1 Alpha101 library during factor generation, injected as precomputed panels so MASE's Alpha101 factors are bit-for-bit identical to FAMA's. All 82 factors go to post_debate (skip evolution+debate). Set false to revert to MASE's legacy 98-formula DSL library.
-  n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  n_seeds_hypothesis: 20        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
   alpha101_top_k: 20            # [ACTIVE] Step 3: number of Stage-1 Alpha101 library factors (top by |IC|) returned alongside the LLM-mined Stage-2 factors for joint evaluation in the pool. 0 = return LLM-mined factors only.
-  n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  n_seeds_memory_augment: 5     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
   retrieve_alpha101: true        # [ACTIVE] Step 3: Alpha101 library loading + LLM mining during factor generation. Library factors go to post_debate (skip evolution+debate); LLM-mined factors join the seed pool for evolution. Set false to skip entirely.
   alpha101_ratio: 1.0           # [ACTIVE] Step 3 Alpha101 library scoring knob — INDEPENDENT of alphafama.alpha101_ratio. 0 = load Alpha101 formulas WITHOUT scoring (IC=0.0 placeholder); >0 = load + score the library on TRAIN data. Used as skip/score TOGGLE, not a pool proportion.
   alpha101_max_workers: 0        # [ACTIVE] Step 3 parallel worker count for scoring the Alpha101 library inside llm_mine_alpha101_inspired (0 = auto).
@@ -150,7 +150,7 @@ evolution:
   max_drawdown: -1.0       # [ACTIVE] quality filter: drop factors with drawdown worse than this. Cumsum-based after fix (single-sided 10d LS returns); -0.20 was too strict for 2023-2024 A-share bear market — even decent factors easily exceed -20% cumulative.
   originality_gate: true    # [ACTIVE] static AST gate: reject structural near-duplicates + trivial/no-data/constant-dominated factors before they enter the pool
   dedup_similarity: 0.90    # [ACTIVE] canonical-signature similarity above which a factor is treated as a near-duplicate of an accepted one
-  improve_temperature: 0.3  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
+  improve_temperature: 0.7  # [ACTIVE] LLM temperature for factor IMPROVEMENT (NOT seed generation). Diversity is now driven by the improve-prompt family-rotation + operator-diversity rules, so 0.7 balances refinement vs exploration. The old 0.8 (with no prompt-side diversity guard) caused fresh-lottery collapse.
   elitism_carry: 3          # [ACTIVE] number of top factors carried forward unmutated each round. Breaks the "full replacement" cycle that collapses the pool to a single direction.
 
 # ==================== Memory Bank Configuration ====================
