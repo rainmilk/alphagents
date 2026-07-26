@@ -1246,6 +1246,7 @@ def run_alphafama_baseline(
         'calmar_ratio': simulated_metrics.get('calmar_ratio', 0.0),
         'win_rate': simulated_metrics.get('win_rate', 0.0),
         'avg_turnover': simulated_metrics.get('avg_turnover', 0.0),
+        'n_trading_days': simulated_metrics.get('n_trading_days', 0),
         'train_end': train_end,
         'test_start': test_start,
         'train_start': train_start,

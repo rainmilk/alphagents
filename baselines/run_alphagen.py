@@ -1684,6 +1684,7 @@ def run_alphagen_baseline(
 
     results = {
         'rl_method': rl_method,
+        'total_return': backtest_metrics.get('total_return', 0.0),
         'annual_return': backtest_metrics.get('annual_return', 0.0),
         'sharpe_ratio': backtest_metrics.get('sharpe_ratio', 0.0),
         'max_drawdown': backtest_metrics.get('max_drawdown', 0.0),
@@ -1705,6 +1706,7 @@ def run_alphagen_baseline(
         'holding_period': holding_period,
         'pool_weights': pool.weights.tolist() if pool.size > 0 else [],
         'pool_exprs': [repr(e) for e in pool.exprs],
+        'n_trading_days': backtest_metrics.get('n_trading_days', 0),
     }
     
     # Include RL training stats if available
