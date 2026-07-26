@@ -1451,7 +1451,7 @@ class AAAI2027Pipeline:
                 else:
                     ic_std_val = 1.0
             else:
-                ic_val = ic_std_val = sharpe_val = 0.0
+                ic_val = icir_val = ic_std_val = sharpe_val = val_icir_val = 0.0
 
             dscore = debate_score_map.get(name, 0.0)
             if dscore == 0.0:
