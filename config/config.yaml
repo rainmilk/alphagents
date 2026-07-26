@@ -51,7 +51,7 @@ data:
   # Context window: prepend N train days to test_data as lookback so
   # rolling-window factor expressions (ts_mean, ts_std, ts_corr, …) have
   # history on the first test date. Cropped before backtest.
-  context_days: 30  # trading days; 30 covers typical max rolling window
+  context_days: 60  # trading days; 60 covers typical max rolling window
   
   # Feature engineering
   features:
@@ -130,8 +130,8 @@ evolution:
   alpha101_ratio: 1.0           # [ACTIVE] Step 3 Alpha101 library scoring knob — INDEPENDENT of alphafama.alpha101_ratio. 0 = load Alpha101 formulas WITHOUT scoring (IC=0.0 placeholder); >0 = load + score the library on TRAIN data. Used as skip/score TOGGLE, not a pool proportion.
   alpha101_max_workers: 0        # [ACTIVE] Step 3 parallel worker count for scoring the Alpha101 library inside llm_mine_alpha101_inspired (0 = auto).
   alpha101_llm_mining: true     # [DEPRECATED] Alpha101 LLM mining is now controlled by retrieve_alpha101 above. Kept for backward config compat (ignored).
-  alpha101_llm_mining_iters: 1   # [ACTIVE] number of LLM mining iterations (each walks every family chain once).
-  alpha101_llm_mining_per_iter: 3  # [ACTIVE] number of new factors to request per LLM call per family chain.
+  alpha101_llm_mining_iters: 2   # [ACTIVE] number of LLM mining iterations (each walks every family chain once).
+  alpha101_llm_mining_per_iter: 2  # [ACTIVE] number of new factors to request per LLM call per family chain.
   alpha101_llm_mining_max_chain: 5 # [ACTIVE] max chain length per family (top-N Alpha101 expressions by |IC| used as LLM inspiration).
   eval_max_workers: 0            # [ACTIVE] evolution-loop parallel worker count for backtesting factors each round (0 = auto = min(32, cpu_count()+4)).
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
@@ -199,7 +199,7 @@ fusion:
 
   # Weighting strategy → used by FactorFusion in step6_fuse_factors
   weighting:
-    strategy: "icir2_shrinkage"  # equal | ic_weighted | icir_weighted | decay_weighted | icir2_shrinkage
+    strategy: "icir_weighted"  # equal | ic_weighted | icir_weighted | decay_weighted | icir2_shrinkage
     corr_penalty: true           # whether to apply correlation-based redundancy penalty
     corr_threshold: 0.7          # correlation threshold for redundancy detection
     # ICIR² shrinkage hyperparameters (for icir2_shrinkage strategy)
@@ -231,7 +231,7 @@ fusion:
   # the user wants to feed fusion.fuse(). NOTE: this is a different knob from
   # memory.retrieval.top_k (factor-pool retrieval) and llm.chair.synthesis_top_n
   # (how many factors get full detail in the Chair prompt).
-  top_k: 10
+  top_k: 20
 
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:

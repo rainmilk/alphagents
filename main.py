@@ -409,21 +409,14 @@ class AAAI2027Pipeline:
         fwd = forward_period
         self._forward_period = forward_period
 
-        # Alpha101 library is loaded HERE during factor generation (not in
-        # Step 3).  Library factors go to self._post_debate_factors (skip
-        # evolution + debate); LLM-mined alpha101-inspired factors join
-        # self.generated_factors (evolve + evaluate normally).
-        alpha101_retrieval_enabled = bool(evo_cfg.get('retrieve_alpha101', True))
-        print(f"\n[Step 3] Generating seed factors — "
+        # Step 3 generates SEED factors only (hypothesis-driven + optional
+        # memory-augmented). Alpha101 / FAMA-101 factor generation lives in
+        # step4c_retrieve_alpha101 (post-debate; does NOT evolve/debate).
+        print(f"\n[Step 3] Generating seed factors - "
               f"hypothesis: {n_seeds_hypothesis}, "
               f"memory-augment: {n_seeds_memory_augment}")
-        print(f"  [Step 3] Alpha101 library loaded here → post_debate; "
-              f"LLM-mining alpha101-inspired factors → seeds "
-              f"(enabled={alpha101_retrieval_enabled}).")
 
-        # Initialize evolving generator — Alpha101 library factors are added
-        # to self._post_debate_factors below; LLM-mined factors are added to
-        # self.generated_factors (seeds for evolution).
+        # Initialize the evolving generator (seeds for Step-4 evolution).
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
             n_seeds_hypothesis=n_seeds_hypothesis,
@@ -506,179 +499,7 @@ class AAAI2027Pipeline:
               f"({len(seed_factors)} base + "
               f"{len(self.generated_factors) - len(seed_factors)} memory-augmented)")
 
-        # --- Alpha101 library: score + LLM-mine new factors here ---
-        # The Alpha101 formula library (or FAMA-101 bridge) is loaded HERE
-        # during factor generation. Library factors go to
-        # self._post_debate_factors (they skip evolution + debate); LLM-mined
-        # alpha101-inspired factors join self.generated_factors (they go
-        # through evolution + evaluation normally).
-        self._post_debate_factors = getattr(self, '_post_debate_factors', []) or []
-        if alpha101_retrieval_enabled:
-            gen = self.evolving_generator
-            llm_available = getattr(gen, 'use_llm', False) and bool(gen.client)
-
-            # --- Build TRAIN backtester (needed for scoring + FAMA bridge) ---
-            try:
-                train_price = self.train_data['price_data']
-                train_fund = self.train_data.get('fundamental_data', {})
-                import os as _os
-                bt = FactorBacktester(
-                    prices=train_price,
-                    fundamentals=train_fund,
-                    forward_period=fwd,
-                )
-            except Exception as _e:
-                print(f"  [alpha101] Cannot build backtester ({_e}); "
-                      f"skipping Alpha101 loading.")
-                bt = None
-
-            if bt is not None:
-                # --- FAMA-101 bridge (if enabled) ---
-                use_fama101_bridge = bool(
-                    self.config['evolution'].get('use_fama101_bridge', False))
-                fama_factors = []  # defined even when bridge is off
-                if use_fama101_bridge:
-                    # ── Restrict compute to the train+test span (with warm-up) ──
-                    # self.price_data is bundle.full = the ENTIRE archive, which is
-                    # usually wider than the experiment window: it carries pre-train
-                    # rows (if full_start < train_start) and post-test rows
-                    # (test_end → archive_end). Those dates are NEVER IC-scored or
-                    # backtested, so computing factors on them is pure waste.
-                    # We compute only on [train_start - context_days, test_end]:
-                    #   • the context_days warm-up before train_start mirrors the
-                    #     test context window split_data() already prepends, so the
-                    #     train-boundary factor values stay correct (Alpha101's
-                    #     longest rolling window is ~20d, well under context_days);
-                    #   • post-test rows are dropped outright (the only future-
-                    #     dependent column, forward_return, is unused downstream).
-                    # Alpha101 factors are causal (ts_*/delay/returns read only past
-                    # data), so this scope change introduces NO test leakage and the
-                    # in-window values remain bit-identical to a full-series compute.
-                    full_idx = self.price_data['close'].index
-                    ts_idx = pd.to_datetime(full_idx)
-                    ctx = int(getattr(self, '_context_days', 30))
-                    if self._train_start_date:
-                        _pos = int(ts_idx.searchsorted(
-                            pd.Timestamp(self._train_start_date)))
-                        _warm_start = ts_idx[max(0, _pos - ctx)]
-                    else:
-                        _warm_start = ts_idx[0]
-                    _end = (pd.Timestamp(self._test_end_date)
-                            if self._test_end_date else ts_idx[-1])
-                    _px = {k: v.loc[slice(_warm_start, _end)]
-                           for k, v in self.price_data.items()}
-                    _n_dt, _n_tkr = _px['close'].shape[0], _px['close'].shape[1]
-                    print(f"  [alpha101] FAMA-101 bridge: computing Alpha101 "
-                          f"exposures (forward_period={fwd}) on train+test span "
-                          f"with {ctx}d warm-up ({_n_dt} dates × {_n_tkr} tickers; "
-                          f"full archive = {len(full_idx)} dates)...")
-                    try:
-                        from methods.fama_alpha101_bridge import (
-                            compute_fama101_exposures,
-                            slice_exposures_to_dates,
-                        )
-                        from concurrent.futures import ThreadPoolExecutor
-
-                        exposures = compute_fama101_exposures(
-                            _px, forward_period=fwd)
-                        train_dates = self.train_data['price_data']['close'].index
-                        train_slices = slice_exposures_to_dates(exposures, train_dates)
-
-                        fama_factors = []
-                        for col in exposures.columns:
-                            cf = CandidateFactor(
-                                id=col, expression=col,
-                                description=f"FAMA Alpha101 {col}",
-                                generation=0, family='Alpha101')
-                            cf._from_fama101 = True
-                            cf._from_alpha101_lib = True
-                            cf._from_alpha101 = True
-                            fama_factors.append(cf)
-
-                        def _score_fama(cf):
-                            fv = train_slices.get(cf.expression)
-                            if fv is None: return
-                            try:
-                                bt.evaluate(cf, factor_values=fv,
-                                            cache_key=cf.expression)
-                            except Exception: pass
-                        _nw = 1  # serial (avoids Windows C-level crash)
-                        with ThreadPoolExecutor(max_workers=_nw) as _ex:
-                            list(_ex.map(_score_fama, fama_factors))
-
-                        self._fama101_exposures = exposures
-                        self._post_debate_factors.extend(fama_factors)
-                        print(f"  [alpha101] FAMA-101 bridge: {len(fama_factors)} "
-                              f"factors → post_debate")
-                    except Exception as _e:
-                        import traceback
-                        traceback.print_exc()
-                        print(f"  [alpha101] FAMA-101 bridge failed: {_e}")
-
-                # --- LLM mining of alpha101-inspired factors ---
-                # Runs AFTER the bridge (so fama_factors are available as the
-                # scored library for inspiration chains).
-                if llm_available:
-                    try:
-                        mining_iters = int(evo_cfg.get(
-                            'alpha101_llm_mining_iters', 3))
-                        mining_per_iter = int(evo_cfg.get(
-                            'alpha101_llm_mining_per_iter', 1))
-                        mining_max_chain = int(evo_cfg.get(
-                            'alpha101_llm_mining_max_chain', 5))
-                        alpha101_ratio = float(evo_cfg.get(
-                            'alpha101_ratio', 1.0))
-                        alpha101_top_k = int(evo_cfg.get(
-                            'alpha101_top_k', 0) or 0)
-
-                        # In FAMA bridge mode, the library is already scored
-                        # and in fama_factors; pass it so chains use those ICs.
-                        _fama_lib = (fama_factors
-                                     if use_fama101_bridge else None)
-                        print(f"  [alpha101] LLM mining Alpha101-inspired factors "
-                              f"({mining_iters} iters × {mining_per_iter}/call, "
-                              f"max_chain={mining_max_chain}, "
-                              f"alpha101_ratio={alpha101_ratio}, "
-                              f"library={'FAMA-101' if use_fama101_bridge else 'Alpha101'})...")
-                        mined = gen.llm_mine_alpha101_inspired(
-                            backtester=bt,
-                            max_workers=max(1, min(32, (_os.cpu_count() or 4) + 4)),
-                            n_iters=mining_iters,
-                            n_per_iter=mining_per_iter,
-                            max_chain_len=mining_max_chain,
-                            temperature=getattr(gen, 'improve_temperature', 0.3),
-                            alpha101_ratio=alpha101_ratio,
-                            alpha101_top_k=alpha101_top_k,
-                            fama101_library=_fama_lib,
-                        )
-                        if mined:
-                            lib_factors = [f for f in mined
-                                           if getattr(f, '_from_alpha101_lib', False)]
-                            llm_factors = [f for f in mined
-                                           if not getattr(f, '_from_alpha101_lib', False)]
-                            if lib_factors:
-                                self._post_debate_factors.extend(lib_factors)
-                                print(f"  [alpha101] {len(lib_factors)} library "
-                                      f"factors → post_debate")
-                            if llm_factors:
-                                self.generated_factors.extend(llm_factors)
-                                print(f"  [alpha101] {len(llm_factors)} LLM-mined "
-                                      f"factors → generated_factors (will evolve)")
-                    except Exception as _e:
-                        print(f"  [alpha101] LLM mining failed: {_e}")
-                else:
-                    print(f"  [alpha101] LLM not available — Alpha101 "
-                          f"mining skipped; {len(self._post_debate_factors)} "
-                          f"library factors loaded.")
-            else:
-                print("  [alpha101] No backtester available; "
-                      "Alpha101 loading skipped.")
-        else:
-            print("  [alpha101] Alpha101 retrieval disabled "
-                  "(evolution.retrieve_alpha101=false).")
-
-        print(f"  Total factors: {len(self.generated_factors)} in pool "
-              f"+ {len(self._post_debate_factors)} post_debate")
+        print(f"  Total factors: {len(self.generated_factors)} in pool")
         print("  [✓] Factor generation complete")
         
     def _split_train_val(self, train_data: dict, val_ratio: float):
@@ -892,6 +713,182 @@ class AAAI2027Pipeline:
             print("  No relevant factors found in memory")
 
         print("  [✓] Memory retrieval complete")
+
+    def step4c_retrieve_alpha101(self, forward_period: int = None):
+        """
+        Step 4c: Retrieve / generate Alpha101 (and FAMA-101 bridge) factors.
+
+        Produced factors are placed in self._post_debate_factors, so they
+        SKIP evolution (Step 4a) and debate (Step 5): they are merged back
+        into the fusion pool after Step 5b. This step runs AFTER evolution
+        has finished, so these factors cannot be evolved anyway.
+
+        Args:
+            forward_period: forward return horizon in trading days
+                            (None -> config['evolution']['forward_period'] or 10).
+        """
+        if not METHODS_AVAILABLE:
+            print("\n[Step 4c] Skipped: methods modules not available")
+            return
+
+        evo_cfg = self.config['evolution']
+        # Resolve forward_period: explicit arg > config.yaml > default 10
+        # (mirrors step3 / step4 / step1).
+        if forward_period is None:
+            forward_period = evo_cfg.get('forward_period', 10)
+        fwd = forward_period
+        self._forward_period = forward_period
+
+        # Initialize (or preserve) the post-debate pool.
+        self._post_debate_factors = getattr(self, '_post_debate_factors', []) or []
+
+        alpha101_retrieval_enabled = bool(evo_cfg.get('retrieve_alpha101', True))
+        if not alpha101_retrieval_enabled:
+            print("  [step4c] Alpha101 retrieval disabled "
+                  "(evolution.retrieve_alpha101=false).")
+            return
+
+        gen = self.evolving_generator
+        llm_available = getattr(gen, 'use_llm', False) and bool(gen.client)
+
+        # --- Build TRAIN backtester (needed for scoring + FAMA bridge) ---
+        try:
+            train_price = self.train_data['price_data']
+            train_fund = self.train_data.get('fundamental_data', {})
+            import os as _os
+            bt = FactorBacktester(
+                prices=train_price,
+                fundamentals=train_fund,
+                forward_period=fwd,
+            )
+        except Exception as _e:
+            print(f"  [step4c] Cannot build backtester ({_e}); "
+                  f"skipping Alpha101 loading.")
+            return
+
+        # --- FAMA-101 bridge (if enabled) ---
+        use_fama101_bridge = bool(evo_cfg.get('use_fama101_bridge', False))
+        fama_factors = []
+        if use_fama101_bridge:
+            # Restrict compute to the train+test span (with warm-up) so we
+            # never waste cycles on pre-train / post-test rows that are never
+            # IC-scored or backtested. The context_days warm-up before
+            # train_start mirrors the test context window split_data() already
+            # prepends, keeping train-boundary factor values correct (Alpha101
+            # longest rolling window is ~20d < context_days). Alpha101 factors
+            # are causal, so this introduces no test leakage and in-window
+            # values stay bit-identical to a full-series compute.
+            full_idx = self.price_data['close'].index
+            ts_idx = pd.to_datetime(full_idx)
+            ctx = int(getattr(self, '_context_days', 30))
+            if self._train_start_date:
+                _pos = int(ts_idx.searchsorted(pd.Timestamp(self._train_start_date)))
+                _warm_start = ts_idx[max(0, _pos - ctx)]
+            else:
+                _warm_start = ts_idx[0]
+            _end = (pd.Timestamp(self._test_end_date)
+                    if self._test_end_date else ts_idx[-1])
+            _px = {k: v.loc[slice(_warm_start, _end)]
+                   for k, v in self.price_data.items()}
+            _n_dt, _n_tkr = _px['close'].shape[0], _px['close'].shape[1]
+            print(f"  [step4c] FAMA-101 bridge: computing Alpha101 exposures "
+                  f"(forward_period={fwd}) on train+test span with {ctx}d "
+                  f"warm-up ({_n_dt} dates x {_n_tkr} tickers; "
+                  f"full archive = {len(full_idx)} dates)...")
+            try:
+                from methods.fama_alpha101_bridge import (
+                    compute_fama101_exposures,
+                    slice_exposures_to_dates,
+                )
+                from concurrent.futures import ThreadPoolExecutor
+
+                exposures = compute_fama101_exposures(_px, forward_period=fwd)
+                train_dates = self.train_data['price_data']['close'].index
+                train_slices = slice_exposures_to_dates(exposures, train_dates)
+
+                fama_factors = []
+                for col in exposures.columns:
+                    cf = CandidateFactor(
+                        id=col, expression=col,
+                        description=f"FAMA Alpha101 {col}",
+                        generation=0, family='Alpha101')
+                    cf._from_fama101 = True
+                    cf._from_alpha101_lib = True
+                    cf._from_alpha101 = True
+                    fama_factors.append(cf)
+
+                def _score_fama(cf):
+                    fv = train_slices.get(cf.expression)
+                    if fv is None:
+                        return
+                    try:
+                        bt.evaluate(cf, factor_values=fv,
+                                    cache_key=cf.expression)
+                    except Exception:
+                        pass
+                _nw = 1  # serial (avoids Windows C-level crash)
+                with ThreadPoolExecutor(max_workers=_nw) as _ex:
+                    list(_ex.map(_score_fama, fama_factors))
+
+                self._fama101_exposures = exposures
+                self._post_debate_factors.extend(fama_factors)
+                print(f"  [step4c] FAMA-101 bridge: {len(fama_factors)} "
+                      f"factors -> post_debate")
+            except Exception as _e:
+                import traceback
+                traceback.print_exc()
+                print(f"  [step4c] FAMA-101 bridge failed: {_e}")
+
+        # --- LLM mining of alpha101-inspired factors ---
+        # Runs AFTER the bridge (so fama_factors are available as the scored
+        # library for inspiration chains). ALL mined factors go to
+        # _post_debate_factors (Step 4c does not participate in debate).
+        if llm_available:
+            try:
+                mining_iters = int(evo_cfg.get('alpha101_llm_mining_iters', 3))
+                mining_per_iter = int(evo_cfg.get('alpha101_llm_mining_per_iter', 1))
+                mining_max_chain = int(evo_cfg.get('alpha101_llm_mining_max_chain', 5))
+                alpha101_ratio = float(evo_cfg.get('alpha101_ratio', 1.0))
+                alpha101_top_k = int(evo_cfg.get('alpha101_top_k', 0) or 0)
+
+                _fama_lib = fama_factors if use_fama101_bridge else None
+                print(f"  [step4c] LLM mining Alpha101-inspired factors "
+                      f"({mining_iters} iters x {mining_per_iter}/call, "
+                      f"max_chain={mining_max_chain}, "
+                      f"alpha101_ratio={alpha101_ratio}, "
+                      f"library={'FAMA-101' if use_fama101_bridge else 'Alpha101'})...")
+                mined = gen.llm_mine_alpha101_inspired(
+                    backtester=bt,
+                    max_workers=max(1, min(32, (_os.cpu_count() or 4) + 4)),
+                    n_iters=mining_iters,
+                    n_per_iter=mining_per_iter,
+                    max_chain_len=mining_max_chain,
+                    temperature=getattr(gen, 'improve_temperature', 0.3),
+                    alpha101_ratio=alpha101_ratio,
+                    alpha101_top_k=alpha101_top_k,
+                    fama101_library=_fama_lib,
+                )
+                if mined:
+                    lib_factors = [f for f in mined
+                                   if getattr(f, '_from_alpha101_lib', False)]
+                    llm_factors = [f for f in mined
+                                   if not getattr(f, '_from_alpha101_lib', False)]
+                    if lib_factors:
+                        self._post_debate_factors.extend(lib_factors)
+                        print(f"  [step4c] {len(lib_factors)} library factors "
+                              f"-> post_debate")
+                    if llm_factors:
+                        self._post_debate_factors.extend(llm_factors)
+                        print(f"  [step4c] {len(llm_factors)} LLM-mined factors "
+                              f"-> post_debate (no evolve/debate)")
+            except Exception as _e:
+                print(f"  [step4c] LLM mining failed: {_e}")
+        else:
+            print(f"  [step4c] LLM not available - Alpha101 mining skipped; "
+                  f"{len(self._post_debate_factors)} library factors loaded.")
+
+        print(f"  [step4c] Post-debate pool size: "
+              f"{len(self._post_debate_factors)}")
 
     def step4d_select_top_factors(self):
         from collections import Counter
@@ -1993,6 +1990,7 @@ class AAAI2027Pipeline:
         self.step3_generate_factors(forward_period=forward_period)
         self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
         self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
+        self.step4c_retrieve_alpha101(forward_period=forward_period)  # Alpha101/FAMA-101 → post_debate
         self.step4d_select_top_factors()     # filter + rank → keep top n_best4debate for Step 5
         if skip_eval:
             print("\n[skip] Step 5 (debate) and Step 5b (Chair synthesis) skipped "
@@ -2527,7 +2525,7 @@ Examples:
     )
     parser.add_argument(
         '--alpha101-top-k', dest='alpha101_top_k', type=int, default=None,
-        help='Step 3: number of Stage-1 Alpha101 library factors (top by |IC|) '
+        help='Step 4c: number of Stage-1 Alpha101 library factors (top by |IC|) '
              'returned alongside the LLM-mined Stage-2 factors for joint '
              'evaluation (default: config evolution.alpha101_top_k; 0 = '
              'LLM-mined only).',
@@ -2545,14 +2543,14 @@ Examples:
     parser.add_argument(
         '--retrieve-alpha101', dest='retrieve_alpha101', action='store_true',
         default=None,
-        help='Enable Step 3 Alpha101 library loading + LLM mining during factor '
+        help='Enable Step 4c Alpha101 library loading + LLM mining during factor '
              'generation. Scores the Alpha101 library on TRAIN data, builds '
              'inspiration chains, and uses the LLM to evolve novel expressions. '
              'Pass --no-retrieve-alpha101 to skip.',
     )
     parser.add_argument(
         '--no-retrieve-alpha101', dest='retrieve_alpha101', action='store_false',
-        help='Disable Alpha101 loading during factor generation (Step 3).',
+        help='Disable Alpha101 loading during factor generation (Step 4c).',
     )
     parser.add_argument(
         '--n-shots', type=int, default=None,
