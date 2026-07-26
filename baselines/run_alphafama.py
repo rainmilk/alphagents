@@ -8,7 +8,9 @@ This runner:
 3. Runs AlphaFAMA's 101-factor generation + IC computation
 4. Clusters factors by IC profiles (K-Means)
 5. LLM alpha-mining: iteratively generates new factors by fusing top performers
-6. Merges LLM-generated + original factors, evaluates via IC-weighted portfolio
+6. Merges LLM-generated + original factors, evaluates via FactorFusion
+   (ICIR² shrinkage + sign-aware + correlation penalty) — the SAME engine MASE
+   uses in step6_fuse_factors, so both baselines fuse factors identically.
 7. Returns performance metrics compatible with the main project
 
 The LLM alpha-mining follows the original FAMA (FActor Mining Agent) framework:
@@ -23,7 +25,7 @@ Usage:
     python baselines/run_alphafama.py --train-start 2020-01-01 --test-end 2024-12-31 --universe hs300
     python baselines/run_alphafama.py --no-llm          # disable LLM mining
     python baselines/run_alphafama.py --llm-iters 20    # set LLM iterations
-    python baselines/run_alphafama.py --alpha101-ratio 0.5   # keep top-50% Alpha101 (default)
+    python baselines/run_alphafama.py --alpha101-ratio 0.5   # include Alpha101 library (default)
     python baselines/run_alphafama.py --alpha101-ratio 0     # disable Alpha101
 
 Author: AAAI 2027 LLM Multi-Factor Stock Selection Project
@@ -54,7 +56,12 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
+from methods.portfolio_utils import (
+    allocate_score_proportional,
+    allocate_portfolio_weights,
+    DEFAULT_MAX_WEIGHT,
+    DEFAULT_MAX_INDUSTRY_EXPOSURE,
+)
 
 from dataloader.loader import DataLoader
 from baselines.AlphaFAMA.src.data_bridge import (
@@ -68,6 +75,7 @@ from baselines.AlphaFAMA.src.factor_matrix import compute_ic_matrix
 from baselines.AlphaFAMA.src.constants.formula_map import FORMULA_MAP
 from baselines.AlphaFAMA.src.utils.generate_rankics import (
     factor_series_fn,
+    factor_panel_fn,
     compute_rankic,
 )
 from scipy.stats import spearmanr
@@ -543,7 +551,14 @@ def _run_llm_mining(
     # re-evaluating every LLM expression a second time on the training data —
     # that second pass was the bulk of Step 6's cost.
     train_exposure_cache = {}
-    returns_col = train_df['returns']
+    # Forward N-day return — the predictive IC target.
+    # train_df['returns'] is the backward 1-day realized return (close.pct_change()),
+    # used as an INPUT feature by Alpha101 formulas. Using it as the IC target was
+    # a bug: it measured contemporaneous correlation (factor vs same-day return)
+    # instead of predictive power (factor vs future return), systematically
+    # inflating IC. train_df['forward_return'] = close[t+N]/close[t] - 1 is the
+    # correct target, matching compute_ic_matrix / _compute_returns / MASE.
+    returns_col = train_df['forward_return']
 
     print(f"\n  LLM Mining: {len(chains)} clusters, {n_iters} iterations")
     print(f"  Model: {model}")
@@ -580,22 +595,14 @@ def _run_llm_mining(
 
             # Evaluate the new factor
             try:
-                # Compute factor series per ticker
-                factor_values_list = []
-                for ticker, grp in train_df.groupby('ticker'):
-                    series = factor_series_fn(grp, new_factor)
-                    # NB: name the per-ticker piece with the expression. The
-                    # cached copy (train_exposure_cache[new_factor]) is later
-                    # pd.concat-ed along axis=1 in Step 6; without a name here
-                    # the columns collapse to positional [0,1,2] and stop
-                    # matching the expression-string factor names used in
-                    # train_ic / top_factor_names → "factors missing from
-                    # train_ic". compute_rankic tolerates a 1-col named
-                    # DataFrame (it indexes .iloc[:,0]), so this is safe.
-                    factor_values_list.append(
-                        pd.Series(series.values, index=grp.index, name=new_factor)
-                    )
-                factor_series = pd.concat(factor_values_list)
+                # Compute factor series on the full panel (cross-sectional
+                # rank/scale semantics — matches what the LLM prompt
+                # advertises: "rank(x): cross-sectional rank into [0,1]"
+                # and what MASE's _fn_rank does).  Previously this looped
+                # per-ticker via factor_series_fn, which evaluated rank()
+                # on a 1D Series (time-series rank) — a semantic mismatch
+                # with the LLM's intent.
+                factor_series = factor_panel_fn(train_df, new_factor)
 
                 # Compute Rank IC
                 ric = compute_rankic(factor_series, returns_col)
@@ -634,7 +641,10 @@ def _run_llm_mining(
 def _eval_ticker_factors(ticker_group, factor_expressions):
     """Evaluate every expression for a single ticker (serial, GIL-bound safe).
 
-    Mirrors one iteration of the original serial loop.
+    .. deprecated:: Kept for backward compatibility. LLM factor evaluation
+       now uses :func:`factor_panel_fn` (panel-level, cross-sectional rank)
+       via :func:`_compute_llm_factor_exposures`. This function is no longer
+       called by the main pipeline but remains importable for testing.
     """
     ticker, grp = ticker_group
     ticker_factors = {}
@@ -652,30 +662,25 @@ def _compute_llm_factor_exposures(
     factor_expressions: List[str],
     n_jobs: int = None,
 ) -> pd.DataFrame:
-    """
-    Compute factor exposures for LLM-generated expressions.
+    """Compute factor exposures for LLM-generated expressions on a **panel**.
 
-    Evaluates each expression per-ticker using factor_series_fn. This is a
-    **serial** implementation — deliberately so. Two parallelism attempts were
-    benchmarked and both *lost* to serial for this workload:
+    Evaluates each expression on the full (date × ticker) panel using
+    :func:`factor_panel_fn`, which provides **cross-sectional** ``rank()``
+    and ``scale()`` semantics — matching what the LLM prompt advertises
+    ("rank(x): cross-sectional rank into [0,1]") and what MASE's
+    ``_fn_rank`` does.
 
-      * ProcessPoolExecutor: ~6 s of Windows ``spawn`` re-import cost (it drags
-        in the heavy AlphaFactory chain) + pickling every ticker slice to the
-        workers, which dominates the small LLM-factor compute.
-      * ThreadPoolExecutor: the per-call cost is GIL-bound Python inside
-        ``factor_series_fn`` (expression compile + namespace build), so threads
-        serialize *and* add overhead.
-
-    The real speedups come from (a) the compile cache in ``factor_series_fn``
-    and (b) Step 6 reusing the train exposures already computed during Step 5
-    mining (see ``_run_llm_mining``'s returned cache) instead of re-evaluating
-    them. ``n_jobs`` is accepted for API symmetry with ``_compute_factors`` but
-    is currently unused.
+    Previously this evaluated per-ticker via ``factor_series_fn``, which
+    turned ``rank()`` into a **time-series** rank on a 1D Series — a
+    semantic mismatch with the LLM's intent that produced completely
+    different factor values.
 
     Args:
         df: AlphaFAMA-format DataFrame (MultiIndex date, ticker)
         factor_expressions: List of factor expression strings
-        n_jobs: accepted for API symmetry; currently unused (see note above).
+        n_jobs: accepted for API symmetry with ``_compute_factors``;
+            currently unused (panel evaluation is a single vectorized pass,
+            no per-ticker parallelism needed).
 
     Returns:
         DataFrame with MultiIndex (date, ticker) and one column per factor
@@ -683,11 +688,18 @@ def _compute_llm_factor_exposures(
     if not factor_expressions:
         return pd.DataFrame(index=df.index)
 
-    ex_list = [
-        _eval_ticker_factors(g, factor_expressions)
-        for g in df.groupby("ticker")
-    ]
-    return pd.concat(ex_list) if ex_list else pd.DataFrame(index=df.index)
+    results = {}
+    for expr in factor_expressions:
+        try:
+            results[expr] = factor_panel_fn(df, expr)
+        except Exception:
+            # Failed expression → all-NaN column (same behavior as the
+            # old per-ticker path's except branch)
+            results[expr] = pd.Series(np.nan, index=df.index, name=expr)
+
+    if not results:
+        return pd.DataFrame(index=df.index)
+    return pd.DataFrame(results)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -711,6 +723,7 @@ def run_alphafama_baseline(
     n_jobs: Optional[int] = None,
     seed: int = 42,
     portfolio_method: str = "score_proportional",
+    top_n: Optional[int] = None,
 ) -> Dict:
     """
     Run AlphaFAMA baseline using the main project's DataLoader.
@@ -815,26 +828,34 @@ def run_alphafama_baseline(
     print(f"  Loaded: {len(price_data['close'].index)} trading days x "
           f"{len(price_data['close'].columns)} stocks")
 
-    # ── Resolve forward_period & holding_period from config ───────────
-    if forward_period is None or holding_period is None:
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                _cfg = yaml.safe_load(f)
-            if forward_period is None:
-                forward_period = int(
-                    _cfg.get('evolution', {}).get('forward_period', 10)
-                )
-            if holding_period is None:
-                holding_period = int(
-                    _cfg.get('backtest', {}).get('trading', {}).get('holding_period', 1)
-                )
-        except Exception:
-            if forward_period is None:
-                forward_period = 10
-            if holding_period is None:
-                holding_period = 1
+    # ── Resolve forward_period, holding_period, top_n from config ──────
+    # Config is loaded once; each value keeps its explicit arg when provided,
+    # otherwise falls back to the matching key. fusion.portfolio.top_n is the
+    # single knob shared with MASE step7 and the other baselines.
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            _cfg = yaml.safe_load(f)
+    except Exception:
+        _cfg = {}
+    if forward_period is None:
+        forward_period = int(_cfg.get('evolution', {}).get('forward_period', 10))
+    if holding_period is None:
+        holding_period = int(
+            _cfg.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+        )
+    if top_n is None:
+        top_n = int(_cfg.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
+    # Portfolio caps + factor count: share the SAME knobs as MASE step7 so the
+    # two methods' portfolio construction stays bit-for-bit identical (a hard
+    # requirement for a fair comparison, per portfolio_utils.py's own contract).
+    max_weight = float(_cfg.get('fusion', {}).get('portfolio', {}).get('max_weight', DEFAULT_MAX_WEIGHT))
+    max_industry_exposure = float(
+        _cfg.get('fusion', {}).get('portfolio', {}).get('max_industry_exposure', DEFAULT_MAX_INDUSTRY_EXPOSURE)
+    )
+    n_top_factors = int(_cfg.get('fusion', {}).get('top_k', 10))
     print(f"  Forward period (IC horizon): {forward_period}d")
     print(f"  Holding period (rebalance):  {holding_period}d")
+    print(f"  Portfolio size (top_n):      {top_n}")
 
     # ── Step 2: Convert train/test slices to AlphaFAMA format ──────────
     # The train/test split is now produced centrally by loader.load_data
@@ -872,14 +893,15 @@ def run_alphafama_baseline(
         _all_test = _compute_factors(test_df, n_jobs=n_jobs)
         n_factors_all = len(_all_train.columns)   # typically 101
 
-        # Keep ALL Alpha101 factors in the candidate pool. The Alpha101/LLM
-        # split is decided later, at the final top-k selection (Step 8), via
-        # alpha101_ratio — so the ratio no longer pre-filters the 101 here.
+        # Keep ALL Alpha101 factors in the candidate pool. alpha101_ratio is an
+        # include-gate decided here (ratio>0 → compute the 101; ratio=0 → skip);
+        # the final top-k is a pure |ICIR| ranking over the merged Alpha101+LLM
+        # pool (Step 8, MASE-aligned), so there is no family split to pre-filter.
         train_exposures = _all_train
         test_exposures = _all_test
         n_factors = n_factors_all
         print(f"  Generated {n_factors_all} Alpha101 factors "
-              f"(all kept; Step-8 split at ratio={_alpha101_ratio:.2f})")
+              f"(all kept; library included via alpha101_ratio={_alpha101_ratio:.2f})")
     else:
         print("\n[Step 4] Alpha101 factors DISABLED (ratio=0) — skipping "
               "all-Alpha101 computation (LLM will seed from the base formula "
@@ -1047,16 +1069,33 @@ def run_alphafama_baseline(
                 if col not in train_ic.columns:
                     train_ic[col] = llm_train_ic[col]
 
-            # Merge IC: combine original mean_train_ic with LLM rankic
-            # For LLM factors, use their rankic as the IC estimate
+            # Merge IC: use llm_train_ic (computed by compute_ic_matrix above)
+            # as the single source of truth for LLM factors' training IC.
+            # This ensures Alpha101 and LLM factors are scored by the same
+            # cross-sectional Rank-IC function, avoiding divergence between
+            # compute_rankic (mining-time, per-factor) and compute_ic_matrix
+            # (Step-6, vectorized panel). Fallback to llm_rankic only if the
+            # factor is somehow missing from llm_train_ic (defensive).
             for expr in llm_factor_expressions:
                 if expr not in mean_train_ic.index:
-                    mean_train_ic[expr] = llm_rankic.get(expr, 0.0)
+                    if expr in llm_train_ic.columns:
+                        mean_train_ic[expr] = llm_train_ic[expr].mean()
+                    else:
+                        mean_train_ic[expr] = llm_rankic.get(expr, 0.0)
 
             n_total = len(test_exposures_merged.columns)
             print(f"  Merged: {n_factors} Alpha101 + {n_llm_factors} LLM = {n_total} total factors")
             print(f"  train_ic columns: {len(train_ic.columns)}, test_ic columns: {len(test_ic.columns)}")
             test_exposures = test_exposures_merged
+
+            # Mirror the test-side merge for TRAIN exposures so the fused
+            # combination layer (FactorFusion) can read train-period panels for
+            # every selected factor (weights + correlation penalty need train
+            # data; previously only test_exposures carried the LLM columns).
+            train_exposures = pd.concat([train_exposures, llm_train_exposures], axis=1)
+            train_exposures = train_exposures.loc[
+                :, ~train_exposures.columns.duplicated()
+            ]
 
         except Exception as e:
             print(f"  WARNING: Failed to compute LLM factor exposures: {e}")
@@ -1097,58 +1136,38 @@ def run_alphafama_baseline(
     if len(logical_test_ic) > 0:
         print(f"  Mean Rank-IC (test, no context): {logical_avg_ic:.4f}")
 
-    # ── Step 8: Final top-k selection with Alpha101/LLM split ─────────
-    # alpha101_ratio controls the proportion of the final top-k that come from
-    # the Alpha101 family vs the LLM family. e.g. k=10, ratio=0.5 → 5 Alpha101
-    # + 5 LLM. This is the single point where the ratio takes effect; Step 4
-    # already kept all 101 Alpha101 factors in the pool.
-    _alpha101_cols = list(train_exposures.columns) if _alpha101_ratio > 0 else []
-    # train_exposures still holds only Alpha101 columns (test_exposures is the
-    # merged frame); derive LLM columns as the complement within mean_train_ic.
-    _llm_cols = [c for c in mean_train_ic.index if c not in set(_alpha101_cols)]
+    # ── Step 8: Final top-k selection (MASE-aligned) ──────────────────
+    # UNIFIED with MASE step6: cap the pool by `fusion.top_k` and rank by
+    # |ICIR| over the merged Alpha101 + LLM pool. The old Alpha101/LLM *family
+    # slot split* (alpha101_ratio × top_k) has been REMOVED so FAMA and MASE
+    # select factors identically — both let library + LLM factors compete in
+    # one pool by their signal strength (ICIR / prior), no forced family quota.
+    #
+    # `alpha101_ratio` now acts purely as an INCLUDE-GATE for the Alpha101
+    # library (Step 4 decides whether the 101 formulas enter the candidate
+    # pool at all). Its magnitude no longer splits the top-k — matching MASE,
+    # where `evolution.alpha101_ratio` is likewise a score/skip toggle for the
+    # Alpha101 library, not a proportion of the final pool.
+    _top_k = int(_cfg.get('fusion', {}).get('top_k', 10))
+    _top_k = max(1, min(_top_k, len(mean_train_ic)))
 
-    # Final selection slot count (also referenced by the guard warning below).
-    _top_k = min(10, len(mean_train_ic))
+    # Per-factor ICIR from the training IC matrix (dates × factors). Used both
+    # for the selection ranking (MASE fallback prior) and, later, as the
+    # FactorFusion combination weight (icir2_shrinkage uses |ICIR|²).
+    _icir = train_ic.mean() / (train_ic.std() + 1e-12)
+    top_factors_series = _icir.abs().nlargest(_top_k)
+    top_factors_dict = {k: float(train_ic[k].mean()) for k in top_factors_series.index}
+    # Selected factor names (ordered by |ICIR|). Passed to _simulate_portfolio_from_ic
+    # as top_n_factors and iterated in Step 10 for family accounting — must exist.
+    top_factors = list(top_factors_series.index)
 
-    # Guard: if the LLM family is empty, the ratio has nothing to split against
-    # and silently degrades to an all-Alpha101 selection. Make that explicit so
-    # a user who expected a 5+5 / 2+8 mix isn't left wondering why the ratio
-    # "does nothing". This happens when LLM mining is off (--no-llm), the LLM
-    # config has no api_key/model (Step 5b skips mining), or mining produced
-    # zero usable factors.
-    if 0.0 < _alpha101_ratio < 1.0 and len(_llm_cols) == 0:
-        print(f"\n  WARNING: alpha101_ratio={_alpha101_ratio:.2f} requested an "
-              f"Alpha101/LLM split, but 0 LLM factors are available "
-              f"(used_llm={used_llm}). The ratio is being IGNORED — all top-"
-              f"{_top_k} slots fall back to Alpha101. Enable LLM mining (valid "
-              f"api_key/model) or set alpha101_ratio to 0 or 1 for a "
-              f"deterministic single-family run.")
-
-    _n_a = int(round(_alpha101_ratio * _top_k))
-    _n_a = max(0, min(_n_a, len(_alpha101_cols)))
-    _n_l = _top_k - _n_a
-    _n_l = max(0, min(_n_l, len(_llm_cols)))
-    # Reallocate any shortfall (a family with too few factors) to the other.
-    _shortfall = _top_k - (_n_a + _n_l)
-    if _shortfall > 0:
-        if _n_a < len(_alpha101_cols):
-            _n_a = min(len(_alpha101_cols), _n_a + _shortfall)
-        elif _n_l < len(_llm_cols):
-            _n_l = min(len(_llm_cols), _n_l + _shortfall)
-
-    _top_a = (mean_train_ic.reindex(_alpha101_cols).abs().nlargest(_n_a)
-              if _n_a > 0 else pd.Series(dtype=float))
-    _top_l = (mean_train_ic.reindex(_llm_cols).abs().nlargest(_n_l)
-              if _n_l > 0 else pd.Series(dtype=float))
-    top_factors = pd.concat([_top_a, _top_l])
-    top_factors = top_factors[~top_factors.index.duplicated()]
-    top_factors_dict = {k: float(v) for k, v in top_factors.items()}
-
-    print(f"\n  Final top-{_top_k} selection (Alpha101={_n_a}, LLM={_n_l}, "
-          f"ratio={_alpha101_ratio:.2f}):")
-    for f, ic_val in top_factors_dict.items():
+    print(f"\n  Final top-{_top_k} selection by |ICIR| (MASE-aligned; "
+          f"alpha101_ratio={_alpha101_ratio:.2f} is the Alpha101-library "
+          f"include-gate, NOT a family split):")
+    for f in top_factors_dict:
         label = f if len(f) <= 60 else f[:57] + "..."
-        print(f"    {label}: {ic_val:.4f}")
+        print(f"    {label}: ic={top_factors_dict[f]:.4f}, "
+              f"icir={float(_icir.get(f, 0.0)):.4f}")
 
     # ── Step 9: Simulate portfolio performance (unified BacktestEngine) ─
     print("\n[Step 9] Simulating portfolio performance (unified BacktestEngine)...")
@@ -1181,16 +1200,29 @@ def run_alphafama_baseline(
         holding_period=holding_period,
         save_dir=run_dir,
         portfolio_method=portfolio_method,
+        top_n=top_n,
+        n_top_factors=n_top_factors,
+        max_weight=max_weight,
+        max_industry_exposure=max_industry_exposure,
+        industry=test_ind,
+        train_exposures=train_exposures,
+        forward_period=forward_period,
+        fusion_cfg=_cfg.get('fusion', {}),
     )
 
     # ── Step 10: Compile results ───────────────────────────────────────
-    # Report the FINAL selected counts (the Step-8 split), not the pool sizes.
+    # Selection is now a pure |ICIR| ranking (no forced family split), so report
+    # the family membership of the SELECTED top-k for transparency. alpha101_ratio
+    # is the Alpha101-library include-gate (Step 4), not a top-k proportion.
+    _a_cols = set(train_exposures.columns) if _alpha101_ratio > 0 else set()
+    _n_a_sel = sum(1 for f in top_factors if f in _a_cols)
+    _n_l_sel = len(top_factors) - _n_a_sel
     total_factors = len(top_factors)
     results = {
         'method': 'AlphaFAMA' + ('+LLM' if used_llm else ''),
         'n_factors': total_factors,
-        'n_alpha101_factors': _n_a,
-        'n_llm_factors': _n_l,
+        'n_alpha101_factors': _n_a_sel,
+        'n_llm_factors': _n_l_sel,
         'alpha101_ratio': alpha101_ratio,
         'used_llm': used_llm,
         'llm_model': llm_model,
@@ -1331,45 +1363,86 @@ def _simulate_portfolio_from_ic(
     holding_period: int = 1,
     save_dir: Optional[str] = None,
     portfolio_method: str = "score_proportional",
+    top_n: int = 50,
+    n_top_factors: int = 10,
+    max_weight: float = DEFAULT_MAX_WEIGHT,
+    max_industry_exposure: float = DEFAULT_MAX_INDUSTRY_EXPOSURE,
+    industry: Optional[pd.Series] = None,
+    train_exposures: Optional[pd.DataFrame] = None,
+    forward_period: int = 10,
+    fusion_cfg: Optional[dict] = None,
 ) -> Dict:
     """
-    Simulate an IC-weighted portfolio using the unified BacktestEngine.
+    Simulate a portfolio using the UNIFIED FactorFusion engine (methods.fusion).
 
-    Strategy:
-    1. Select top-N factors by training |IC|
-    2. At each rebalance date, compute weighted score as sum(|IC| * normalized_exposure)
-    3. Go long top-50 stocks by score, equal-weight
-    4. Use BacktestEngine for consistent metrics
+    Replaces FAMA's old bespoke IC-weighted combination with the SAME
+    FactorFusion class MASE uses in step6_fuse_factors, so both baselines fuse
+    factors with identical math: icir2_shrinkage (|ICIR|² weight + James-Stein
+    shrinkage + sign-aware) + IPR correlation penalty + industry-neutral z-score.
+
+    Pipeline:
+    1. Selection (caller, Step 8): top_k factors by |ICIR| over the merged
+       Alpha101 + LLM pool (MASE-aligned).
+    2. Build FactorInfo(ic, icir, n_periods) per selected factor from TRAIN IC.
+    3. FactorFusion.fuse(TRAIN panels) → train ICIR weights + IPR corr penalty;
+       apply saved weights/signs to TEST panels → OOS composite (mirrors MASE
+       step6 → step7, which applies trained weights to test factor values).
+    4. Each rebalance date: rank stocks by composite, go long top-n, weight via
+       FAMA's portfolio layer (allocate_portfolio_weights) → shared BacktestEngine.
 
     Args:
-        train_ic: IC matrix on training data (dates x factors)
-        test_ic: IC matrix on test data (dates x factors)
-        test_exposures: Factor exposures on test data, MultiIndex (date, ticker) x factors
-        test_returns: Returns on test data, MultiIndex (date, ticker) x ['returns']
-        top_n_factors: Top factors by |IC| (Series, index=factor name, value=IC)
-        test_start_date: Test start date (to filter out context window)
-        prices: Close price DataFrame (date x stock) for BacktestEngine
-        holding_period: Rebalance frequency (1=daily, 5=weekly, 20=monthly)
+        train_ic: IC matrix on training data (dates x factors).
+        test_ic: IC matrix on test data (dates x factors).
+        test_exposures: Factor exposures on test data, MultiIndex (date, ticker)
+            x factors.
+        test_returns: Returns on test data, MultiIndex (date, ticker) x ['returns'].
+        top_n_factors: Selected top-k factors (Series, index=factor name).
+        test_start_date: Test start date (filters out the context window).
+        prices: Close price DataFrame (date x stock) for BacktestEngine.
+        train_exposures: Factor exposures on TRAIN data, MultiIndex (date, ticker)
+            x factors — needed so FactorFusion can read train panels.
+        forward_period: Forward return horizon (trading days), for n_periods.
+        fusion_cfg: dict from config['fusion'] — aligns weighting/normalization
+            with MASE (defaults mirror MASE's fusion block).
+        industry: TEST industry Series (stock -> industry) for industry-neutral
+            normalization in fuse() and portfolio construction.
 
     Returns:
         Dict with metrics from BacktestEngine.
     """
     from backtest.engine import BacktestEngine
+    from methods.fusion import FactorFusion, FactorInfo, FactorNormalizer
 
-    # Get top factor names — filter to those actually present in train_ic
-    # (LLM-generated factors may appear in top_n_factors but could be missing
-    # from train_ic if the merge step was skipped or partially failed)
-    top_factor_names = list(top_n_factors.index[:min(10, len(top_n_factors))])
-    available_in_train_ic = [f for f in top_factor_names if f in train_ic.columns]
-    if len(available_in_train_ic) < len(top_factor_names):
-        missing = set(top_factor_names) - set(available_in_train_ic)
+    # Selection ordering (|ICIR| ranking) is done by the caller (Step 8); here
+    # `top_n_factors` is already the MASE-aligned top-k Series. Just take names.
+    # top_n_factors may be a Series (factor-name index) or a plain list of names.
+    if isinstance(top_n_factors, pd.Series):
+        _sel_names = list(top_n_factors.index)
+    else:
+        _sel_names = list(top_n_factors)
+    top_factor_names = _sel_names[:min(n_top_factors, len(_sel_names))]
+
+    # ── Validate availability in train IC + train/test panels ──
+    # (LLM factors may be missing from a panel if the merge was skipped/failed)
+    _train_panel_cols = (
+        set(train_exposures.columns) if train_exposures is not None
+        else set(train_ic.columns)
+    )
+    available = [
+        f for f in top_factor_names
+        if f in train_ic.columns
+        and f in _train_panel_cols
+        and f in test_exposures.columns
+    ]
+    if len(available) < len(top_factor_names):
+        missing = set(top_factor_names) - set(available)
         logger.warning(
-            f"_simulate_portfolio_from_ic: {len(missing)} top factors missing "
-            f"from train_ic, using {len(available_in_train_ic)}/{len(top_factor_names)}"
+            f"_simulate_portfolio_from_ic: {len(missing)} top factors unavailable "
+            f"in train IC/test panel, using {len(available)}/{len(top_factor_names)}"
         )
-    top_factor_names = available_in_train_ic
+    top_factor_names = available
     if not top_factor_names:
-        logger.warning("_simulate_portfolio_from_ic: no factors available in train_ic")
+        logger.warning("_simulate_portfolio_from_ic: no factors available")
         return {
             'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
             'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
@@ -1377,21 +1450,113 @@ def _simulate_portfolio_from_ic(
             'n_trading_days': 0,
         }
 
-    # Sign-aware weights: a factor whose mean IC is negative predicts that
-    # high factor values → LOW future returns, so it must contribute to the
-    # composite *score* with a flipped sign. Using abs() here (old code) silently
-    # inverted every negative-IC factor, randomly flipping long/short and pushing
-    # the realized annual return to extreme +/- tails.
-    mean_ic = train_ic[top_factor_names].mean()            # signed mean IC per factor
-    factor_weights = np.sign(mean_ic) * mean_ic.abs()      # signed magnitude
-    factor_weights = factor_weights / factor_weights.abs().sum()
+    # ── UNIFIED combination via methods.fusion.FactorFusion ──
+    # Same engine as MASE step6_fuse_factors → identical weighting math:
+    #   icir2_shrinkage (|ICIR|² + James-Stein shrinkage + sign-aware) +
+    #   IPR correlation penalty + industry-neutral z-score normalization.
+    # FAMA keeps only its own portfolio layer (top-n -> position weights ->
+    # shared BacktestEngine). market_state=None → regime tilt disabled for
+    # FAMA (no market encoder yet); corr penalty + shrinkage still apply.
+    fusion_cfg = fusion_cfg or {}
+    norm_cfg = fusion_cfg.get('normalization', {})
+    weighting_cfg = fusion_cfg.get('weighting', {})
+    normalizer = FactorNormalizer(
+        method=norm_cfg.get('method', 'zscore'),
+        neutralize_industry=norm_cfg.get('neutralize_industry', True),
+    )
+    fusion = FactorFusion(
+        strategy=weighting_cfg.get('strategy', 'icir2_shrinkage'),
+        corr_penalty=weighting_cfg.get('corr_penalty', True),
+        corr_threshold=weighting_cfg.get('corr_threshold', 0.7),
+        normalizer=normalizer,
+        regime_tilt_strength=weighting_cfg.get('regime_tilt_strength', 0.2),
+        shrinkage_kappa=weighting_cfg.get('shrinkage_kappa', 0.3),
+        ipr_alpha=weighting_cfg.get('ipr_alpha', 2.0),
+    )
 
-    # Filter test exposures to logical test period (no context)
+    # Per-factor IC / ICIR from TRAIN (no leakage). n_periods = effective sample
+    # size for the shrinkage SE estimate (T = #train dates - forward_period).
+    _train_ic_mean = train_ic[top_factor_names].mean()
+    _train_ic_std = train_ic[top_factor_names].std()
+    _n_periods = max(2, len(train_ic) - int(forward_period or 10))
+    factor_infos = []
+    test_fv = {}
+    for f in top_factor_names:
+        _ic = float(_train_ic_mean[f])
+        _std = float(_train_ic_std[f]) if not np.isnan(_train_ic_std[f]) else 1.0
+        _icir = _ic / _std if _std > 1e-12 else 0.0
+        factor_infos.append(FactorInfo(
+            name=f, expression=f,
+            ic=_ic, icir=_icir, ic_std=_std,
+            debate_score=0.0,
+            ic_sign=np.sign(_ic) if abs(_ic) > 1e-10 else 1.0,
+            n_periods=_n_periods,
+        ))
+        # FactorFusion expects {name: DataFrame(index=date, columns=stock)}.
+        # FAMA exposures are MultiIndex (date, ticker) → unstack to date×stock.
+        # Coerce to float: Alpha101/LLM exposure panels can carry object dtype
+        # (non-numeric or mixed cells). FactorFusion.normalize copies the input
+        # dtype and never upcasts, so an object panel would propagate all the way
+        # to `score` and break `nlargest()` below. pd.to_numeric + errors='coerce'
+        # is the right tool: numeric strings parse, true non-numerics → NaN (the
+        # correct "missing factor value" semantics), float input is a no-op.
+        test_fv[f] = pd.to_numeric(test_exposures[f], errors='coerce').unstack('ticker')
+
+    # ── UNIFIED fuse() convention (matches MASE step6 → step7) ──
+    # MASE fits weights on TRAIN panels (fuse(train_factor_dict)), then applies
+    # the saved weights/signs to TEST panels (step7). We do the SAME so the
+    # weight estimation — incl. the IPR correlation penalty — is trained on TRAIN
+    # data and only the final composite is out-of-sample. Passing TEST panels
+    # straight to fuse() would fit the corr-penalty on test (leakage + divergence
+    # from MASE), so instead we fit on train and apply to test below.
+    train_fv = {}
+    if train_exposures is not None:
+        for f in top_factor_names:
+            if f in train_exposures.columns:
+                train_fv[f] = pd.to_numeric(train_exposures[f], errors='coerce').unstack('ticker')
+    try:
+        # 1) Fit weights on TRAIN panels (corr penalty uses train structure).
+        _, fusion_meta = fusion.fuse(
+            factor_infos, train_fv, industry=industry, market_state=None,
+        )
+        _w_dict = fusion_meta.get('weights', {})
+        _s_dict = fusion_meta.get('signs', {})
+        print(f"  [fusion] strategy={fusion.strategy}, "
+              f"corr_penalty={fusion.corr_penalty}, n_factors={len(factor_infos)} "
+              f"(weights fit on TRAIN, applied to TEST — mirrors MASE)")
+        # 2) Apply saved weights/signs to TEST panels → OOS composite
+        #    (mirrors main.py step7_construct_portfolio L1633-1646).
+        _common = None
+        for f in top_factor_names:
+            _idx = test_fv[f].index
+            _common = _idx if _common is None else _common.intersection(_idx)
+        _weighted = None
+        for f in top_factor_names:
+            _fv = normalizer.normalize(test_fv[f].loc[_common], industry)
+            _w = _w_dict.get(f, 0.0)
+            _s = _s_dict.get(f, 1.0)
+            _contrib = _fv * _w * _s
+            _weighted = _contrib if _weighted is None else _weighted.add(_contrib, fill_value=0)
+        composite_scores = normalizer.normalize(_weighted, industry)
+    except Exception as e:
+        logger.warning(f"FactorFusion failed ({e}); falling back to equal-weight "
+                       f"mean of z-scored test panels.")
+        _parts = [test_fv[f] for f in top_factor_names if f in test_fv]
+        composite_scores = (sum(_parts) / max(1, len(_parts))) if _parts else pd.DataFrame()
+
+    if not isinstance(composite_scores, pd.DataFrame) or composite_scores.empty:
+        return {
+            'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
+            'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
+            'win_rate': 0, 'information_ratio': 0, 'avg_turnover': 0,
+            'n_trading_days': 0,
+        }
+
+    # Filter composite to logical test period (exclude context window)
     test_start_ts = pd.Timestamp(test_start_date)
-    dates_in_range = test_exposures.index.get_level_values('date')
-    test_exposures_filtered = test_exposures[dates_in_range >= test_start_ts]
-
-    if test_exposures_filtered.empty:
+    _comp_dates = composite_scores.index
+    composite_filtered = composite_scores[_comp_dates >= test_start_ts]
+    if composite_filtered.empty:
         return {
             'total_return': 0, 'annual_return': 0, 'annual_volatility': 0,
             'sharpe_ratio': 0, 'max_drawdown': 0, 'calmar_ratio': 0,
@@ -1399,7 +1564,7 @@ def _simulate_portfolio_from_ic(
             'n_trading_days': 0,
         }
 
-    unique_dates = test_exposures_filtered.index.get_level_values('date').unique().sort_values()
+    unique_dates = composite_filtered.index.unique().sort_values()
 
     # Build portfolios DataFrame: each row = one date, values = position weights
     portfolio_rows = []
@@ -1409,40 +1574,30 @@ def _simulate_portfolio_from_ic(
     # rebalance cadence is governed solely by `holding_period` in the
     # BacktestEngine (it re-samples every `holding_period`-th portfolio row),
     # exactly like all other baselines. This keeps `holding_period` as the
-    # single frequency knob and removes the old double-skip (FAMA pre-sampling
-    # at `holding_period` AND the engine re-sampling at `holding_period` again).
-    rebalance_indices = list(range(len(unique_dates)))
-
-    for idx_pos, i in enumerate(rebalance_indices):
-        rebal_date = unique_dates[i]
-
+    # single frequency knob — identical to MASE step7.
+    for rebal_date in unique_dates:
         try:
-            exp = test_exposures_filtered.xs(rebal_date, level='date')
+            # Defensive coercion: if any panel slipped through as object dtype,
+            # nlargest() below would raise TypeError. Coerce + dropna clears it.
+            score = pd.to_numeric(composite_filtered.loc[rebal_date], errors='coerce').dropna()
         except KeyError:
             continue
-
-        # Compute composite score = weighted sum of normalized factor exposures
-        score = pd.Series(0.0, index=exp.index)
-        for f in top_factor_names:
-            if f in exp.columns:
-                f_vals = exp[f].dropna().astype(float)
-                if len(f_vals) > 1:
-                    # Winsorize to [1%, 99%] before z-scoring: Alpha101 factors are
-                    # extremely heavy-tailed, and a single outlier can inflate the
-                    # cross-sectional std, letting one stock dominate the ranking and
-                    # spiking turnover. Clipping first makes the score robust to tails.
-                    lo, hi = f_vals.quantile(0.01), f_vals.quantile(0.99)
-                    f_w = f_vals.clip(lower=lo, upper=hi)
-                    f_norm = (f_w - f_w.mean()) / (f_w.std() + 1e-10)
-                    score.loc[f_norm.index] += factor_weights.get(f, 0.0) * f_norm
-
-        # Select top-50 stocks; weight score-proportionally (MASE-consistent)
-        top_stocks = score.nlargest(min(50, len(score)))
-        if len(top_stocks) == 0:
-            # No stocks selected: emit a zero-weight row (BacktestEngine handles this)
+        if len(score) == 0:
             continue
 
-        w = allocate_portfolio_weights(top_stocks, method=portfolio_method)
+        # Composite is already the fused weighted score (sign-aware, normalized);
+        # select top-n stocks and weight them via FAMA's portfolio layer.
+        top_stocks = score.nlargest(min(top_n, len(score)))
+        if len(top_stocks) == 0:
+            continue
+
+        w = allocate_portfolio_weights(
+            top_stocks,
+            method=portfolio_method,
+            max_weight=max_weight,
+            max_industry_exposure=max_industry_exposure,
+            industry=industry,
+        )
         portfolio_rows.append(w)
         portfolio_dates.append(rebal_date)
 
@@ -1499,11 +1654,14 @@ if __name__ == '__main__':
     parser.add_argument('--no-llm', action='store_false', dest='use_llm',
                         help='Disable LLM alpha-mining')
     parser.add_argument('--alpha101-ratio', type=float, default=0.5,
-                        help='Fraction of the 101 Alpha101 factors to keep and '
-                             'merge. Defaults to config alphafama.alpha101_ratio '
-                             '(0.5). 0.0 disables Alpha101; 1.0 keeps all 101. '
-                             'Selected by |mean train Rank-IC|.')
-    parser.add_argument('--llm-iters', type=int, default=2,
+                        help='Include-gate for the Alpha101 library: >0 adds the '
+                             '101 Alpha101 formulas to the candidate pool (merged '
+                             'with LLM factors); 0.0 disables Alpha101 entirely '
+                             '(LLM-only). The final top-k selection is by |ICIR| '
+                             'over the merged pool (MASE-aligned) — alpha101_ratio '
+                             'no longer splits the top-k by family. Defaults to '
+                             'config alphafama.alpha101_ratio (0.5).')
+    parser.add_argument('--llm-iters', type=int, default=3,
                         help='Number of LLM mining iterations (default: 5)')
     parser.add_argument('--forward-period', type=int, default=None,
                         help='Forward return horizon (trading days) for IC evaluation. '
@@ -1511,6 +1669,9 @@ if __name__ == '__main__':
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Rebalance frequency in days (1=daily, 5=weekly, 20=monthly). '
                              'Defaults to config backtest.trading.holding_period (1).')
+    parser.add_argument('--top-n', type=int, default=None,
+                        help='Number of stocks to hold long (top-n by composite score). '
+                             'Defaults to config fusion.portfolio.top_n (50).')
     parser.add_argument('--n-jobs', type=int, default=None,
                         help='Worker processes for Alpha101 factor computation '
                              '(step 4). None=auto (cpu_count-1). 1=serial. '
@@ -1553,6 +1714,7 @@ if __name__ == '__main__':
         llm_iters=args.llm_iters,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
+        top_n=args.top_n,
         n_jobs=args.n_jobs,
         seed=args.seed,
     )

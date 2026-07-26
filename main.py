@@ -391,25 +391,24 @@ class AAAI2027Pipeline:
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
         n_shots = evo_cfg.get('n_shots', 3)
 
-        # Alpha101 is NO LONGER generated as a seed here. It is now *retrieved
-        # by score* in Step 4c (step4c_retrieve_alpha101), which scores the full
-        # Alpha101 library on TRAIN data and merges the top-k into the candidate
-        # pool for Step 5. We deliberately seed the generator with 0 Alpha101
-        # factors so the evolution seeds stay pure hypothesis + memory-augment.
-        # Step 4c (retrieve Alpha101 by score) is driven by two config knobs:
-        #   alpha101_top_k      -> Step 4c retrieve top-k count
+        # Alpha101 is NO LONGER generated as a seed here. Step 4c now does
+        # LLM mining: it scores the Alpha101 library on TRAIN data, builds
+        # inspiration chains, and uses the LLM to evolve novel expressions.
+        # Only LLM-generated factors enter the pool — raw library factors are
+        # used solely as inspiration. We deliberately seed the generator with
+        # 0 Alpha101 factors so evolution seeds stay pure hypothesis +
+        # memory-augment. Step 4c is driven by:
         #   retrieve_alpha101  -> Step 4c enable/disable flag
-        alpha101_retrieve_top_k = int(evo_cfg.get('alpha101_top_k', 0))
         alpha101_retrieval_enabled = bool(evo_cfg.get('retrieve_alpha101', True))
         print(f"\n[Step 3] Generating seed factors — "
               f"hypothesis: {n_seeds_hypothesis}, "
               f"memory-augment: {n_seeds_memory_augment}")
-        print(f"  [Step 3] Alpha101 factors are NOT seeded here; they will be "
-              f"retrieved in Step 4c (enabled={alpha101_retrieval_enabled}, "
-              f"top_k={alpha101_retrieve_top_k}).")
+        print(f"  [Step 3] Alpha101 factors are NOT seeded here; Step 4c will "
+              f"LLM-mine Alpha101-inspired factors "
+              f"(enabled={alpha101_retrieval_enabled}).")
 
-        # Initialize evolving generator (Alpha101 is NOT seeded here — it is
-        # retrieved by score in Step 4c, so evolution seeds stay pure
+        # Initialize evolving generator (Alpha101 is NOT seeded here — Step 4c
+        # mines Alpha101-inspired factors via LLM, so evolution seeds stay pure
         # hypothesis + memory-augment).
         self.evolving_generator = SelfEvolvingGenerator(
             llm_model=self.config['llm']['generator']['model'],
@@ -728,43 +727,40 @@ class AAAI2027Pipeline:
 
     def step4c_retrieve_alpha101(self):
         """
-        Step 4c: Retrieve Alpha101 factors by SCORE and merge the top-k into the
-        candidate pool before Step 5 (debate).
+        Step 4c: LLM mining of Alpha101-inspired factors.
 
-        Unlike the old behaviour (Alpha101 factors were blindly injected as
-        *seeds* in Step 3), this step:
-          1. Builds a CandidateFactor for EVERY expression in the Alpha101
-             library (methods.alpha101).
-          2. Scores each one on the SAME TRAIN backtester used by evolution
-             (so its IC is directly comparable to the evolved factors' ICs,
-             including the val_split-aware train window).
-          3. Ranks by train Rank-IC and keeps the top-k.
-          4. Merges them into ``self.best_factors`` (deduped by expression) so
-             they are debate-evaluated in Step 5 and can flow into fusion.
+        The Alpha101 formula library is **always** used as the LLM inspiration
+        source (matching FAMA's ``formula_map``).  ``alpha101_ratio`` controls
+        whether the formulas are *scored* before chain building:
 
-        Alpha101 factors are tagged ``_from_alpha101=True`` so Step 5's
-        memory-save skips re-persisting these publicly-known library factors.
+        * ``alpha101_ratio > 0``: loads the Alpha101 library (98 formulas),
+          scores all on TRAIN data, and builds IC-ranked inspiration chains.
 
-        Controlled by config ``evolution.retrieve_alpha101`` (enable/disable)
-        and ``evolution.alpha101_top_k`` (top-k count).
+        * ``alpha101_ratio == 0``: loads the Alpha101 formulas but **skips
+          scoring** — all formulas get IC=0.0 placeholder (matching FAMA's
+          ``_seed_clusters_from_formula_map``).  The expensive 98-factor
+          evaluation is avoided, but the LLM still receives real formula
+          expressions to evolve.
+
+        Both Stage-1 Alpha101 library factors (top-k by |IC|, controlled by
+        ``evolution.alpha101_top_k``) and the LLM-generated Stage-2 factors
+        enter the candidate pool for joint evaluation.  Set
+        ``alpha101_top_k=0`` to return LLM-mined factors only (legacy
+        behavior).
+
+        Controlled by config ``evolution.retrieve_alpha101`` (enable/disable),
+        ``evolution.alpha101_ratio`` (scoring on/off; independent of
+        ``alphafama.alpha101_ratio``), and ``evolution.alpha101_top_k``
+        (how many library factors to return).
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 4c] Skipped: methods modules not available")
             return
 
         evo_cfg = self.config['evolution']
-        top_k = int(evo_cfg.get('alpha101_top_k', 50))
         enabled = bool(evo_cfg.get('retrieve_alpha101', True))
-        # Parallel worker count: 0 (default) => auto-scale to the machine so we
-        # don't leave cores idle (the old hardcoded 4 wasted half an 8+ core box).
-        # Any explicit value > 0 is used as-is.
-        n_workers_cfg = int(evo_cfg.get('alpha101_max_workers', 0) or 0)
-        max_workers = (n_workers_cfg
-                       if n_workers_cfg > 0
-                       else max(1, min(32, (os.cpu_count() or 4) + 4)))
-        if not enabled or top_k <= 0:
-            print(f"\n[Step 4c] Skipped: Alpha101 retrieval disabled "
-                  f"(retrieve_alpha101={enabled}, top_k={top_k})")
+        if not enabled:
+            print("\n[Step 4c] Skipped: retrieve_alpha101=False")
             return
 
         if not hasattr(self, 'best_factors') or not self.best_factors:
@@ -772,14 +768,43 @@ class AAAI2027Pipeline:
                   f"(run Step 4 first)")
             return
 
-        print(f"\n[Step 4c] Retrieving Alpha101 factors "
-              f"(parallel scoring, {max_workers} workers, keep top-{top_k})...")
+        if not hasattr(self, 'evolving_generator'):
+            print("\n[Step 4c] Skipped: no evolving generator available")
+            return
+
+        gen = self.evolving_generator
+        if not getattr(gen, 'use_llm', False) or not gen.client:
+            print("\n[Step 4c] Skipped: LLM client not available "
+                  "(mining requires LLM)")
+            return
+
+        # --- Config ---
+        mining_iters = int(evo_cfg.get('alpha101_llm_mining_iters', 3))
+        mining_per_iter = int(evo_cfg.get('alpha101_llm_mining_per_iter', 5))
+        mining_max_chain = int(evo_cfg.get('alpha101_llm_mining_max_chain', 5))
+        n_workers_cfg = int(evo_cfg.get('alpha101_max_workers', 0) or 0)
+        max_workers = (n_workers_cfg
+                       if n_workers_cfg > 0
+                       else max(1, min(32, (os.cpu_count() or 4) + 4)))
+
+        # alpha101_ratio (MASE-own knob, INDEPENDENT of alphafama.alpha101_ratio):
+        # 0 = load Alpha101 formulas without scoring (IC=0.0 placeholder, like
+        # FAMA's _seed_clusters_from_formula_map); >0 = load + score Alpha101
+        # library as IC-ranked inspiration. Step 4c only returns LLM-generated
+        # factors, so this is a score/skip toggle, not a pool proportion.
+        alpha101_ratio = float(evo_cfg.get('alpha101_ratio', 1.0))
+        alpha101_top_k = int(evo_cfg.get('alpha101_top_k', 5))
+
+        mode_label = ("formulas only (scoring skipped)" if alpha101_ratio == 0
+                      else f"scored library (ratio={alpha101_ratio:.2f})")
+        print(f"\n[Step 4c] LLM mining Alpha101-inspired factors "
+              f"({mode_label}, "
+              f"{mining_iters} iters, {mining_per_iter} factors/call, "
+              f"max_chain={mining_max_chain})...")
 
         # --- Backtester: reuse the exact evolution backtester when available ---
         backtester = getattr(self, '_train_backtester', None)
         if backtester is None:
-            # Fallback: build a fresh TRAIN backtester (full window) so Step 4c
-            # still works even if Step 4 did not store one.
             try:
                 from methods.evolve import FactorBacktester
                 train_price = self.train_data['price_data']
@@ -793,72 +818,167 @@ class AAAI2027Pipeline:
                 print(f"  [Step 4c] Cannot build backtester ({e}); skipping.")
                 return
 
-        # --- Build CandidateFactors for the whole Alpha101 library ---
+        # --- LLM mining ---
         try:
-            from methods.alpha101 import get_alpha101_formulas
-            from methods.evolve import _infer_family
-        except Exception as e:
-            print(f"  [Step 4c] Cannot import Alpha101 library ({e}); skipping.")
-            return
-
-        formulas = get_alpha101_formulas()
-        if not formulas:
-            print("  [Step 4c] Alpha101 library is empty; skipping.")
-            return
-
-        a101_factors = [
-            CandidateFactor(
-                id=f"a101_{fid}",
-                expression=expr,
-                description=f"Alpha101 {fid}",
-                generation=0,
-                family=_infer_family(expr),
+            mined = gen.llm_mine_alpha101_inspired(
+                backtester=backtester,
+                max_workers=max_workers,
+                n_iters=mining_iters,
+                n_per_iter=mining_per_iter,
+                max_chain_len=mining_max_chain,
+                temperature=getattr(gen, 'improve_temperature', 0.3),
+                alpha101_ratio=alpha101_ratio,
+                alpha101_top_k=alpha101_top_k,
             )
-            for fid, expr in formulas.items()
-        ]
-        print(f"  Built {len(a101_factors)} Alpha101 candidates from library")
+        except Exception as e:
+            print(f"  [Step 4c] LLM mining failed: {e}")
+            mined = []
 
-        # --- Score ALL of them on TRAIN data (parallel) ---
-        metrics_list = backtester.evaluate_batch(
-            a101_factors, max_workers=max_workers, parallel=True)
-
-        scored = []
-        for f, m in zip(a101_factors, metrics_list):
-            f.ic = m.get('ic', float('nan'))
-            f.icir = m.get('icir', float('nan'))
-            f.sharpe = m.get('sharpe', 0.0)
-            f.is_valid = m.get('is_valid', True)
-            if f.is_valid and not np.isnan(f.ic):
-                scored.append(f)
-
-        if not scored:
-            print("  [Step 4c] No valid Alpha101 factors scored; skipping.")
-            return
-
-        # Rank by train IC (signed — matches evolution's ranking convention;
-        # the backtester already direction-aligns quantile metrics by sign(IC),
-        # so reverse factors remain usable downstream).
-        scored.sort(key=lambda x: x.ic, reverse=True)
-        top = scored[:top_k]
-
-        # --- Merge into the candidate pool (dedup by expression) ---
+        # --- Merge LLM-generated factors into the candidate pool ---
         existing = set()
         for f in self.best_factors:
             existing.add(getattr(f, 'expression', '') or '')
-        added = 0
-        for f in top:
-            if f.expression not in existing:
-                f._from_alpha101 = True
-                self.best_factors.append(f)
-                existing.add(f.expression)
-                added += 1
 
-        print(f"  Scored {len(scored)} valid Alpha101 factors; "
-              f"selected top-{top_k} by train IC.")
-        print(f"  Added {added} new Alpha101 factors to pool "
-              f"(skipped {len(top) - added} duplicates already present).")
-        print(f"  Factor pool size after merge: {len(self.best_factors)}")
-        print("  [✓] Alpha101 retrieval complete")
+        if mined:
+            mined_added = 0
+            for f in mined:
+                if f.expression not in existing:
+                    f._from_alpha101 = True
+                    # Preserve the Stage-1 (library) vs Stage-2 (LLM-mined)
+                    # distinction set inside evolve; only tag LLM-mined here.
+                    if not getattr(f, '_from_alpha101_lib', False):
+                        f._from_alpha101_llm = True
+                    self.best_factors.append(f)
+                    existing.add(f.expression)
+                    mined_added += 1
+            print(f"  [Step 4c] Added {mined_added} LLM-mined factors "
+                  f"to pool.")
+            print(f"  Factor pool size after mining: {len(self.best_factors)}")
+        else:
+            print(f"  [Step 4c] LLM mining produced no new factors.")
+
+        print("  [✓] LLM mining complete")
+
+    def step4d_select_top_factors(self):
+        """
+        Step 4d: Filter and rank the accumulated factor pool, keep only the
+        top ``n_best4debate`` factors for Step 5 (debate).
+
+        After Step 4 (evolve) + Step 4b (memory retrieval) + Step 4c (LLM
+        mining), ``self.best_factors`` may contain 30–50+ factors from three
+        heterogeneous sources.  Step 5's multi-agent debate is expensive (5 LLM
+        API calls per factor), and Step 6's ``fusion.top_k`` cap would discard
+        most of them anyway.  This step pre-filters the pool so Step 5 only
+        debates the most promising candidates.
+
+        Ranking metric: ``|train IC|`` (absolute IC, direction-agnostic — the
+        backtester direction-aligns quantile metrics by sign(IC), so negative-IC
+        factors are just as useful as positive).  All three sources (evolved,
+        memory, LLM-mined) carry a train IC, making this a fair universal metric.
+
+        Config:
+            evolution.n_best4debate  — top-N to retain (0 = disabled, pass all
+                                       through; backward compatible).
+        """
+        evo_cfg = self.config.get('evolution', {})
+        n_best = int(evo_cfg.get('n_best4debate', 0) or 0)
+
+        if n_best <= 0:
+            print(f"\n[Step 4d] Skipped: n_best4debate={n_best} "
+                  f"(0 = no pre-step5 filter)")
+            return
+
+        if not hasattr(self, 'best_factors') or not self.best_factors:
+            print("\n[Step 4d] Skipped: no factors in pool")
+            return
+
+        pool_size = len(self.best_factors)
+        if pool_size <= n_best:
+            print(f"\n[Step 4d] Pool has {pool_size} factors ≤ n_best4debate="
+                  f"{n_best}; no truncation needed.")
+            return
+
+        # --- Filter: drop NaN-IC and explicitly-invalid factors ---
+        valid = []
+        dropped = 0
+        for f in self.best_factors:
+            ic = getattr(f, 'ic', None) if not isinstance(f, dict) else f.get('ic')
+            if ic is None or (isinstance(ic, float) and np.isnan(ic)):
+                dropped += 1
+                continue
+            is_valid = getattr(f, 'is_valid', True) if not isinstance(f, dict) \
+                else f.get('is_valid', True)
+            if is_valid is False:
+                dropped += 1
+                continue
+            valid.append(f)
+
+        if dropped:
+            print(f"\n[Step 4d] Filtered {dropped} invalid/NaN-IC factors "
+                  f"({pool_size} → {len(valid)})")
+
+        if not valid:
+            print("  [Step 4d] No valid factors after filtering; keeping "
+                  "original pool unchanged.")
+            return
+
+        if len(valid) <= n_best:
+            print(f"  [Step 4d] {len(valid)} valid factors ≤ n_best4debate="
+                  f"{n_best}; no truncation needed.")
+            # Still replace with the filtered list (invalid factors removed)
+            self.best_factors = valid
+            return
+
+        # --- Rank by |IC| descending, keep top-N ---
+        def _abs_ic(f):
+            if isinstance(f, dict):
+                return abs(f.get('ic', 0.0))
+            return abs(getattr(f, 'ic', 0.0) or 0.0)
+
+        valid.sort(key=_abs_ic, reverse=True)
+        selected = valid[:n_best]
+
+        # --- Print summary table ---
+        def _source_tag(f):
+            if isinstance(f, dict):
+                return f.get('_source', 'evolved')
+            if getattr(f, '_from_alpha101_llm', False):
+                return 'alpha101-llm'
+            if getattr(f, '_from_alpha101', False):
+                return 'alpha101'
+            if getattr(f, '_from_memory', False):
+                return 'memory'
+            return 'evolved'
+
+        print(f"\n[Step 4d] Selecting top {n_best} of {len(valid)} valid factors "
+              f"by |train IC|:")
+        print(f"  {'Rank':<5} {'Source':<14} {'IC':>8}  Expression")
+        print(f"  {'─'*5} {'─'*14} {'─'*8}  {'─'*50}")
+        for rank, f in enumerate(selected, 1):
+            ic = f.get('ic', 0.0) if isinstance(f, dict) else getattr(f, 'ic', 0.0)
+            expr = (f.get('expression', '') if isinstance(f, dict)
+                    else getattr(f, 'expression', ''))
+            print(f"  {rank:<5} {_source_tag(f):<14} {ic:>+8.4f}  {expr[:60]}")
+
+        # Show what was cut (top of the dropped tail)
+        tail = valid[n_best:]
+        if tail:
+            best_cut_ic = _abs_ic(tail[0])
+            worst_keep_ic = _abs_ic(selected[-1])
+            print(f"\n  Cut-off: |IC| {worst_keep_ic:.4f} → {best_cut_ic:.4f} "
+                  f"({len(tail)} factors dropped)")
+            # Source breakdown of what survived vs cut
+            from collections import Counter
+            kept_src = Counter(_source_tag(f) for f in selected)
+            cut_src = Counter(_source_tag(f) for f in tail)
+            parts = [f"{s}={kept_src.get(s,0)}" for s in sorted(kept_src)]
+            print(f"  Survived by source: {', '.join(parts)}")
+            parts = [f"{s}={cut_src.get(s,0)}" for s in sorted(cut_src)]
+            print(f"  Dropped  by source: {', '.join(parts)}")
+
+        self.best_factors = selected
+        print(f"  [✓] Factor pool: {pool_size} → {len(self.best_factors)} "
+              f"(ready for Step 5)")
 
     def step5_evaluate_factors(self):
         """
@@ -1256,6 +1376,16 @@ class AAAI2027Pipeline:
                 if _s == 0.0:
                     # fall back to base expression (dup-suffix / whitespace variant)
                     _s = debate_score_map.get(_name.split('__dup')[0].strip(), 0.0)
+                if _s == 0.0:
+                    # Fallback when no debate/chair prior exists (e.g. --skip-eval
+                    # skipped Step 5/5b): rank by |ICIR| so the top_k cap still
+                    # selects the strongest factors instead of an arbitrary
+                    # dict-order prefix. meta = (ic, icir, sharpe, val_icir).
+                    _meta = factor_meta_lookup.get(_name)
+                    if _meta is None:
+                        _meta = factor_meta_lookup.get(_name.split('__dup')[0].strip())
+                    if _meta:
+                        _s = abs(_meta[1])  # |icir|
                 return _s
             _ranked = sorted(train_factor_dict.keys(),
                              key=_fusion_prior, reverse=True)
@@ -1766,6 +1896,7 @@ class AAAI2027Pipeline:
         forward_period: int = None,
         holding_period: int = None,
         test_data=None,
+        skip_eval: bool = False,
     ):
         """
         Run the full end-to-end pipeline.
@@ -1790,6 +1921,11 @@ class AAAI2027Pipeline:
                            None → use config or default 1.
             test_data: Optional external test data dict to use in step7/step8.
                        If provided, overrides self.test_data from step1 split.
+            skip_eval: If True, skip Step 5 (multi-agent debate) and Step 5b
+                       (Chair synthesis) and go straight to Step 6 factor fusion.
+                       The fused factor is then built directly from the evolved
+                       best_factors (capped by fusion.top_k, ranked by |ICIR| when
+                       no debate prior is available).
         """
         print("\n" + "=" * 60)
         data_label = "SAMPLE DATA (fast test)" if use_sample else "REAL DATA"
@@ -1823,9 +1959,18 @@ class AAAI2027Pipeline:
         self.step3_generate_factors()
         self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
         self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
-        self.step4c_retrieve_alpha101()      # score Alpha101 library, merge top-k into pool
-        self.step5_evaluate_factors()        # debate ALL candidates (incl. memory + alpha101 factors)
-        self.step5b_chair_synthesis()     # Chair synthesis (step 5b)
+        self.step4c_retrieve_alpha101()      # LLM mine Alpha101-inspired factors into pool
+        self.step4d_select_top_factors()     # filter + rank → keep top n_best4debate for Step 5
+        if skip_eval:
+            print("\n[skip] Step 5 (debate) and Step 5b (Chair synthesis) skipped "
+                  "--fusing top_k best_factors directly in Step 6.")
+            if bool(self.config.get('fusion', {}).get('use_chair_selection', False)):
+                print("  [warn] fusion.use_chair_selection is TRUE but Step 5b was "
+                      "skipped, so Chair selection is effectively disabled (no ranked "
+                      "set to filter by). Factors enter fusion unfiltered by the Chair.")
+        else:
+            self.step5_evaluate_factors()        # debate ALL candidates (incl. memory + alpha101 factors)
+            self.step5b_chair_synthesis()     # Chair synthesis (step 5b)
         self.step6_fuse_factors()
         self.step7_construct_portfolio(test_data=test_data)
         self.step8_backtest(test_data=test_data, output_dir=output_dir)
@@ -2255,6 +2400,7 @@ Examples:
   python main.py --full --real --source westock            Real data via westock (WorkBuddy)
   python main.py --full --real --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
   python main.py --full --real --force-refresh             Skip cache, re-download
+  python main.py --full --skip-eval                       Skip Step 5/5b, fuse top_k directly
   python main.py --test --factor-path experiments/20260601/results/final_factors.json
   python main.py --test --factor-path PATH --real --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
   python main.py --test --factor-path PATH --holding-period 5
@@ -2305,8 +2451,8 @@ Examples:
     )
     parser.add_argument(
         '--n-seeds', type=int, default=None,
-        help='[legacy] Convenience: sets alpha101_top_k (Step 4c Alpha101 '
-             'retrieval top-k). Prefer --alpha101-top-k for clarity.',
+        help='[legacy] No longer used (raw Alpha101 factors are not merged into '
+             'the pool). Kept for backward CLI compat.',
     )
     parser.add_argument(
         '--n-seeds-hypothesis', type=int, default=None,
@@ -2314,12 +2460,15 @@ Examples:
     )
     parser.add_argument(
         '--alpha101-top-k', dest='alpha101_top_k', type=int, default=None,
-        help='Step 4c Alpha101 retrieval top-k: score the whole Alpha101 library '
-             'on TRAIN data and merge the top-k into the candidate pool for Step 5.',
+        help='Step 4c: number of Stage-1 Alpha101 library factors (top by |IC|) '
+             'returned alongside the LLM-mined Stage-2 factors for joint '
+             'evaluation (default: config evolution.alpha101_top_k; 0 = '
+             'LLM-mined only).',
     )
     parser.add_argument(
         '--alpha101-max-workers', dest='alpha101_max_workers', type=int, default=None,
         help='Step 4c parallel worker count for scoring the Alpha101 library '
+             'inside llm_mine_alpha101_inspired '
              '(default: config value; 0 = auto = min(32, cpu_count()+4)).',
     )
     parser.add_argument(
@@ -2329,21 +2478,23 @@ Examples:
     parser.add_argument(
         '--retrieve-alpha101', dest='retrieve_alpha101', action='store_true',
         default=None,
-        help='[DEFAULT ON] Enable Step 4c Alpha101 retrieval: score the whole '
-             'Alpha101 library on TRAIN data and merge the top-k into the '
-             'candidate pool for Step 5. Alpha101 is no longer seeded in Step 3. '
-             'Pass --no-retrieve-alpha101 to skip Step 4c entirely.',
+        help='Enable Step 4c: LLM mining of Alpha101-inspired factors. Scores '
+             'the Alpha101 library on TRAIN data, builds inspiration chains, and '
+             'uses the LLM to evolve novel expressions. The top-k Alpha101 '
+             'library factors (evolution.alpha101_top_k) and the LLM-generated '
+             'factors both enter the pool for joint evaluation. Pass '
+             '--no-retrieve-alpha101 to skip.',
     )
     parser.add_argument(
         '--no-retrieve-alpha101', dest='retrieve_alpha101', action='store_false',
-        help='Disable Step 4c Alpha101 retrieval (skip scoring the library).',
+        help='Disable Step 4c (skip Alpha101 LLM mining).',
     )
     parser.add_argument(
         '--n-shots', type=int, default=None,
         help='Few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (default: config value)',
     )
     parser.add_argument(
-        '--n-evolution-rounds', type=int, default=5,
+        '--n-evolution-rounds', type=int, default=1,
         help='Number of evolution rounds (default: 5)',
     )
     parser.add_argument(
@@ -2359,10 +2510,25 @@ Examples:
         help='Override evolution.n_best_factors (default: use config value)',
     )
     parser.add_argument(
+        '--n-best4debate', dest='n_best4debate', type=int, default=None,
+        help='Step 4d pre-step5 filter: keep top-N factors by |train IC| from '
+             'the combined pool (evolved + memory + alpha101-llm). '
+             '0 = disabled (pass all to Step 5). '
+             'Set to match fusion.top_k to avoid wasting debate API calls.',
+    )
+    parser.add_argument(
         '--fusion-top-k', type=int, default=None,
         help='Cap the number of factors fused (final step6 top_k). '
              '0 or None → no cap (use config fusion.top_k). '
              'Only takes effect in --full mode (test mode loads pre-fused factors).',
+    )
+    parser.add_argument(
+        '--skip-eval', dest='skip_eval', action='store_true', default=False,
+        help='Skip Step 5 (multi-agent debate) and Step 5b (Chair synthesis) and '
+             'go straight to Step 6 factor fusion. Useful when you want the fused '
+             'factor built directly from the evolved best_factors (capped by '
+             'fusion.top_k) without the LLM quality-gate round. When skipped, the '
+             'step6 top_k cap ranks factors by |ICIR| instead of debate_score.',
     )
     parser.add_argument(
         '--output-dir', type=str, default=None,
@@ -2407,12 +2573,14 @@ Examples:
         if args.n_shots is not None:
             evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:
-            # Legacy convenience: Step 4c Alpha101 retrieval top-k.
-            evo_overrides['alpha101_top_k'] = args.n_seeds
+            # [deprecated] No-op: alpha101_top_k is no longer used by Step 4c.
+            pass
         if args.n_evolution_rounds != 5:
             pipeline.config['evolution']['max_rounds'] = args.n_evolution_rounds
         if args.n_best_factors is not None:
             pipeline.config['evolution']['n_best_factors'] = args.n_best_factors
+        if args.n_best4debate is not None:
+            pipeline.config['evolution']['n_best4debate'] = args.n_best4debate
         if args.fusion_top_k is not None:
             pipeline.config.setdefault('fusion', {})['top_k'] = args.fusion_top_k
 
@@ -2427,6 +2595,7 @@ Examples:
             output_dir=args.output_dir,
             forward_period=args.forward_period,
             holding_period=args.holding_period,
+            skip_eval=args.skip_eval,
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")

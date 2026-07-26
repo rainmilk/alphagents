@@ -122,21 +122,27 @@ llm:
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
   forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
-  n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
-  alpha101_top_k: 5             # [ACTIVE] Step 4c Alpha101 RETRIEVAL top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5.
-  n_seeds_memory_augment: 15     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
-  retrieve_alpha101: true        # [ACTIVE] enable Step 4c Alpha101 retrieval (score the Alpha101 library, merge top-k into the pool for Step 5). Set false to skip Step 4c entirely.
-  alpha101_max_workers: 0        # [ACTIVE] Step 4c parallel worker count for scoring the whole Alpha101 library (0 = auto = min(32, cpu_count()+4)). More workers = faster on multi-core, but each holds a factor panel in RAM.
+  n_seeds_hypothesis: 5        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
+  alpha101_top_k: 20            # [ACTIVE] Step 4c: number of Stage-1 Alpha101 library factors (top by |IC|) returned alongside the LLM-mined Stage-2 factors for joint evaluation in the pool. 0 = return LLM-mined factors only (legacy behavior). Revived: previously deprecated when Step 4c was LLM-mining-only.
+  n_seeds_memory_augment: 20     # [ACTIVE] memory-augmented seed factors (consumed by MemoryAugmentedGenerator; 0 = off)
+  retrieve_alpha101: true        # [ACTIVE] enable Step 4c: LLM mining of Alpha101-inspired factors. Scores the library on TRAIN data, builds inspiration chains, and uses LLM to evolve novel expressions. The top-k Alpha101 library factors (evolution.alpha101_top_k) AND the LLM-generated factors both enter the pool for joint evaluation. Set false to skip Step 4c entirely.
+  alpha101_ratio: 1.0           # [ACTIVE] Step 4c Alpha101 library scoring knob — INDEPENDENT of alphafama.alpha101_ratio. 0 = load Alpha101 formulas WITHOUT scoring (IC=0.0 placeholder, cheap — skips the 98-factor eval, like FAMA's _seed_clusters_from_formula_map); >0 = load + score the library on TRAIN data and build IC-ranked inspiration chains. Because Step 4c only returns LLM-generated factors (not the Alpha101 formulas themselves), this value acts as a score/skip TOGGLE, not a pool proportion.
+  alpha101_max_workers: 0        # [ACTIVE] Step 4c parallel worker count for scoring the Alpha101 library inside llm_mine_alpha101_inspired (0 = auto = min(32, cpu_count()+4)). More workers = faster on multi-core, but each holds a factor panel in RAM.
+  alpha101_llm_mining: false     # [DEPRECATED] Step 4c is now LLM-mining-only; controlled by retrieve_alpha101 above. Kept for backward config compat (ignored).
+  alpha101_llm_mining_iters: 5   # [ACTIVE] number of LLM mining iterations (each walks every family chain once).
+  alpha101_llm_mining_per_iter: 1  # [ACTIVE] number of new factors to request per LLM call per family chain.
+  alpha101_llm_mining_max_chain: 5 # [ACTIVE] max chain length per family (top-N Alpha101 expressions by |IC| used as LLM inspiration).
   eval_max_workers: 0            # [ACTIVE] evolution-loop parallel worker count for backtesting factors each round (0 = auto = min(32, cpu_count()+4)).
   n_shots: 5                   # [ACTIVE] few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (retrieval count; INDEPENDENT of memory.retrieval.top_k which is for factor-pool merge)
   n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
+  n_best4debate: 20     # [ACTIVE] Step 4d: pre-step5 filter — keep top-N factors by |train IC| from the combined pool (evolved + memory + alpha101-llm). 0 = disabled (pass all to Step 5). Set to match fusion.top_k to avoid wasting debate API calls on factors that will be cut.
   max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
-  n_improve: 10        # [ACTIVE] target number of improved factors per round (LLM generation)
+  n_improve: 15        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
   convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
   convergence_window: 2     # [ACTIVE] number of recent rounds to check for convergence
   patience: 3               # [ACTIVE] max consecutive non-improving rounds before early stop
-  val_ratio: 0.3            # [ACTIVE] fraction of TRAIN period held out as validation for factor SELECTION and early-stop (0 = disabled; full train used as before). This is the key anti-overfitting lever: evolution is driven by train IC but factors are finally ranked/early-stopped on validation IC.
+  val_ratio: 0.3           # [ACTIVE] fraction of TRAIN period held out as validation for factor SELECTION and early-stop (0 = disabled; full train used as before). This is the key anti-overfitting lever: evolution is driven by train IC but factors are finally ranked/early-stopped on validation IC.
   min_ic: 0.02              # [ACTIVE] quality filter: drop factors with IC below this
   min_val_ic: 0.02         # [ACTIVE] honest gate (val-mode only): drop factors whose validation IC < this. Requires a real OOS edge — at val_ratio=0.3 the holdout window is ~hundreds of days (SE of mean val-IC ≈ 0.005), so 0.01 ≈ "factor must show a small but statistically-meaningful rank-IC on holdout" (~2 SE above zero). Set 0.005 for a more lenient bar; avoid 0.02 (= min_ic) unless you want val IC to match the in-sample floor (too strict given holdout noise).
   min_sharpe: 0.0           # [ACTIVE] soft guard: drop factors with NEGATIVE Sharpe. NOTE: Sharpe here is distorted by overlapping-window annualization (daily-sampled 10d forward returns * sqrt(252)), so keep this a soft floor, not a hard gate. Was 0.5 — dead code: it constantly cleared every factor, then the fallback re-admitted all of them, so the filter never excluded anything.
@@ -214,7 +220,7 @@ fusion:
   # for family overlap, yet hard-dropped them at only MEDIUM confidence.
   chair_max_per_family: 3        # [ACTIVE] family-diversity cap fed to the Chair prompt (was hardcoded "2-3"). Raise to 4-5 to let a dominant family keep more variants.
   chair_soft_reject: true        # [ACTIVE] true = rejected factors are DOWNWEIGHTED (kept in fusion with a reduced prior), not hard-dropped. Prevents a MEDIUM-confidence Chair from permanently discarding a high-IC factor.
-  chair_soft_reject_weight: 0.3  # [ACTIVE] debate_score multiplier for soft-rejected factors (0 = drop the prior entirely, 1 = no penalty).
+  chair_soft_reject_weight: 1.0  # [ACTIVE] debate_score multiplier for soft-rejected factors (0 = drop the prior entirely, 1 = no penalty).
 
   # Final cap on the number of factors that actually ENTER fusion (applied LAST,
   # on top of Chair selection / soft-reject). 0 = no cap (legacy behaviour:
@@ -224,7 +230,7 @@ fusion:
   # the user wants to feed fusion.fuse(). NOTE: this is a different knob from
   # memory.retrieval.top_k (factor-pool retrieval) and llm.chair.synthesis_top_n
   # (how many factors get full detail in the Chair prompt).
-  top_k: 15
+  top_k: 10
 
   # Portfolio construction → used by step7_construct_portfolio
   portfolio:

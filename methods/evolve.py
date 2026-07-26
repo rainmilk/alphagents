@@ -239,15 +239,68 @@ _ALLOWED_FIELDS_STR = (
 )
 _KNOWN_FUNCS = _GATE_ALLOWED_FUNCS | set(_GATE_FUNC_ALIASES.keys())
 
+# Function arity (min, max positional args) — SINGLE SOURCE OF TRUTH shared by
+# the validation gate (_validate_factor_expr) and the backtester's runtime
+# evaluator (_FactorExprEvaluator._call_func). Keeping one copy avoids drift:
+# if a function's signature changes here, both the pre-filter and the runtime
+# check stay in sync. Mirrors the evaluator's runtime arity table so malformed
+# LLM expressions (e.g. ts_zscore(x) with 1 arg instead of 2) are dropped at
+# the validation gate instead of crashing during backtest.
+_FUNCTION_ARITY = {
+    'rank':       (1, 1),
+    'ts_rank':    (2, 2),
+    'ts_corr':    (3, 3),
+    'ts_cov':     (3, 3),
+    'ts_mean':    (2, 2),
+    'ts_std':     (2, 2),
+    'ts_var':     (2, 2),
+    'ts_skew':    (2, 2),
+    'ts_kurt':    (2, 2),
+    'ts_min':     (2, 2),
+    'ts_max':     (2, 2),
+    'ts_sum':     (2, 2),
+    'ts_delta':   (2, 2),
+    'ts_pct_change': (2, 2),
+    'ts_zscore':  (2, 2),
+    'ts_decay':   (2, 2),
+    'ts_slope':   (2, 2),
+    'delay':      (2, 2),
+    'sign':       (1, 1),
+    'abs':        (1, 1),
+    'log':        (1, 1),
+    'sqrt':       (1, 1),
+    'if':         (3, 3),
+    # --- Alpha101 primitives ---
+    'ts_argmax':  (2, 2),
+    'ts_argmin':  (2, 2),
+    'signedpower':(1, 2),
+    'scale':      (1, 2),
+    'decay_linear':(2, 2),
+    'ts_product': (2, 2),
+    'correlation':(3, 3),
+    # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y)) ---
+    'ele_min':    (2, 2),
+    'ele_max':    (2, 2),
+}
+
 
 def _validate_factor_expr(expr: str):
-    """Return (is_valid, bad_fields).
+    """Return (is_valid, bad_info).
 
-    Cheap, data-independent pre-filter: every bare identifier in the expression
-    must be either a known DSL function or an allowed data field. Catches
-    LLM-hallucinated fundamentals (revenue, assets, ...) BEFORE they reach the
-    backtester. A syntax error (or a `return` keyword the custom parser tolerates)
-    is NOT flagged here — we only ever DROP expressions we are sure are invalid.
+    Cheap, data-independent pre-filter with two checks:
+
+    1. **Identifier whitelist** — every bare identifier must be either a known
+       DSL function or an allowed data field. Catches LLM-hallucinated
+       fundamentals (revenue, assets, ...) BEFORE they reach the backtester.
+    2. **Arity (argument count)** — every function *call* must respect its
+       parameter count. Catches e.g. ``ts_zscore(x)`` with 1 arg when it needs
+       2 (``ts_zscore(x, w)``), which would otherwise crash the backtester's
+       evaluator with a ``ValueError`` mid-run.
+
+    We only ever DROP expressions we are SURE are invalid. A syntax error (or a
+    ``return`` keyword the custom parser tolerates) is NOT flagged here — the
+    backtester makes the final authoritative parse. Likewise, an expression we
+    cannot AST-parse cleanly is deferred to the backtester rather than dropped.
     """
     pre = FactorOriginalityGate._preprocess(expr)
     ids = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", pre))
@@ -257,7 +310,35 @@ def _validate_factor_expr(expr: str):
         if name in _KNOWN_FUNCS or name in _ALLOWED_FIELDS:
             continue
         bad.append(i)
-    return (len(bad) == 0), sorted(set(bad))
+    if bad:
+        return (False, sorted(set(bad)))
+
+    # --- Arity check: walk the AST and validate function-call argument counts ---
+    try:
+        tree = ast.parse(pre, mode='eval')
+    except (SyntaxError, ValueError):
+        # Can't parse cleanly — defer to the backtester (don't drop on uncertain
+        # syntax). The gate only flags what it's CERTAIN is wrong.
+        return (True, [])
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            # Normalize alias → canonical (mirrors the evaluator / gate canon)
+            fname = _GATE_FUNC_ALIASES.get(fname, fname)
+            if fname == '_if':
+                fname = 'if'
+            if fname in _FUNCTION_ARITY:
+                lo, hi = _FUNCTION_ARITY[fname]
+                n_args = len(node.args)
+                if not (lo <= n_args <= hi):
+                    bad.append(
+                        f"{fname} expects {lo}-{hi} args, got {n_args}"
+                    )
+    if bad:
+        return (False, sorted(set(bad)))
+
+    return (True, [])
 
 
 # Canonical factor-DSL function whitelist injected into every LLM factor-generation
@@ -508,6 +589,238 @@ def _tokenize(expr: str) -> List[tuple]:
     return tokens
 
 
+# =====================================================================
+# Compiled-expression cache
+# ---------------------------------------------------------------------
+# Alpha101 (and any other fixed/recurring) factor expressions are parsed
+# from a DSL *string* on every ``evaluate()`` call. The recursive-descent
+# parser re-runs even though the tokenizer itself is memoized. Since the
+# Alpha101 library is fixed and known ahead of time, we pre-compile each
+# expression into a Python code object ONCE (module-level cache) and execute
+# the compiled bytecode on later evaluations — skipping the parse/dispatch
+# overhead entirely. The generated code calls the SAME ``_fn_*`` primitives
+# as the interpreter, so results are bit-for-bit identical to the slow path.
+# Steps 4c/5/6 all evaluate the Alpha101 expressions; per-run this removes
+# the repeated parse cost and (because the cache is process-global) any
+# later backtester that re-evaluates the same formula reuses the bytecode.
+# =====================================================================
+
+_COMPILED: Dict = {}          # expr string -> compiled code object (or _SLOW)
+_SLOW = object()              # sentinel: this expr could not be compiled
+
+
+def _div(a, b):
+    """Robust division that mirrors the slow parser's zero-guard.
+
+    The DSL divides DataFrames by DataFrames (replace 0 -> NaN) but also by
+    bare numeric literals in rare cases; handle both safely.
+    """
+    if isinstance(b, (pd.DataFrame, pd.Series)):
+        return a / b.replace(0, np.nan)
+    return a / (np.nan if b == 0 else b)
+
+
+class _CIDict(dict):
+    """Case-insensitive data lookup so compiled code tolerates PE/pe etc."""
+
+    def __getitem__(self, k):
+        if k in self:
+            return super().__getitem__(k)
+        lk = k.lower()
+        if lk in self:
+            return super().__getitem__(lk)
+        raise KeyError(k)
+
+
+class _ExprCompiler:
+    """Generate Python *source* for a factor expression, mirroring the grammar
+    of ``_FactorExprEvaluator`` but emitting code instead of eager DataFrames.
+
+    The emitted source references ``data['field']`` (a case-insensitive view of
+    the evaluator's ``_data``), the ``_fn_*`` primitive implementations, ``_div``
+    for zero-safe division, and ``np``. It is compiled once via ``compile()``
+    and cached; subsequent evaluations just ``eval`` the bytecode.
+    """
+
+    def __init__(self, tokens):
+        self._tokens = tokens
+        self._pos = 0
+
+    def compile(self) -> str:
+        src = self._parse_expression()
+        if self._peek()[0] != 'EOF':
+            raise ValueError(f"Trailing tokens after: {src}")
+        return src
+
+    # ---- scanner ----
+    def _peek(self):
+        return self._tokens[self._pos] if self._pos < len(self._tokens) else ('EOF', None)
+
+    def _advance(self):
+        tok = self._peek()
+        self._pos += 1
+        return tok
+
+    def _expect(self, kind, value=None):
+        tok = self._advance()
+        if tok[0] != kind or (value is not None and tok[1] != value):
+            raise ValueError(f"Expected {kind}({value}), got {tok}")
+        return tok
+
+    # ---- grammar (parallel to _FactorExprEvaluator's parser) ----
+    def _parse_expression(self) -> str:
+        left = self._parse_comparison()
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('+', '-'):
+            op = self._advance()[1]
+            right = self._parse_comparison()
+            left = f"({left} {op} {right})"
+        return left
+
+    def _parse_comparison(self) -> str:
+        left = self._parse_term()
+        while self._peek()[0] == "CMP":
+            op = self._advance()[1]
+            right = self._parse_term()
+            left = f"({left} {op} {right})"
+        return left
+
+    def _parse_term(self) -> str:
+        left = self._parse_power()
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('*', '/'):
+            op = self._advance()[1]
+            right = self._parse_power()
+            if op == '*':
+                left = f"({left} * {right})"
+            else:
+                left = f"_div({left}, {right})"
+        return left
+
+    def _parse_power(self) -> str:
+        left = self._parse_unary()
+        while (self._peek()[0] == 'OP' and self._peek()[1] == '^') or \
+              (self._peek()[0] == 'POWER' and self._peek()[1] == '**'):
+            self._advance()
+            right = self._parse_unary()
+            left = f"({left} ** {right})"
+        return left
+
+    def _parse_unary(self) -> str:
+        sign = 1
+        while self._peek()[0] == 'OP' and self._peek()[1] in ('+', '-'):
+            if self._advance()[1] == '-':
+                sign = -sign
+        result = self._parse_atom()
+        if sign == -1:
+            return f"(-{result})"
+        return result
+
+    def _parse_atom(self) -> str:
+        tok = self._peek()
+        if tok[0] == 'NUMBER':
+            self._advance()
+            return repr(tok[1])
+        if tok[0] == 'PAREN' and tok[1] == '(':
+            self._advance()
+            result = self._parse_expression()
+            self._expect('PAREN', ')')
+            return f"({result})"
+        if tok[0] == 'IDENT':
+            name = self._advance()[1]
+            if self._peek()[0] == 'PAREN' and self._peek()[1] == '(':
+                return self._parse_func_call(name)
+            uname = name.upper()
+            if uname == "NAN":
+                return "np.nan"
+            if uname == "INF":
+                return "np.inf"
+            if uname == "-INF":
+                return "(-np.inf)"
+            return f"data[{name!r}]"
+        raise ValueError(f"Unexpected token {tok}")
+
+    def _parse_func_call(self, name: str) -> str:
+        self._expect('PAREN', '(')
+        args = []
+        if self._peek()[0] == 'PAREN' and self._peek()[1] == ')':
+            pass
+        else:
+            args.append(self._parse_expression())
+            while self._peek()[0] == 'COMMA':
+                self._advance()
+                args.append(self._parse_expression())
+        self._expect('PAREN', ')')
+        canon = _FactorExprEvaluator._FUNC_ALIASES.get(name, name)
+        fn = '_fn_if' if canon == 'if' else f"_fn_{canon}"
+        return f"{fn}({', '.join(args)})"
+
+
+_EVAL_NS = None  # populated lazily (needs _FactorExprEvaluator to exist)
+
+
+def _ensure_eval_ns():
+    """Build the global namespace used to ``eval`` compiled expressions.
+
+    Holds numpy/pandas, the zero-safe ``_div`` helper, and every ``_fn_*``
+    primitive (static methods of ``_FactorExprEvaluator``). Built once.
+    """
+    global _EVAL_NS
+    if _EVAL_NS is not None:
+        return
+    ns = {'np': np, 'pd': pd, '_div': _div}
+    for _n in dir(_FactorExprEvaluator):
+        if _n.startswith('_fn_'):
+            ns[_n] = getattr(_FactorExprEvaluator, _n)
+    _EVAL_NS = ns
+
+
+def _get_compiled(expr: str):
+    """Return a compiled ``f(data) -> DataFrame`` callable for ``expr``.
+
+    The callable is cached process-globally (so the fixed Alpha101 library is
+    effectively pre-coded once and reused by every later evaluation). Returns
+    ``None`` if the expression cannot be compiled — the caller then falls back
+    to the original interpreter. Failed compiles are remembered via ``_SLOW``
+    so we never retry them.
+    """
+    cached = _COMPILED.get(expr)
+    if cached is _SLOW:
+        return None
+    if cached is not None:
+        return cached
+    try:
+        tokens = _tokenize(expr)
+        if not tokens:
+            raise ValueError("no tokens")
+        src = "def __alpha_eval__(data):\n    return " + _ExprCompiler(tokens).compile()
+        _ensure_eval_ns()
+        local = dict(_EVAL_NS)  # exec defines __alpha_eval__ inside this ns
+        exec(compile(src, '<alpha101>', 'exec'), local)  # noqa: S102 trusted DSL
+        fn = local['__alpha_eval__']
+    except Exception:
+        _COMPILED[expr] = _SLOW
+        return None
+    _COMPILED[expr] = fn
+    return fn
+
+
+def precompile_alpha101():
+    """Pre-compile every Alpha101 DSL formula into a cached callable.
+
+    Called (guarded) at ``methods.alpha101`` import time so the fixed library
+    is "pre-coded" once and Step 4c's scoring calls the bytecode directly.
+    No-op if the alpha101 module is unavailable.
+    """
+    try:
+        from methods.alpha101 import get_alpha101_formulas
+    except Exception:
+        return
+    for _expr in get_alpha101_formulas().values():
+        try:
+            _get_compiled(_expr)
+        except Exception:
+            pass
+
+
 class _FactorExprEvaluator:
     """
     Recursive-descent evaluator for WorldQuant-style factor expressions.
@@ -567,11 +880,39 @@ class _FactorExprEvaluator:
         self._pos = 0
 
     def evaluate(self, expr: str) -> pd.DataFrame:
-        """Parse and evaluate a factor expression."""
-        # --- Input validation ---
+        """Parse and evaluate a factor expression.
+
+        Fast path: if ``expr`` has been compiled to a ``f(data)`` callable
+        (e.g. the fixed Alpha101 library, or any expression seen before), call
+        it directly — skipping the recursive-descent parse entirely. The
+        callable's globals are the shared, read-only primitive namespace, and
+        ``data`` is passed per call, so concurrent workers are safe. Any
+        failure (or an un-compilable expression) transparently falls back to
+        the original interpreter in ``_evaluate_slow`` so behaviour is
+        identical and nothing regresses.
+        """
         if not expr or not expr.strip():
             raise ValueError("Empty factor expression")
 
+        fn = _get_compiled(expr)
+        if fn is not None:
+            try:
+                result = fn(_CIDict(self._data))
+            except Exception:
+                # Compiled path unexpectedly failed — use the safe interpreter.
+                return self._evaluate_slow(expr)
+            # Ensure result is a DataFrame (not a scalar or Series)
+            if isinstance(result, (int, float)):
+                template = next(iter(self._data.values()))
+                result = pd.DataFrame(
+                    result, index=template.index, columns=template.columns
+                )
+            return result
+
+        return self._evaluate_slow(expr)
+
+    def _evaluate_slow(self, expr: str) -> pd.DataFrame:
+        """Original recursive-descent interpreter (fallback / un-compilable)."""
         self._tokens = _tokenize(expr)
         self._pos = 0
 
@@ -806,46 +1147,9 @@ class _FactorExprEvaluator:
         name = self._FUNC_ALIASES.get(name, name)
 
         arity = len(args)
-        # Check arity
-        arity_map = {
-            'rank':       (1, 1),
-            'ts_rank':    (2, 2),
-            'ts_corr':    (3, 3),
-            'ts_cov':     (3, 3),
-            'ts_mean':    (2, 2),
-            'ts_std':     (2, 2),
-            'ts_var':     (2, 2),
-            'ts_skew':    (2, 2),
-            'ts_kurt':    (2, 2),
-            'ts_min':     (2, 2),
-            'ts_max':     (2, 2),
-            'ts_sum':     (2, 2),
-            'ts_delta':   (2, 2),
-            'ts_pct_change': (2, 2),
-            'ts_zscore':  (2, 2),
-            'ts_decay':   (2, 2),
-            'ts_slope':   (2, 2),
-            'delay':      (2, 2),
-            'sign':       (1, 1),
-            'abs':        (1, 1),
-            'log':        (1, 1),
-            'sqrt':       (1, 1),
-            'if':         (3, 3),
-            # --- Alpha101 primitives ---
-            'ts_argmax':  (2, 2),
-            'ts_argmin':  (2, 2),
-            'signedpower':(1, 2),
-            'scale':      (1, 2),
-            'decay_linear':(2, 2),
-            'ts_product': (2, 2),
-            'correlation':(3, 3),
-            # --- elementwise min/max (Alpha101 Min(x,y)/Max(x,y)) ---
-            'ele_min':    (2, 2),
-            'ele_max':    (2, 2),
-        }
-
-        if name in arity_map:
-            lo, hi = arity_map[name]
+        # Check arity against the shared gate table (single source of truth).
+        if name in _FUNCTION_ARITY:
+            lo, hi = _FUNCTION_ARITY[name]
             if not (lo <= arity <= hi):
                 raise ValueError(
                     f"Function '{name}' expects {lo}-{hi} args, got {arity}"
@@ -1066,11 +1370,11 @@ class _FactorExprEvaluator:
     # ---- Alpha101 primitive operators (added to extend the DSL) -----------
 
     @staticmethod
-    def _fn_ts_argmax(x: pd.DataFrame, d) -> pd.DataFrame:
-        """ts_argmax(x, d) — position (in periods) of the max within the trailing
-        d-day window, counting BACK from the most recent day. Mirrors WorldQuant's
-        ts_argmax: (d-1) - argmax. Returns 0 if today is the max, d-1 if the max was
-        d days ago. NaN-aware: all-NaN windows yield NaN.
+    def _fn_ts_argmax_slow(x: pd.DataFrame, d) -> pd.DataFrame:
+        """Reference (slow) implementation — kept for verification / fallback.
+
+        See :meth:`_fn_ts_argmax` for semantics. Uses ``rolling().apply()`` with a
+        Python callback; this is the original (pre-vectorization) hot path.
         """
         w = _FactorExprEvaluator._safe_int(d)
         min_p = min(max(2, w // 2), w)
@@ -1082,10 +1386,47 @@ class _FactorExprEvaluator:
         return (w - 1) - x.rolling(window=w, min_periods=min_p).apply(_amax, raw=True)
 
     @staticmethod
-    def _fn_ts_argmin(x: pd.DataFrame, d) -> pd.DataFrame:
-        """ts_argmin(x, d) — position (in periods) of the min within the trailing
+    def _fn_ts_argmax(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_argmax(x, d) — position (in periods) of the max within the trailing
         d-day window, counting BACK from the most recent day. Mirrors WorldQuant's
-        ts_argmin: (d-1) - argmin.
+        ts_argmax: (d-1) - argmax. Returns 0 if today is the max, d-1 if the max was
+        d days ago. NaN-aware: all-NaN windows yield NaN.
+
+        Vectorized equivalent of :meth:`_fn_ts_argmax_slow` — **bit-identical**, but
+        uses ``numpy.lib.stride_tricks.sliding_window_view`` + ``np.nanargmax`` so it
+        runs at C speed instead of crossing the Python boundary once per
+        (window, stock). The warm-up / partial-window region (rows ``0..w-2``) is
+        handled explicitly so the ``min_periods`` gate and the ``(w-1) - argmax``
+        offset match pandas exactly.
+        """
+        if not isinstance(x, pd.DataFrame):
+            return _FactorExprEvaluator._fn_ts_argmax_slow(x, d)
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+        vals = x.to_numpy(dtype=float)
+        T, N = vals.shape
+        out = np.full((T, N), np.nan)
+        last_lead = min(w - 1, T)
+        for i in range(last_lead):                       # warm-up partial windows
+            L = i + 1
+            seg = vals[:L, :]
+            valid = (L - np.isnan(seg).sum(axis=0)) >= min_p
+            if valid.any():
+                am = np.argmax(np.nan_to_num(seg, nan=-np.inf), axis=0)
+                out[i, :] = np.where(valid, (w - 1) - am, np.nan)
+        if T >= w:                                       # full windows
+            sw = np.lib.stride_tricks.sliding_window_view(vals, w, axis=0)
+            n_nan = np.isnan(sw).sum(axis=2)
+            valid = ((w - n_nan) >= min_p) & (n_nan < w)
+            am = np.argmax(np.nan_to_num(sw, nan=-np.inf), axis=2)
+            out[w - 1:, :] = np.where(valid, (w - 1) - am, np.nan)
+        return pd.DataFrame(out, index=x.index, columns=x.columns)
+
+    @staticmethod
+    def _fn_ts_argmin_slow(x: pd.DataFrame, d) -> pd.DataFrame:
+        """Reference (slow) implementation — kept for verification / fallback.
+
+        See :meth:`_fn_ts_argmin` for semantics.
         """
         w = _FactorExprEvaluator._safe_int(d)
         min_p = min(max(2, w // 2), w)
@@ -1095,6 +1436,36 @@ class _FactorExprEvaluator:
             return np.nan if np.isnan(a).all() else float(np.nanargmin(a))
 
         return (w - 1) - x.rolling(window=w, min_periods=min_p).apply(_amin, raw=True)
+
+    @staticmethod
+    def _fn_ts_argmin(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_argmin(x, d) — position (in periods) of the min within the trailing
+        d-day window, counting BACK from the most recent day. Mirrors WorldQuant's
+        ts_argmin: (d-1) - argmin. Vectorized equivalent of :meth:`_fn_ts_argmin_slow`
+        — bit-identical (see :meth:`_fn_ts_argmax` for the vectorization strategy).
+        """
+        if not isinstance(x, pd.DataFrame):
+            return _FactorExprEvaluator._fn_ts_argmin_slow(x, d)
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+        vals = x.to_numpy(dtype=float)
+        T, N = vals.shape
+        out = np.full((T, N), np.nan)
+        last_lead = min(w - 1, T)
+        for i in range(last_lead):                       # warm-up partial windows
+            L = i + 1
+            seg = vals[:L, :]
+            valid = (L - np.isnan(seg).sum(axis=0)) >= min_p
+            if valid.any():
+                am = np.argmin(np.nan_to_num(seg, nan=np.inf), axis=0)
+                out[i, :] = np.where(valid, (w - 1) - am, np.nan)
+        if T >= w:                                       # full windows
+            sw = np.lib.stride_tricks.sliding_window_view(vals, w, axis=0)
+            n_nan = np.isnan(sw).sum(axis=2)
+            valid = ((w - n_nan) >= min_p) & (n_nan < w)
+            am = np.argmin(np.nan_to_num(sw, nan=np.inf), axis=2)
+            out[w - 1:, :] = np.where(valid, (w - 1) - am, np.nan)
+        return pd.DataFrame(out, index=x.index, columns=x.columns)
 
     @staticmethod
     def _fn_signedpower(x: pd.DataFrame, p=2) -> pd.DataFrame:
@@ -1114,10 +1485,10 @@ class _FactorExprEvaluator:
         return x.div(denom, axis=0) * aval
 
     @staticmethod
-    def _fn_decay_linear(x: pd.DataFrame, d) -> pd.DataFrame:
-        """decay_linear(x, d) — linearly-weighted moving average over the trailing
-        d days, where the MOST RECENT day has the highest weight (1..d). WorldQuant
-        Alpha101 primitive (e.g. alpha019, alpha028, alpha047).
+    def _fn_decay_linear_slow(x: pd.DataFrame, d) -> pd.DataFrame:
+        """Reference (slow) implementation — kept for verification / fallback.
+
+        See :meth:`_fn_decay_linear` for semantics.
         """
         w = _FactorExprEvaluator._safe_int(d)
         min_p = min(max(2, w // 2), w)
@@ -1134,10 +1505,51 @@ class _FactorExprEvaluator:
         return x.rolling(window=w, min_periods=min_p).apply(_decay, raw=True)
 
     @staticmethod
-    def _fn_ts_product(x: pd.DataFrame, d) -> pd.DataFrame:
-        """ts_product(x, d) — rolling product over the trailing d days, per stock.
-        WorldQuant Alpha101 primitive (e.g. alpha009, alpha022). All-NaN windows
-        yield NaN; partially-NaN windows multiply the valid entries.
+    def _fn_decay_linear(x: pd.DataFrame, d) -> pd.DataFrame:
+        """decay_linear(x, d) — linearly-weighted moving average over the trailing
+        d days, where the MOST RECENT day has the highest weight (1..d). WorldQuant
+        Alpha101 primitive (e.g. alpha019, alpha028, alpha047).
+
+        Vectorized equivalent of :meth:`_fn_decay_linear_slow` — **bit-identical**,
+        using a broadcast weight matrix over ``sliding_window_view`` so the
+        per-window Python callback is eliminated. All-NaN windows yield NaN
+        (matching the reference guard).
+        """
+        if not isinstance(x, pd.DataFrame):
+            return _FactorExprEvaluator._fn_decay_linear_slow(x, d)
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+        weights = np.arange(1, w + 1, dtype=float)
+        vals = x.to_numpy(dtype=float)
+        T, N = vals.shape
+        out = np.full((T, N), np.nan)
+        last_lead = min(w - 1, T)
+        for i in range(last_lead):                       # warm-up partial windows
+            L = i + 1
+            seg = vals[:L, :]
+            n_nan = np.isnan(seg).sum(axis=0)
+            valid = (L - n_nan) >= min_p
+            if valid.any():
+                wsub = weights[w - L:]                   # length-L tail of weights
+                wmat = np.broadcast_to(wsub.reshape(L, 1), (L, N))
+                num = np.nansum(seg * wmat, axis=0)
+                den = np.nansum(wmat, axis=0)               # full weight-sum (wmat has no NaN)
+                out[i, :] = np.where(valid & (den > 0), num / den, np.nan)
+        if T >= w:                                       # full windows
+            sw = np.lib.stride_tricks.sliding_window_view(vals, w, axis=0)
+            wmat = np.broadcast_to(weights.reshape(1, 1, w), sw.shape)
+            num = np.nansum(sw * wmat, axis=2)
+            den = np.nansum(wmat, axis=2)               # full weight-sum (wmat has no NaN)
+            n_nan = np.isnan(sw).sum(axis=2)
+            valid = ((w - n_nan) >= min_p) & (n_nan < w) & (den > 0)
+            out[w - 1:, :] = np.where(valid, num / den, np.nan)
+        return pd.DataFrame(out, index=x.index, columns=x.columns)
+
+    @staticmethod
+    def _fn_ts_product_slow(x: pd.DataFrame, d) -> pd.DataFrame:
+        """Reference (slow) implementation — kept for verification / fallback.
+
+        See :meth:`_fn_ts_product` for semantics.
         """
         w = _FactorExprEvaluator._safe_int(d)
         min_p = min(max(2, w // 2), w)
@@ -1147,6 +1559,39 @@ class _FactorExprEvaluator:
             return np.nan if np.isnan(a).all() else float(np.nanprod(a))
 
         return x.rolling(window=w, min_periods=min_p).apply(_prod, raw=True)
+
+    @staticmethod
+    def _fn_ts_product(x: pd.DataFrame, d) -> pd.DataFrame:
+        """ts_product(x, d) — rolling product over the trailing d days, per stock.
+        WorldQuant Alpha101 primitive (e.g. alpha009, alpha022). All-NaN windows
+        yield NaN; partially-NaN windows multiply the valid entries.
+
+        Vectorized equivalent of :meth:`_fn_ts_product_slow` — **bit-identical**.
+        """
+        if not isinstance(x, pd.DataFrame):
+            return _FactorExprEvaluator._fn_ts_product_slow(x, d)
+        w = _FactorExprEvaluator._safe_int(d)
+        min_p = min(max(2, w // 2), w)
+        vals = x.to_numpy(dtype=float)
+        T, N = vals.shape
+        out = np.full((T, N), np.nan)
+        last_lead = min(w - 1, T)
+        for i in range(last_lead):                       # warm-up partial windows
+            L = i + 1
+            seg = vals[:L, :]
+            n_nan = np.isnan(seg).sum(axis=0)
+            all_nan = n_nan >= L
+            valid = ((L - n_nan) >= min_p) & (~all_nan)
+            if valid.any():
+                prod = np.prod(np.nan_to_num(seg, nan=1.0), axis=0)
+                out[i, :] = np.where(valid, prod, np.nan)
+        if T >= w:                                       # full windows
+            sw = np.lib.stride_tricks.sliding_window_view(vals, w, axis=0)
+            n_nan = np.isnan(sw).sum(axis=2)
+            valid = ((w - n_nan) >= min_p) & (n_nan < w)
+            prod = np.prod(np.nan_to_num(sw, nan=1.0), axis=2)
+            out[w - 1:, :] = np.where(valid, prod, np.nan)
+        return pd.DataFrame(out, index=x.index, columns=x.columns)
 
     @staticmethod
     def _fn_ele_min(x: pd.DataFrame, y: pd.DataFrame) -> pd.DataFrame:
@@ -2237,10 +2682,11 @@ class SelfEvolvingGenerator:
             if not hyp_factors:
                 print("  [hypothesis] pipeline yielded nothing.")
 
-        # Alpha101 factors are NO LONGER generated as seeds here — they are
-        # retrieved by score in Step 4c (main.step4c_retrieve_alpha101), which
-        # scores the full Alpha101 library on TRAIN data and merges the top-k
-        # into the candidate pool for Step 5.
+        # Alpha101 factors are NO LONGER generated as seeds here — Step 4c
+        # (main.step4c_retrieve_alpha101) now does LLM mining: it scores the
+        # Alpha101 library on TRAIN data, builds inspiration chains, and uses
+        # the LLM to evolve novel expressions. Only LLM-generated factors
+        # enter the candidate pool.
         result = hyp_factors
         print(f"Generated {len(result)} seed factors locally "
               f"({len(hyp_factors)} hypothesis-driven). "
@@ -2426,7 +2872,7 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
                 # skipping early keeps the factor budget on valid candidates.
                 _ok, _bad = _validate_factor_expr(expr)
                 if not _ok:
-                    print(f"  [evolve] Skipping seed factor with unknown field(s) "
+                    print(f"  [evolve] Skipping seed factor — invalid: "
                           f"{_bad}: {expr}")
                     continue
                 # Prefer the LLM's explicit family label (it often knows a
@@ -2452,7 +2898,353 @@ DIVERSITY MANDATE (critical — factors that violate this are低 quality):
             raise
         except Exception as e:
             raise
-    
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Alpha101-inspired LLM mining (ported from FAMA _run_llm_mining)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def llm_mine_alpha101_inspired(
+        self,
+        backtester: 'FactorBacktester',
+        max_workers: int = 0,
+        n_iters: int = 3,
+        n_per_iter: int = 5,
+        max_chain_len: int = 5,
+        temperature: float = 0.7,
+        alpha101_ratio: float = 1.0,
+        alpha101_top_k: int = 5,
+    ) -> List[CandidateFactor]:
+        """Generate NEW factor expressions via LLM chain evolution.
+
+        Mirrors FAMA's ``_run_llm_mining``: builds per-family "inspiration
+        chains" from the Alpha101 formula library, then uses LLM to *evolve*
+        novel expressions.
+
+        Both the raw Alpha101 library factors (Stage 1, top-k by |IC|) and the
+        LLM-evolved factors (Stage 2) are returned for **joint evaluation** in
+        the candidate pool.  Set ``alpha101_top_k <= 0`` to return LLM-mined
+        factors only (legacy behavior — library factors used purely as
+        inspiration, never entered the pool).
+
+        The Alpha101 formula library is **always** used as the inspiration
+        source (matching FAMA's ``formula_map``).  ``alpha101_ratio``
+        controls whether the formulas are *scored* before chain building:
+
+        * **alpha101_ratio > 0** (default): loads the Alpha101 library (98
+          formulas), scores all on the TRAIN backtester, and builds chains
+          ordered by |IC|.  This is the expensive path (98 parallel
+          evaluations) but provides IC-ranked inspiration.
+
+        * **alpha101_ratio == 0**: loads the Alpha101 library but **skips
+          scoring** — all formulas get IC=0.0 placeholder (matching FAMA's
+          ``_seed_clusters_from_formula_map``).  Chains are built in
+          arbitrary order (uniform IC), but the LLM still receives real
+          formula expressions to evolve.  The expensive 98-factor
+          evaluation is avoided entirely.
+
+        Args:
+            backtester: TRAIN FactorBacktester for scoring (when
+                alpha101_ratio > 0) and for evaluating LLM-generated factors
+                (always).
+            max_workers: Parallel workers for Alpha101 scoring (0 = auto).
+                Ignored when alpha101_ratio == 0.
+            n_iters: Mining iterations (each walks every family chain).
+            n_per_iter: Factors requested per LLM call.
+            max_chain_len: Max chain length per family (top-N by |IC|).
+            temperature: LLM sampling temperature.
+            alpha101_ratio: 0 = load formulas without scoring (IC=0.0
+                placeholder); >0 = load + score Alpha101 library.
+            alpha101_top_k: Number of Stage-1 Alpha101 library factors
+                (top by |IC|) to return alongside the LLM-mined factors.
+                0 = return LLM-mined factors only (legacy behavior).
+
+        Returns:
+            List of CandidateFactor objects — top-k Alpha101 library factors
+            (Stage 1) plus all LLM-mined factors (Stage 2), deduped by
+            expression.
+        """
+        if not self.use_llm or not self.client:
+            print("  [alpha101-mining] LLM not available; skipping mining.")
+            return []
+
+        # --- 0. Load Alpha101 library + optionally score it ---
+        inspiration_source = "Alpha101 library"
+        try:
+            from methods.alpha101 import get_alpha101_formulas
+        except Exception as e:
+            print(f"  [alpha101-mining] Cannot import Alpha101 "
+                  f"library ({e}).")
+            return []
+
+        formulas = get_alpha101_formulas()
+        if not formulas:
+            print("  [alpha101-mining] Alpha101 library is empty; "
+                  "skipping.")
+            return []
+
+        if alpha101_ratio > 0:
+            # Score all formulas on TRAIN data for IC-ranked chains
+            a101_factors = [
+                CandidateFactor(
+                    id=f"a101_{fid}",
+                    expression=expr,
+                    description=f"Alpha101 {fid}",
+                    generation=0,
+                    family=_infer_family(expr),
+                )
+                for fid, expr in formulas.items()
+            ]
+            print(f"  [alpha101-mining] Loaded {len(a101_factors)} Alpha101 "
+                  f"expressions; scoring on TRAIN data...")
+
+            _mw = (max_workers if max_workers > 0
+                   else max(1, min(32, (os.cpu_count() or 4) + 4)))
+            metrics_list = backtester.evaluate_batch(
+                a101_factors, max_workers=_mw, parallel=True)
+
+            scored_expressions: List[Tuple[str, float]] = []
+            for f, m in zip(a101_factors, metrics_list):
+                ic = m.get('ic', float('nan'))
+                if not np.isnan(ic):
+                    scored_expressions.append((f.expression, ic))
+
+            # Stage-1 library factors (raw Alpha101 formulas) — scored and kept
+            # for joint evaluation with the LLM-mined Stage-2 factors.
+            lib_factors = []
+            for f, m in zip(a101_factors, metrics_list):
+                ic = m.get('ic', float('nan'))
+                if not np.isnan(ic):
+                    f.ic = ic
+                    lib_factors.append(f)
+
+            if not scored_expressions:
+                print("  [alpha101-mining] No valid Alpha101 factors "
+                      "scored; skipping mining.")
+                return []
+
+            print(f"  [alpha101-mining] {len(scored_expressions)} valid "
+                  f"scored expressions → building inspiration chains...")
+        else:
+            # Skip scoring — use all formulas with IC=0.0 placeholder
+            # (matches FAMA's _seed_clusters_from_formula_map)
+            scored_expressions = [
+                (expr, 0.0) for expr in formulas.values()
+            ]
+            # Stage-1 library factors (raw Alpha101 formulas) — IC=0.0
+            # placeholder; returned for joint eval if alpha101_top_k > 0.
+            lib_factors = [
+                CandidateFactor(
+                    id=f"a101_{fid}",
+                    expression=expr,
+                    description=f"Alpha101 {fid}",
+                    generation=0,
+                    family=_infer_family(expr),
+                )
+                for fid, expr in formulas.items()
+            ]
+            print(f"  [alpha101-mining] alpha101_ratio=0: loaded "
+                  f"{len(scored_expressions)} Alpha101 formulas "
+                  f"(scoring skipped, IC=0.0 placeholder) → building "
+                  f"inspiration chains...")
+
+        # --- Select top-k Stage-1 Alpha101 library factors to return ---
+        # Raw Alpha101 formulas returned for joint evaluation with the
+        # LLM-mined Stage-2 factors. alpha101_top_k <= 0 disables returning
+        # library factors (LLM-mined only, as before).
+        _top_k = int(alpha101_top_k)
+        if _top_k > 0 and lib_factors:
+            lib_factors.sort(
+                key=lambda x: abs(getattr(x, 'ic', 0.0) or 0.0), reverse=True)
+            top_k_lib = lib_factors[:_top_k]
+        else:
+            top_k_lib = []
+        for f in top_k_lib:
+            f._from_alpha101 = True
+            f._from_alpha101_lib = True
+
+        # --- 1. Group by family and build initial chains ---
+        from collections import defaultdict
+        family_buckets: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for expr, ic in scored_expressions:
+            if np.isnan(ic):
+                continue
+            fam = _infer_family(expr)
+            family_buckets[fam].append((expr, ic))
+
+        # Sort each family by |IC| desc, keep top max_chain_len
+        chains: Dict[str, List[Tuple[str, float]]] = {}
+        for fam, items in family_buckets.items():
+            items.sort(key=lambda x: abs(x[1]), reverse=True)
+            chains[fam] = items[:max_chain_len]
+
+        if not chains:
+            print("  [alpha101-mining] No valid family chains built.")
+            return []
+
+        print(f"\n  [alpha101-mining] {len(chains)} family chains, "
+              f"{n_iters} iterations, {n_per_iter} factors/call")
+        print(f"  [alpha101-mining] Families: {', '.join(chains.keys())}")
+
+        # Track all known expressions to avoid re-evaluating duplicates
+        known = {expr for expr, _ in scored_expressions}
+        mined_factors: List[CandidateFactor] = []
+        mine_counter = 0
+
+        for iteration in range(1, n_iters + 1):
+            new_this_iter = 0
+            for fam, chain in chains.items():
+                if not chain:
+                    continue
+
+                # Build the LLM prompt with this family's chain as improve_path
+                chain_exprs = [expr for expr, _ in chain[:max_chain_len]]
+                chain_ics = [f"{ic:+.4f}" for _, ic in chain[:max_chain_len]]
+
+                system_prompt = (
+                    "You are an alpha-mining agent specializing in A-share stock "
+                    "selection. You are given a chain of top-performing "
+                    f"{inspiration_source} "
+                    "factor expressions (ordered by improving performance) and "
+                    "must generate NEW, different factor expressions inspired by "
+                    "them.\n\n"
+                    + _FUNCTION_WHITELIST_STR + "\n\n"
+                    + _ALLOWED_FIELDS_STR + "\n\n"
+                    "Supported operators: +, -, *, /, ^\n"
+                    "Supported comparisons: <, >, <=, >=, ==, !=\n"
+                    "Ternary: if(condition, value_if_true, value_if_false)\n\n"
+                    "RULES:\n"
+                    "1. Each new factor MUST be different from every input factor.\n"
+                    "2. Do NOT just wrap an input in rank() or negate it — combine "
+                    "ideas from multiple chain factors or use a different operator.\n"
+                    "3. Use ONLY the functions and data fields listed above.\n"
+                    "4. Each factor should have clear economic intuition.\n"
+                    "5. Return a JSON object: {\"factors\": [{\"expression\": \"...\", "
+                    "\"description\": \"...\"}, ...]}\n"
+                    "6. Return ONLY the JSON object — no markdown, no explanation."
+                )
+
+                user_prompt = (
+                    f"Generate {n_per_iter} NEW factor expressions inspired by "
+                    f"the following {inspiration_source} factor chain "
+                    f"(family: {fam}).\n\n"
+                    f"The chain shows factors ordered by improving performance "
+                    f"(IC values in parentheses). Use these as inspiration to "
+                    f"create novel expressions:\n\n"
+                )
+                for i, (expr, ic) in enumerate(chain[:max_chain_len]):
+                    user_prompt += f"  Factor {i+1} (IC={ic:+.4f}): {expr}\n"
+
+                user_prompt += (
+                    f"\nGenerate {n_per_iter} NEW expressions. Each must be "
+                    f"algebraically distinct from the inputs above and from "
+                    f"each other. Return JSON: "
+                    f'{{"factors": [{{"expression": "...", "description": "..."}}]}}'
+                )
+
+                # --- LLM call with per-iteration error isolation ---
+                try:
+                    raw = self._call_llm(
+                        system_prompt, user_prompt,
+                        temperature=temperature, expect_json=True,
+                    )
+                    factors_json = self._parse_llm_json(raw)
+                except Exception as e:
+                    print(f"  [alpha101-mining iter {iteration} {fam}] "
+                          f"LLM call failed: {e}")
+                    continue
+
+                if not factors_json:
+                    print(f"  [alpha101-mining iter {iteration} {fam}] "
+                          f"No factors parsed from LLM response.")
+                    continue
+
+                # --- Validate + evaluate each new expression ---
+                for f_data in factors_json:
+                    if not isinstance(f_data, dict) or "expression" not in f_data:
+                        continue
+                    expr = self._fix_parentheses(f_data["expression"])
+
+                    # Skip duplicates of known expressions
+                    if expr in known:
+                        continue
+
+                    # Skip expressions with invalid data fields
+                    _ok, _bad = _validate_factor_expr(expr)
+                    if not _ok:
+                        print(f"  [alpha101-mining] Skipping invalid expr "
+                              f"({_bad}): {expr[:80]}")
+                        continue
+
+                    known.add(expr)
+
+                    # Evaluate on the TRAIN backtester
+                    factor = CandidateFactor(
+                        id=f"a101_mined_{mine_counter}",
+                        expression=expr,
+                        description=f_data.get("description",
+                                               f"{inspiration_source}-inspired ({fam})"),
+                        generation=iteration,
+                        family=_infer_family(expr),
+                    )
+                    mine_counter += 1
+
+                    try:
+                        metrics = backtester.evaluate(factor)
+                    except Exception as e:
+                        print(f"  [alpha101-mining] Eval error for "
+                              f"{expr[:60]}: {e}")
+                        continue
+
+                    ic = metrics.get('ic', float('nan'))
+                    if np.isnan(ic):
+                        continue
+
+                    factor.ic = ic
+                    factor.icir = metrics.get('icir', 0.0)
+                    factor.sharpe = metrics.get('sharpe', 0.0)
+                    factor.is_valid = metrics.get('is_valid', True)
+                    mined_factors.append(factor)
+                    new_this_iter += 1
+
+                    # Update chain: add new factor, keep top by |IC|
+                    updated = chain + [(expr, ic)]
+                    updated.sort(key=lambda x: abs(x[1]), reverse=True)
+                    chains[fam] = updated[:max_chain_len]
+
+                    print(f"  [alpha101-mining iter {iteration} {fam}] "
+                          f"IC={ic:+.4f} | {expr[:80]}")
+
+            if new_this_iter == 0:
+                print(f"  [alpha101-mining iter {iteration}] "
+                      f"No new valid factors generated.")
+            else:
+                print(f"  [alpha101-mining iter {iteration}] "
+                      f"Generated {new_this_iter} new valid factors.")
+
+        # Deduplicate mined factors by expression
+        seen_exprs = set()
+        unique_factors = []
+        for f in mined_factors:
+            if f.expression not in seen_exprs:
+                seen_exprs.add(f.expression)
+                unique_factors.append(f)
+
+        # Combine Stage-1 (Alpha101 library top-k) + Stage-2 (LLM-mined),
+        # deduping across both so a library formula that was also mined is
+        # not doubled.
+        combined = list(top_k_lib)
+        combined_seen = {f.expression for f in combined}
+        for f in unique_factors:
+            if f.expression not in combined_seen:
+                combined_seen.add(f.expression)
+                combined.append(f)
+
+        print(f"\n  [alpha101-mining] Complete: {len(top_k_lib)} Stage-1 "
+              f"library factors + {len(unique_factors)} Stage-2 LLM-mined "
+              f"= {len(combined)} total returned "
+              f"(from {n_iters} iterations).")
+        return combined
+
     def _generate_factors_rule_based(self, n_factors: int) -> List[CandidateFactor]:
         """
         Generate factors using rule-based method (fallback when LLM is unavailable).
@@ -2762,6 +3554,18 @@ Ensure expressions are valid and can be evaluated by the factor engine."""
             if improved_factors is None:
                 print(f"  [evolve] Using rule-based factor improvement.")
                 improved_factors = self._generate_improvements_rule_based(top_factors)
+
+            # Enforce the configured per-round budget. Both the LLM path (capped
+            # internally at L3222) and the rule-based fallback (which emits
+            # n_mutate * len(top_factors) candidates + depth/family-gap variants,
+            # i.e. potentially 100+ for 20 top factors) must yield at most
+            # `n_improve` improved factors per round. Without this single
+            # authority, the next round evaluates an unbounded number of factors
+            # and the cost compounds every iteration. This matches the config
+            # contract: evolution.n_improve = "target number of improved factors
+            # per round".
+            if self.n_improve and len(improved_factors) > self.n_improve:
+                improved_factors = improved_factors[: self.n_improve]
 
             # Record evolution round (store evaluated factors only)
             round_best_ic = max((f.ic for f in evaluated_factors if not np.isnan(f.ic)),
@@ -3164,7 +3968,7 @@ Please generate improved factors now. Return only the JSON object, no other text
                 # waste a backtest slot.
                 _ok, _bad = _validate_factor_expr(expr)
                 if not _ok:
-                    print(f"  [evolve] Skipping improved factor with unknown field(s) "
+                    print(f"  [evolve] Skipping improved factor — invalid: "
                           f"{_bad}: {expr}")
                     continue
                 # Find parent factor

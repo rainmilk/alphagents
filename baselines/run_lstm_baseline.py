@@ -516,7 +516,7 @@ def run_lstm_baseline(
     test_end_date: Optional[str] = None,
     universe: Optional[str] = None,
     context_days: int = 30,
-    top_n_stocks: int = 50,
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
     seq_len: int = 20,
     hidden_size: int = 64,
     num_layers: int = 2,
@@ -560,6 +560,11 @@ def run_lstm_baseline(
         forward_period = _ev_cfg.get('forward_period', 10)
     if not holding_period or holding_period <= 0:
         holding_period = _bt_cfg.get('holding_period', 1)
+    # ── Resolve top_n_stocks (portfolio size knob) from config ──────
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # Single knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
 
     # -- Step 2: Determine train/test split (config-backed) --
     train_start = train_start_date or loader.data_config.get(
@@ -769,8 +774,7 @@ if __name__ == '__main__':
                         help='Train end date (YYYY-MM-DD)')
     parser.add_argument('--test-start', default=None,
                         help='Test start date (YYYY-MM-DD)')
-    parser.add_argument('--top-n', type=int, default=50,
-                        help='Number of stocks in portfolio')
+    parser.add_argument('--top-n', type=int, default=None, help='Portfolio size (default: config fusion.portfolio.top_n)')
     parser.add_argument('--seq-len', type=int, default=20,
                         help='LSTM lookback window (trading days)')
     parser.add_argument('--hidden-size', type=int, default=64,

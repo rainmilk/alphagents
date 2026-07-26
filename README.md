@@ -245,13 +245,16 @@ Options:
   --end DATE               End date for real data (default: 2024-12-31)
   --universe {hs300,zz500,all_a}
                            Stock universe for real data (default: hs300)
-  --alpha101-top-k N       Step 4c Alpha101 retrieval top-k: score the whole Alpha101 library on TRAIN data and merge the top-k into the candidate pool for Step 5 (default: config alpha101_top_k). Alpha101 is no longer seeded in Step 3.
-  --alpha101-max-workers N Step 4c parallel worker count for scoring the Alpha101 library (default: config alpha101_max_workers; 0 = auto = min(32, cpu_count()+4)).
-  --n-seeds N              [legacy] Convenience: set alpha101_top_k (Step 4c Alpha101 retrieval top-k). Prefer --alpha101-top-k.
+  --alpha101-top-k N       [deprecated] No longer used — raw Alpha101 library factors are not merged into the pool. Step 4c now does LLM mining only. Kept for backward CLI compat.
+  --alpha101-max-workers N Step 4c parallel worker count for scoring the Alpha101 library inside llm_mine_alpha101_inspired (default: config alpha101_max_workers; 0 = auto = min(32, cpu_count()+4)).
+  --n-seeds N              [deprecated] No longer used. Kept for backward CLI compat.
+  --retrieve-alpha101      Enable Step 4c: LLM mining of Alpha101-inspired factors (score library → build chains → LLM evolves novel expressions). Only LLM-generated factors enter the pool.
+  --no-retrieve-alpha101   Disable Step 4c (skip Alpha101 LLM mining).
   --n-seeds-hypothesis N   Number of hypothesis-driven seed factors (default: config)
   --n-seeds-memory-augment N Number of memory-augmented seed factors (default: config; 0 = off)
   --n-evolution-rounds N   Override evolution.max_rounds from config (default: 5)
   --n-best-factors N       Override evolution.n_best_factors from config
+  --n-best4debate N       Step 4d: keep top-N factors by |train IC| before Step 5 (0=disabled)
   --forward-period N       Forward return horizon in trading days (None → config or 20)
   --holding-period N       Backtest holding period: 1=daily, 5=weekly, 20=monthly
   --factor-path PATH       Path to final_factors.json for --test mode

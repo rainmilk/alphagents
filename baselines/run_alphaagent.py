@@ -1502,6 +1502,7 @@ def run_alphaagent_baseline(
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['holding_period'] or 1
     portfolio_method: str = "score_proportional",
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
 ) -> Dict:
     """
     Run AlphaAgent baseline using the main project's DataLoader.
@@ -1563,6 +1564,11 @@ def run_alphaagent_baseline(
         forward_period = config.get('evolution', {}).get('forward_period', 10)
     if not holding_period or holding_period <= 0:
         holding_period = config.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+    # ── Resolve top_n_stocks (portfolio size knob) from config ──────
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # This is the SINGLE knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
     _fp = forward_period
     _hp = holding_period
     param_dir = f"{_u}_{_s}_{_e}_forward-{_fp}_holding-{_hp}"
@@ -1694,6 +1700,7 @@ def run_alphaagent_baseline(
         test_start_date=test_start_date,
         end_date=test_end_date,
         portfolio_method=portfolio_method,
+        top_n_stocks=top_n_stocks,
     )
 
     if portfolios.empty:
@@ -1829,6 +1836,9 @@ if __name__ == "__main__":
     parser.add_argument("--holding-period", type=int, default=None,
                         help="Portfolio holding period in days for backtest "
                              "(default: config['backtest']['holding_period'], 1 = daily rebalance)")
+    parser.add_argument("--top-n", type=int, default=None,
+                        help="Number of stocks in the portfolio each day "
+                             "(default: config['fusion']['portfolio']['top_n'], 50)")
     args = parser.parse_args()
 
     run_alphaagent_baseline(
@@ -1843,4 +1853,5 @@ if __name__ == "__main__":
         use_llm=not args.no_llm,
         forward_period=args.forward_period,
         holding_period=args.holding_period,
+        top_n_stocks=args.top_n,
     )

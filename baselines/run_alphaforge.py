@@ -1495,7 +1495,7 @@ def run_alphaforge_baseline(
             if instruments is None:
                 instruments = config['data']['universe'].get('index', 'csi300')
             if top_n_stocks is None:
-                top_n_stocks = config.get('backtest', {}).get('top_n_stocks', 50)
+                top_n_stocks = config.get('fusion', {}).get('portfolio', {}).get('top_n', 50)
         except Exception as e:
             print(f"Warning: Could not load config from {config_path}: {e}")
             # Use defaults

@@ -58,6 +58,7 @@ def run_mcts_llm_alpha_baseline(
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     seed: int = 42,                # Seeds Python's `random` (random formula init / rollouts)
     portfolio_method: str = "score_proportional",
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
 ) -> Dict:
     """
     Run MCTS-LLM-Alpha baseline using the main project's DataLoader.
@@ -100,6 +101,11 @@ def run_mcts_llm_alpha_baseline(
         forward_period = _ev_cfg.get('forward_period', 10)
     if not holding_period or holding_period <= 0:
         holding_period = _bt_cfg.get('holding_period', 1)
+    # ── Resolve top_n_stocks (portfolio size knob) from config ──────
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # Single knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
 
     method_name = "mcts_llm"
     _u = data_cfg.get('index', 'hs300')  # mcts default universe (not exposed via CLI)
@@ -370,6 +376,7 @@ def run_mcts_llm_alpha_baseline(
             save_dir=run_dir,
             holding_period=holding_period if holding_period is not None else mcts_config.holding_period,
             portfolio_method=portfolio_method,
+            top_n_stocks=top_n_stocks,
         )
 
     # ── Save results ──────────────────────────────────────────────
@@ -680,6 +687,8 @@ def parse_args():
                         help='Forward return period in days (default: config evolution.forward_period, 10)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Portfolio holding period in days for backtest (default: config value, 1 = daily rebalance)')
+    parser.add_argument('--top-n', type=int, default=None,
+                        help='Number of stocks in portfolio each day (default: config fusion.portfolio.top_n, 50)')
     # Seed default from config.yaml ('seed') so the CLI honors the global field.
     _seed_default = 42
     try:
@@ -707,5 +716,6 @@ if __name__ == "__main__":
         forward_period=args.forward_period,
         holding_period=args.holding_period,
         seed=args.seed,
+        top_n_stocks=args.top_n,
     )
     print("\nDone!")

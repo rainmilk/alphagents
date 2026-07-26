@@ -163,3 +163,14 @@ def list_alpha101_ids() -> List[str]:
     """Return the list of Alpha101 ids currently included in the library."""
     return list(ALPHA101_FORMULAS.keys())
 
+
+# Pre-compile every Alpha101 DSL expression into a cached callable so Step 4c
+# (and any later re-evaluation of these fixed factors) executes bytecode
+# instead of re-parsing the DSL string. Guarded: if the compiler is
+# unavailable the slow interpreter path is used transparently.
+try:
+    from methods.evolve import precompile_alpha101
+    precompile_alpha101()
+except Exception:
+    pass
+

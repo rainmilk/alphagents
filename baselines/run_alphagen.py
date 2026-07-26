@@ -1340,7 +1340,7 @@ def run_alphagen_baseline(
     universe: Optional[str] = None,
     n_generate: int = 300,
     pool_capacity: int = 20,
-    top_n_stocks: int = 50,
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
     holding_period: Optional[int] = None,
     seed: int = 42,
     output_dir: Optional[str] = None,
@@ -1428,6 +1428,11 @@ def run_alphagen_baseline(
         forward_period = _ev_cfg.get('forward_period', 10)
     if not holding_period or holding_period <= 0:
         holding_period = _bt_cfg.get('holding_period', 1)
+    # ── Resolve top_n_stocks (portfolio size knob) from config ──────
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # Single knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
     train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
     test_start = test_start_date or loader.data_config.get('test_start_date', '2024-01-01')
@@ -1741,7 +1746,7 @@ if __name__ == '__main__':
     parser.add_argument('--test-start', default=None, help='Test start date')
     parser.add_argument('--n-generate', type=int, default=300, help='Factors to generate (random only)')
     parser.add_argument('--pool-capacity', type=int, default=20, help='Pool capacity')
-    parser.add_argument('--top-n', type=int, default=50, help='Portfolio size')
+    parser.add_argument('--top-n', type=int, default=None, help='Portfolio size (default: config fusion.portfolio.top_n)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output-dir', default='experiments/alphagen', help='Output directory')
     

@@ -308,7 +308,7 @@ def run_xgboost_simple(
     test_end_date: Optional[str] = None,
     universe: Optional[str] = None,
     context_days: int = 30,
-    top_n_stocks: int = 50,
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
     n_estimators: int = 200,
     max_depth: int = 5,
     learning_rate: float = 0.05,
@@ -343,6 +343,12 @@ def run_xgboost_simple(
     # -- Resolve forward_period: explicit arg > config.yaml > default 10 --
     if not forward_period or forward_period <= 0:
         forward_period = loader.config.get('evolution', {}).get('forward_period', 10)
+
+    # -- Resolve top_n_stocks (portfolio size knob) from config --
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # Single knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
 
     # -- Step 2: Determine train/test split (config-backed) --
     train_start = train_start_date or loader.data_config.get(
@@ -557,8 +563,7 @@ if __name__ == '__main__':
                         help='Train end date (YYYY-MM-DD)')
     parser.add_argument('--test-start', default=None,
                         help='Test start date (YYYY-MM-DD)')
-    parser.add_argument('--top-n', type=int, default=50,
-                        help='Number of stocks in portfolio')
+    parser.add_argument('--top-n', type=int, default=None, help='Portfolio size (default: config fusion.portfolio.top_n)')
     parser.add_argument('--n-estimators', type=int, default=200,
                         help='Number of boosting rounds')
     parser.add_argument('--max-depth', type=int, default=5,

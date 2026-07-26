@@ -1198,7 +1198,7 @@ def run_alphagrail_baseline(
     test_start_date: Optional[str] = None,
     test_end_date: Optional[str] = None,
     universe: Optional[str] = None,
-    top_n_stocks: int = 50,
+    top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
     holding_period: Optional[int] = None,
     use_llm_tournament: bool = False,
     forward_period: Optional[int] = None,
@@ -1262,6 +1262,11 @@ def run_alphagrail_baseline(
         forward_period = _ev_cfg.get('forward_period', 10)
     if not holding_period or holding_period <= 0:
         holding_period = _bt_cfg.get('holding_period', 1)
+    # ── Resolve top_n_stocks (portfolio size knob) from config ──────
+    # explicit arg > config.yaml['fusion']['portfolio']['top_n'] > default 50.
+    # Single knob shared by MASE step7 and all 9 baselines.
+    if top_n_stocks is None:
+        top_n_stocks = int(loader.config.get('fusion', {}).get('portfolio', {}).get('top_n', 50))
     print(f"  Forward period: {forward_period}d | Holding period: {holding_period}d")
     train_start = train_start_date or loader.data_config.get('train_start_date', '2023-01-01')
     train_end = train_end_date or loader.data_config.get('train_end_date', '2023-12-31')
@@ -1559,8 +1564,8 @@ if __name__ == '__main__':
                         help='Train end date (YYYY-MM-DD)')
     parser.add_argument('--test-start', default=None,
                         help='Test start date (YYYY-MM-DD)')
-    parser.add_argument('--top-n', type=int, default=50,
-                        help='Number of stocks in portfolio')
+    parser.add_argument('--top-n', type=int, default=None,
+                        help='Number of stocks in portfolio (default: config fusion.portfolio.top_n)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Rebalance frequency (1=daily, 5=weekly)')
     parser.add_argument('--use-llm', action='store_true',

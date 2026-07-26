@@ -611,6 +611,8 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_alphagrail_baseline(
             portfolio_method=method,
             config_path=self.config_path,
@@ -619,7 +621,7 @@ class ExperimentRunner:
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,
-            top_n_stocks=50,
+            top_n_stocks=top_n,
             holding_period=holding_period,
             forward_period=forward_period,
             use_llm_tournament=False,
@@ -669,6 +671,8 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_mcts_llm_alpha_baseline(
             portfolio_method=method,
             config_path="config/config.yaml",
@@ -678,6 +682,7 @@ class ExperimentRunner:
             forward_period=forward_period,
             holding_period=holding_period,
             seed=seed,
+            top_n_stocks=top_n,
         )
 
         metrics = results.get('metrics', {})
@@ -728,8 +733,10 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_alphafama_baseline(
             portfolio_method=method,
+            top_n=top_n,
             config_path="config/config.yaml",
             train_start_date=start_date,
             test_end_date=end_date,
@@ -787,6 +794,8 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_alphaagent_baseline(
             portfolio_method=method,
             config_path="config/config.yaml",
@@ -799,6 +808,7 @@ class ExperimentRunner:
             test_start_date=test_start,
             forward_period=forward_period,
             holding_period=holding_period,
+            top_n_stocks=top_n,
         )
 
         return {
@@ -839,7 +849,7 @@ class ExperimentRunner:
                 train_start_date=self.config['data'].get('train_start_date', '2023-01-01'),
                 test_end_date=self.config['data'].get('test_end_date', '2025-06-30'),
                 instruments=self.config['data']['universe'].get('name', 'csi300'),
-                top_n_stocks=self.config.get('backtest', {}).get('top_n_stocks', 50),
+                top_n_stocks=int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50)),
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
                 # Keep AlphaForge's 5-seed variance-reduction averaging, but
                 # base the seed list on the global config seed so it is fully
@@ -910,6 +920,8 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_xgboost_baseline(
             portfolio_method=method,
             config_path=self.config_path,
@@ -918,7 +930,7 @@ class ExperimentRunner:
             universe=universe,
             train_end_date=train_end,
             test_start_date=test_start,
-            top_n_stocks=50,
+            top_n_stocks=top_n,
             n_estimators=200,
             max_depth=5,
             learning_rate=0.05,
@@ -967,6 +979,8 @@ class ExperimentRunner:
         seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
+        # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
+        top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
         results = run_alphagen_baseline(
             portfolio_method=method,
             config_path=self.config_path,
@@ -977,7 +991,7 @@ class ExperimentRunner:
             test_start_date=test_start,
             n_generate=300,
             pool_capacity=20,
-            top_n_stocks=50,
+            top_n_stocks=top_n,
             holding_period=holding_period,
             forward_period=forward_period,
             seed=seed,
