@@ -538,11 +538,40 @@ class AAAI2027Pipeline:
                     self.config['evolution'].get('use_fama101_bridge', False))
                 fama_factors = []  # defined even when bridge is off
                 if use_fama101_bridge:
-                    _px = self.price_data
+                    # ── Restrict compute to the train+test span (with warm-up) ──
+                    # self.price_data is bundle.full = the ENTIRE archive, which is
+                    # usually wider than the experiment window: it carries pre-train
+                    # rows (if full_start < train_start) and post-test rows
+                    # (test_end → archive_end). Those dates are NEVER IC-scored or
+                    # backtested, so computing factors on them is pure waste.
+                    # We compute only on [train_start - context_days, test_end]:
+                    #   • the context_days warm-up before train_start mirrors the
+                    #     test context window split_data() already prepends, so the
+                    #     train-boundary factor values stay correct (Alpha101's
+                    #     longest rolling window is ~20d, well under context_days);
+                    #   • post-test rows are dropped outright (the only future-
+                    #     dependent column, forward_return, is unused downstream).
+                    # Alpha101 factors are causal (ts_*/delay/returns read only past
+                    # data), so this scope change introduces NO test leakage and the
+                    # in-window values remain bit-identical to a full-series compute.
+                    full_idx = self.price_data['close'].index
+                    ts_idx = pd.to_datetime(full_idx)
+                    ctx = int(getattr(self, '_context_days', 30))
+                    if self._train_start_date:
+                        _pos = int(ts_idx.searchsorted(
+                            pd.Timestamp(self._train_start_date)))
+                        _warm_start = ts_idx[max(0, _pos - ctx)]
+                    else:
+                        _warm_start = ts_idx[0]
+                    _end = (pd.Timestamp(self._test_end_date)
+                            if self._test_end_date else ts_idx[-1])
+                    _px = {k: v.loc[slice(_warm_start, _end)]
+                           for k, v in self.price_data.items()}
                     _n_dt, _n_tkr = _px['close'].shape[0], _px['close'].shape[1]
                     print(f"  [alpha101] FAMA-101 bridge: computing Alpha101 "
-                          f"exposures (forward_period={fwd}) on price_data "
-                          f"({_n_dt} dates × {_n_tkr} tickers)...")
+                          f"exposures (forward_period={fwd}) on train+test span "
+                          f"with {ctx}d warm-up ({_n_dt} dates × {_n_tkr} tickers; "
+                          f"full archive = {len(full_idx)} dates)...")
                     try:
                         from methods.fama_alpha101_bridge import (
                             compute_fama101_exposures,
@@ -551,7 +580,7 @@ class AAAI2027Pipeline:
                         from concurrent.futures import ThreadPoolExecutor
 
                         exposures = compute_fama101_exposures(
-                            self.price_data, forward_period=fwd)
+                            _px, forward_period=fwd)
                         train_dates = self.train_data['price_data']['close'].index
                         train_slices = slice_exposures_to_dates(exposures, train_dates)
 
