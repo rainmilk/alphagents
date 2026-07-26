@@ -121,7 +121,7 @@ llm:
     
 # ==================== Evolution Configuration [ALL ACTIVE] ====================
 evolution:
-  forward_period: 10   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
+  forward_period: 5   # [ACTIVE] forward return horizon in trading days (aligned with all other baselines)
   use_fama101_bridge: true     # [ACTIVE] Step 3: use FAMA's OWN Alpha101 code (convert_price_data_to_alphafama + AlphaFactory.all_alphas) as the Stage-1 Alpha101 library during factor generation, injected as precomputed panels so MASE's Alpha101 factors are bit-for-bit identical to FAMA's. All 82 factors go to post_debate (skip evolution+debate). Set false to revert to MASE's legacy 98-formula DSL library.
   n_seeds_hypothesis: 15        # [ACTIVE] hypothesis-driven seed factors (Stage1→Stage2); produced whenever > 0
   alpha101_top_k: 20            # [ACTIVE] Step 3: number of Stage-1 Alpha101 library factors (top by |IC|) returned alongside the LLM-mined Stage-2 factors for joint evaluation in the pool. 0 = return LLM-mined factors only.

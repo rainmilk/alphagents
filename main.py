@@ -371,11 +371,19 @@ class AAAI2027Pipeline:
         
     def step3_generate_factors(
         self,
+        forward_period: int = None,
     ):
         """
         Step 3: Generate factors using LLM.
 
         The number of factors is read from config: evolution.n_seed_factors
+
+        Args:
+            forward_period: Forward return horizon in trading days
+                            (None → config['evolution']['forward_period'] or 10).
+                            Threaded from args.forward_period via run_full_pipeline
+                            so the CLI --forward-period flag is honored in Step 3
+                            (previously Step 3 read config directly and ignored it).
 
         Memory augmentation is enabled implicitly when ``n_seeds_memory_augment > 0``
         (read from config) AND the memory bank has at least one entry. Set the
@@ -390,6 +398,16 @@ class AAAI2027Pipeline:
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
         n_shots = evo_cfg.get('n_shots', 3)
+
+        # Resolve forward_period: explicit arg > config.yaml > default 10.
+        # Mirrors step4_evolve_factors / step1_load_data so Step 3 uses the same
+        # horizon that may have been overridden via args.forward_period, instead
+        # of silently reading config and ignoring the CLI flag. Persist to
+        # self._forward_period for downstream steps (step6 reads it).
+        if forward_period is None:
+            forward_period = self.config.get('evolution', {}).get('forward_period', 10)
+        fwd = forward_period
+        self._forward_period = forward_period
 
         # Alpha101 library is loaded HERE during factor generation (not in
         # Step 3).  Library factors go to self._post_debate_factors (skip
@@ -504,7 +522,6 @@ class AAAI2027Pipeline:
                 train_price = self.train_data['price_data']
                 train_fund = self.train_data.get('fundamental_data', {})
                 import os as _os
-                fwd = self.config.get('evolution', {}).get('forward_period', 10)
                 bt = FactorBacktester(
                     prices=train_price,
                     fundamentals=train_fund,
@@ -1944,7 +1961,7 @@ class AAAI2027Pipeline:
             holding_period=holding_period,
         )
         self.step2_initialize_memory()
-        self.step3_generate_factors()
+        self.step3_generate_factors(forward_period=forward_period)
         self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
         self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
         self.step4d_select_top_factors()     # filter + rank → keep top n_best4debate for Step 5
