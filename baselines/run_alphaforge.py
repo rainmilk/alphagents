@@ -1225,7 +1225,7 @@ def stage3_evaluate_results(
     test_start: Optional[str] = None,
     test_end: Optional[str] = None,
     holding_period: Optional[int] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> Dict:
     """
     Stage 3: Evaluate results using the unified BacktestEngine.
@@ -1442,7 +1442,7 @@ def run_alphaforge_baseline(
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     context_days: int = 30,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> Dict:
     """
     Run complete AlphaForge baseline (all 3 stages).
@@ -1485,6 +1485,11 @@ def run_alphaforge_baseline(
         Dict: Results with metrics, used_gan, gan_pool_size, forward_period,
             train_end, test_start
     """
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
+
     # Load config if needed (for defaults)
     if config_path and (train_start_date is None or test_end_date is None or instruments is None or top_n_stocks is None):
         try:

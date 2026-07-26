@@ -1263,7 +1263,7 @@ def build_portfolios_from_ensemble(
     close: pd.DataFrame,
     top_n: int = 50,
     test_start_date: Optional[str] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from ensemble factor values.
@@ -1359,7 +1359,7 @@ def run_alphagen_baseline(
     ent_coef: float = 0.01,
     device: str = 'cpu',
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> Dict:
     """
     Run AlphaGen baseline — RL-based token factor generation.
@@ -1410,6 +1410,11 @@ def run_alphagen_baseline(
     """
     from dataloader.loader import DataLoader
     from backtest.engine import BacktestEngine
+
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
 
     print("=" * 60)
     print("  AlphaGen Baseline — RL-Based Token Factor Generation")

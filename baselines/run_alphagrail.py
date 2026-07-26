@@ -1120,7 +1120,7 @@ def build_portfolios_from_factor(
     factor_values: pd.DataFrame,
     top_n: int = 50,
     test_start_date: Optional[str] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> pd.DataFrame:
     """
     Build equal-weight long-only portfolios from factor scores.
@@ -1208,7 +1208,7 @@ def run_alphagrail_baseline(
                                # factor path uses no RNG (only the optional
                                # LLM tournament consumes it).
     output_dir: Optional[str] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> Dict:
     """
     Run AlphaGrail baseline using the main project's DataLoader.
@@ -1244,6 +1244,11 @@ def run_alphagrail_baseline(
     """
     from dataloader.loader import DataLoader
     from backtest.engine import BacktestEngine
+
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
 
     print("=" * 60)
     print("  AlphaGrail Baseline — LLM-Driven Alpha Selection (via Main DataLoader)")

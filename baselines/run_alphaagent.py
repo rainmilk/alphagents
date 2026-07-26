@@ -1384,7 +1384,7 @@ def simulate_factor_portfolio(
     end_date: str,
     top_n_factors: int = 10,
     top_n_stocks: int = 50,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> pd.DataFrame:
     """
     Construct daily portfolio weights from factor scores.
@@ -1503,7 +1503,7 @@ def run_alphaagent_baseline(
     use_llm: bool = True,
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['holding_period'] or 1
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
     top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
 ) -> Dict:
     """
@@ -1536,6 +1536,11 @@ def run_alphaagent_baseline(
         Dict with metrics, IC information, and factor details
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
 
     # ── Load config ─────────────────────────────────────────────────
     with open(config_path, 'r', encoding='utf-8') as f:

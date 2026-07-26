@@ -722,7 +722,7 @@ def run_alphafama_baseline(
     holding_period: Optional[int] = None,
     n_jobs: Optional[int] = None,
     seed: int = 42,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
     top_n: Optional[int] = None,
 ) -> Dict:
     """
@@ -777,6 +777,11 @@ def run_alphafama_baseline(
 
     # ── Clamp alpha101_ratio to a ratio in [0, 1] ─────────────────────
     _alpha101_ratio = max(0.0, min(1.0, float(alpha101_ratio)))
+
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
 
     print(f"  Alpha101 factor library: ratio={_alpha101_ratio:.2f} "
           f"({'DISABLED (LLM-only seeds)' if _alpha101_ratio == 0 else 'ENABLED — top-|IC| subset'})")
@@ -1362,7 +1367,7 @@ def _simulate_portfolio_from_ic(
     prices: pd.DataFrame,
     holding_period: int = 1,
     save_dir: Optional[str] = None,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
     top_n: int = 50,
     n_top_factors: int = 10,
     max_weight: float = DEFAULT_MAX_WEIGHT,

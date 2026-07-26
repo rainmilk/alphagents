@@ -57,7 +57,7 @@ def run_mcts_llm_alpha_baseline(
     forward_period: Optional[int] = None,  # None -> config['evolution']['forward_period'] (10)
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     seed: int = 42,                # Seeds Python's `random` (random formula init / rollouts)
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
     top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
 ) -> Dict:
     """
@@ -81,6 +81,11 @@ def run_mcts_llm_alpha_baseline(
         Dict with metrics: annual_return, sharpe_ratio, max_drawdown, etc.
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # Forced: every baseline holds an equal-weight (1/n) portfolio.
+    # MASE main.py step7 keeps score_proportional; this override ensures the
+    # portfolio_method argument / config method does not change baseline behaviour.
+    portfolio_method = "equal_weight"
 
     # Seed Python's global RNG so the random-formula initialization / rollout
     # tie-breaking (see _random_formula) is reproducible across runs. Without
@@ -496,7 +501,7 @@ def compute_portfolio_metrics(
     selected_params: Optional[Dict] = None,
     save_dir: Optional[str] = None,
     holding_period: int = 1,
-    portfolio_method: str = "score_proportional",
+    portfolio_method: str = "equal_weight",
 ) -> Dict[str, float]:
     """
     Compute portfolio-level metrics using the unified BacktestEngine.
