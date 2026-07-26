@@ -746,6 +746,25 @@ def generate_template_factors(
     return unique_factors[:n_factors]
 
 
+def _rankdata_numpy(a: np.ndarray) -> np.ndarray:
+    """Pure-numpy rankdata (average ties, 1-based), ~scipy.stats.rankdata."""
+    n = len(a)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    sorter = np.argsort(a)
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[sorter] = np.arange(1, n + 1, dtype=np.float64)
+    # Average ranks for ties
+    uq, inv, cnts = np.unique(a, return_inverse=True, return_counts=True)
+    if len(uq) < n:
+        # Cumulative sum of counts gives the right bound of each tie group
+        cumcnts = np.cumsum(cnts)
+        group_start = np.concatenate([[0], cumcnts[:-1]])
+        mean_rank = (group_start + cumcnts + 1) / 2.0
+        ranks = mean_rank[inv]
+    return ranks
+
+
 def evaluate_factor_expression(expr: str, prices_multindex: pd.DataFrame) -> pd.DataFrame:
     """
     Evaluate a factor expression on price data.
@@ -783,82 +802,92 @@ def evaluate_factor_expression(expr: str, prices_multindex: pd.DataFrame) -> pd.
         return pd.DataFrame(np.nan, index=close.index, columns=close.columns)
 
 
+def _mean_cross_sectional_pearson(f_2d: np.ndarray, r_2d: np.ndarray) -> float:
+    """
+    Vectorized mean cross-sectional Pearson correlation.
+
+    f_2d, r_2d: (n_dates, n_stocks) numpy arrays.
+    Returns mean of per-date corrcoef (ignoring dates with <10 valid stocks).
+    """
+    n_dates = f_2d.shape[0]
+    ic_values = []
+    for t in range(n_dates):
+        frow = f_2d[t]
+        rrow = r_2d[t]
+        mask = ~(np.isnan(frow) | np.isnan(rrow))
+        if mask.sum() < 10:
+            continue
+        c = np.corrcoef(frow[mask], rrow[mask])[0, 1]
+        if np.isfinite(c):
+            ic_values.append(c)
+    return np.mean(ic_values) if ic_values else 0.0
+
+
 def calculate_ic(factor_scores: pd.DataFrame, returns: pd.DataFrame) -> float:
     """
     Calculate Information Coefficient (IC) between factor and returns.
-    
+
+    Vectorized: avoids per-date DataFrame .loc overhead.
+
     Args:
         factor_scores: Factor values (date x symbol)
         returns: Return values (date x symbol)
-        
+
     Returns:
         float: Mean IC across all dates
     """
-    ic_values = []
-    
-    for date in factor_scores.index:
-        factor_valid = factor_scores.loc[date].dropna()
-        return_valid = returns.loc[date].dropna()
-        
-        # Align indices
-        common_idx = factor_valid.index.intersection(return_valid.index)
-        if len(common_idx) < 10:
-            continue
-            
-        factor_aligned = factor_valid[common_idx]
-        return_aligned = return_valid[common_idx]
-        
-        # Calculate Pearson correlation
-        try:
-            ic = np.corrcoef(factor_aligned, return_aligned)[0, 1]
-            if np.isfinite(ic):
-                ic_values.append(ic)
-        except Exception:
-            continue
-    
-    return np.mean(ic_values) if ic_values else 0.0
+    # Align to common index/columns, convert to numpy
+    common_idx = factor_scores.index.intersection(returns.index)
+    common_cols = factor_scores.columns.intersection(returns.columns)
+    if len(common_idx) < 2 or len(common_cols) < 10:
+        return 0.0
+    f = factor_scores.loc[common_idx, common_cols].values.astype(np.float64)
+    r = returns.loc[common_idx, common_cols].values.astype(np.float64)
+    return _mean_cross_sectional_pearson(f, r)
 
 
 def calculate_rank_ic(factor_scores: pd.DataFrame, returns: pd.DataFrame) -> float:
     """
     Calculate Rank IC (Spearman correlation) between factor and returns.
-    
-    Uses pure numpy implementation (no scipy dependency).
-    
+
+    Vectorized: avoids per-date DataFrame .loc overhead. Uses numpy rankdata
+    (or scipy.stats.rankdata if available for speed).
+
     Args:
         factor_scores: Factor values (date x symbol)
         returns: Return values (date x symbol)
-        
+
     Returns:
         float: Mean Rank IC across all dates
     """
+    # Align to common index/columns, convert to numpy
+    common_idx = factor_scores.index.intersection(returns.index)
+    common_cols = factor_scores.columns.intersection(returns.columns)
+    if len(common_idx) < 2 or len(common_cols) < 10:
+        return 0.0
+    f = factor_scores.loc[common_idx, common_cols].values.astype(np.float64)
+    r = returns.loc[common_idx, common_cols].values.astype(np.float64)
+
+    # Lazy import scipy rankdata for tie-aware ranking (faster)
+    try:
+        from scipy.stats import rankdata as _scipy_rankdata
+        _rk = _scipy_rankdata
+    except ImportError:
+        _rk = _rankdata_numpy
+
+    n_dates = f.shape[0]
     rank_ic_values = []
-    
-    for date in factor_scores.index:
-        factor_valid = factor_scores.loc[date].dropna()
-        return_valid = returns.loc[date].dropna()
-        
-        # Align indices
-        common_idx = factor_valid.index.intersection(return_valid.index)
-        if len(common_idx) < 10:
+    for t in range(n_dates):
+        frow = f[t]
+        rrow = r[t]
+        mask = ~(np.isnan(frow) | np.isnan(rrow))
+        if mask.sum() < 10:
             continue
-            
-        factor_aligned = factor_valid[common_idx]
-        return_aligned = return_valid[common_idx]
-        
-        # Calculate Spearman rank correlation using pure numpy
-        try:
-            # Convert to ranks
-            factor_ranks = factor_aligned.rank()
-            return_ranks = return_aligned.rank()
-            
-            # Calculate Pearson correlation of ranks
-            rho = np.corrcoef(factor_ranks, return_ranks)[0, 1]
-            if np.isfinite(rho):
-                rank_ic_values.append(rho)
-        except Exception:
-            continue
-    
+        f_ranked = _rk(frow[mask])
+        r_ranked = _rk(rrow[mask])
+        rho = np.corrcoef(f_ranked, r_ranked)[0, 1]
+        if np.isfinite(rho):
+            rank_ic_values.append(rho)
     return np.mean(rank_ic_values) if rank_ic_values else 0.0
 
 
@@ -1011,178 +1040,149 @@ def stage2_combine_factors(
     # Convert to MultiIndex format
     prices_multindex = convert_to_multindex(prices)
     forward_returns = compute_forward_returns(prices_multindex, config.forward_period)
-    
+
     # Load factor expressions from Stage 1
     factor_exprs = stage1_results['factor_exprs']
-    
-    # Evaluate all factors on all data
-    print(f"  Evaluating {len(factor_exprs)} factors...")
-    all_factor_values = {}
-    for expr in factor_exprs:
-        all_factor_values[expr] = evaluate_factor_expression(expr, prices_multindex)
-    
-    # Calculate IC and Rank IC for each factor at each date
-    print(f"  Calculating rolling IC (forward_period={config.forward_period}d)...")
-    n_dates = len(forward_returns.index)
     n_factors = len(factor_exprs)
-    
-    # Store IC time series for each factor
-    factor_ic_series = {expr: [] for expr in factor_exprs}
-    factor_rankic_series = {expr: [] for expr in factor_exprs}
-    
-    for i, date in enumerate(forward_returns.index):
-        if i == 0:
-            continue
-            
-        # Use past window to calculate IC
-        if config.window == "inf":
-            start_idx = 0
-        else:
-            start_idx = max(0, i - config.window)
-        
-        for expr in factor_exprs:
-            factor_past = all_factor_values[expr].iloc[start_idx:i]
-            returns_past = forward_returns.iloc[start_idx:i]
-            
-            ic = calculate_ic(factor_past, returns_past)
-            rank_ic = calculate_rank_ic(factor_past, returns_past)
-            
-            factor_ic_series[expr].append(ic)
-            factor_rankic_series[expr].append(rank_ic)
-    
-    # Rolling combination
-    print("  Rolling combination...")
+    n_dates = len(forward_returns.index)
+
+    # ── Evaluate all factors (one pass, store as numpy 3D array) ──
+    print(f"  Evaluating {n_factors} factors...")
+    # Align all factor DataFrames to forward_returns index/columns
+    ret_idx = forward_returns.index
+    ret_cols = forward_returns.columns
+    factor_arr = np.full((n_factors, n_dates, len(ret_cols)), np.nan, dtype=np.float64)
+    for fi, expr in enumerate(factor_exprs):
+        fv = evaluate_factor_expression(expr, prices_multindex)
+        aligned = fv.reindex(index=ret_idx, columns=ret_cols)
+        factor_arr[fi] = aligned.values.astype(np.float64)
+    returns_arr = forward_returns.values.astype(np.float64)
+
+    # ── Pre-compute IC & RankIC matrix: (n_factors, n_dates) ──
+    # Each entry is the CROSS-SECTIONAL (not rolling) IC at that date.
+    # The walk-forward below will compute rolling statistics from this matrix.
+    print(f"  Computing cross-sectional IC/RankIC matrix (vectorized)...")
+    try:
+        from scipy.stats import rankdata as _scipy_rankdata
+        _rk = _scipy_rankdata
+    except ImportError:
+        _rk = _rankdata_numpy
+
+    ic_matrix = np.full((n_factors, n_dates), np.nan, dtype=np.float64)
+    rankic_matrix = np.full((n_factors, n_dates), np.nan, dtype=np.float64)
+
+    for t in range(n_dates):
+        rrow = returns_arr[t]
+        for fi in range(n_factors):
+            frow = factor_arr[fi, t]
+            mask = ~(np.isnan(frow) | np.isnan(rrow))
+            if mask.sum() < 10:
+                continue
+            fv = frow[mask]
+            rv = rrow[mask]
+            c = np.corrcoef(fv, rv)[0, 1]
+            if np.isfinite(c):
+                ic_matrix[fi, t] = c
+            fr = _rk(fv)
+            rr = _rk(rv)
+            rho = np.corrcoef(fr, rr)[0, 1]
+            if np.isfinite(rho):
+                rankic_matrix[fi, t] = rho
+
+    # ── Walk-forward combination on pre-computed IC matrices ──
+    print("  Rolling combination (numpy)...")
     predictions = []
-    prediction_dates = []  # Track date for each prediction (for Stage 3 filtering)
+    prediction_dates = []
     selected_factors_history = []
     weights_history = []
-    
-    # Dynamic minimum start index (handle short data)
+
+    # Dynamic minimum start index
     if config.window == "inf":
-        min_start = min(63, n_dates // 3)  # Use 1/3 of data for short periods
+        min_start = min(63, n_dates // 3)
     else:
         min_start = min(config.window, n_dates // 3)
-    
+
+    shift = config.forward_period
+
     for i in range(min_start, n_dates):
-        if i >= len(forward_returns.index):
+        if i >= n_dates:
             break
-            
-        date = forward_returns.index[i]
-        
-        # Calculate factor metrics using past window
+        date = ret_idx[i]
+
+        # Window bounds
         if config.window == "inf":
             start_idx = 0
         else:
             start_idx = max(0, i - config.window)
-        
-        factor_metrics = {}
-        for expr in factor_exprs:
-            ic_series = factor_ic_series[expr][start_idx:i]
-            rankic_series = factor_rankic_series[expr][start_idx:i]
-            
-            if len(ic_series) > 0:
-                ic_mean = np.mean(ic_series)
-                ic_std = np.std(ic_series)
-                rankic_mean = np.mean(rankic_series)
-                rankic_std = np.std(rankic_series)
-                
-                factor_metrics[expr] = {
-                    'ic': ic_mean,
-                    'ic_std': ic_std,
-                    'icir': ic_mean / ic_std if ic_std > 0 else 0,
-                    'rank_ic': rankic_mean,
-                    'rank_ic_std': rankic_std,
-                    'rank_icir': rankic_mean / rankic_std if rankic_std > 0 else 0,
-                }
-        
-        # Select top factors
-        sorted_factors = sorted(
-            factor_metrics.items(),
-            key=lambda x: abs(x[1].get('rank_icir', 0)),
-            reverse=True
-        )
-        
-        # Filter by thresholds (from combine_AFF.py)
-        good_factors = [
-            x[0] for x in sorted_factors
-            if abs(x[1].get('rank_ic', 0)) > 0.02 and abs(x[1].get('rank_icir', 0)) > 0.2
-        ]
-        
-        if len(good_factors) < 1:
-            good_factors = [sorted_factors[0][0]]
-        
-        good_factors = good_factors[:config.n_factors]
-        selected_factors_history.append(good_factors)
-        
-        # ── Walk-forward linear regression (matches original combine_AFF.py) ──
-        #
-        # Original AlphaForge logic:
-        #   x        = fct_tensor[begin : cur-shift, :, good_idx]   # past panel
-        #   y        = tgt_tensor[begin : cur-shift]                 # past returns
-        #   to_pred  = fct_tensor[cur, :, good_idx]                 # today's factors
-        #   coef     = lstsq(x, y)
-        #   pred     = to_pred @ coef
-        #
-        # Key: forward_returns[t] is the return from t to t+N, which is only
-        # *known* at time t+N. So at time i we can only use training samples
-        # from [start_idx, i - forward_period] — anything later has unrealized
-        # forward returns (look-ahead bias).
 
-        shift = config.forward_period
-        train_end = i - shift  # last date whose forward return is realized by time i
+        # ── Compute rolling metrics from pre-computed matrices ──
+        ic_window = ic_matrix[:, start_idx:i]       # (n_factors, window)
+        rankic_window = rankic_matrix[:, start_idx:i]
 
+        ic_mean = np.nanmean(ic_window, axis=1)      # (n_factors,)
+        ic_std = np.nanstd(ic_window, axis=1)
+        rankic_mean = np.nanmean(rankic_window, axis=1)
+        rankic_std = np.nanstd(rankic_window, axis=1)
+
+        rank_icir = np.where(rankic_std > 0, rankic_mean / rankic_std, 0.0)
+
+        # ── Select top factors by |rank_icir| ──
+        good_mask = (np.abs(rankic_mean) > 0.02) & (np.abs(rank_icir) > 0.2)
+        good_indices = np.where(good_mask)[0]
+        if len(good_indices) == 0:
+            # Fallback: best single factor by |rank_icir|
+            good_indices = np.array([np.nanargmax(np.abs(rank_icir))])
+
+        # Sort by |rank_icir| desc and take top config.n_factors
+        order = np.argsort(np.abs(rank_icir[good_indices]))[::-1]
+        top_indices = good_indices[order][:config.n_factors]
+
+        top_exprs = [factor_exprs[idx] for idx in top_indices]
+        selected_factors_history.append(top_exprs)
+
+        # ── Walk-forward linear regression ──
+        train_end = i - shift
         if train_end <= start_idx:
-            # Not enough history for out-of-sample regression yet
-            n_stocks = len(forward_returns.columns)
+            n_stocks = len(ret_cols)
             predictions.append(np.zeros(n_stocks))
             prediction_dates.append(date)
             weights_history.append(np.zeros(config.n_factors))
             continue
 
-        # Build panel training data: (n_past_days * n_stocks, n_factors)
-        train_cols = []
-        for expr in good_factors:
-            vals = all_factor_values[expr].iloc[start_idx:train_end].values
-            train_cols.append(vals.flatten())
+        # Build panel training data from factor_arr
+        train_cols = [factor_arr[idx, start_idx:train_end, :].ravel() for idx in top_indices]
         train_X = np.column_stack(train_cols)
+        train_y = returns_arr[start_idx:train_end, :].ravel()
 
-        # Corresponding forward returns, flattened to 1-D
-        train_y = forward_returns.iloc[start_idx:train_end].values.flatten()
-
-        # Filter rows: keep only where y is finite AND x has no NaN/inf
-        # (matches original torch.isfinite(y) filter + guards factor NaN)
         valid_mask = np.isfinite(train_y) & np.all(np.isfinite(train_X), axis=1)
         train_X = train_X[valid_mask]
         train_y = train_y[valid_mask]
 
         if len(train_y) < 10:
-            n_stocks = len(forward_returns.columns)
+            n_stocks = len(ret_cols)
             predictions.append(np.zeros(n_stocks))
             prediction_dates.append(date)
             weights_history.append(np.zeros(config.n_factors))
             continue
 
-        # Add bias term and fit
         X_train_bias = np.column_stack([train_X, np.ones(len(train_X))])
         coef = np.linalg.lstsq(X_train_bias, train_y, rcond=None)[0]
 
-        # Predict on TODAY's factor values (out-of-sample)
-        # nan_to_num matches original combine_AFF.py's torch.nan_to_num
+        # Predict on TODAY's factor values
+        t = ret_idx.get_loc(date)
         X_today = np.column_stack([
-            np.nan_to_num(all_factor_values[expr].loc[date].values)
-            for expr in good_factors
+            np.nan_to_num(factor_arr[idx, t, :])
+            for idx in top_indices
         ])
         X_today_bias = np.column_stack([X_today, np.ones(len(X_today))])
         pred = X_today_bias @ coef
 
         predictions.append(pred)
         prediction_dates.append(date)
-        # Pad weights to fixed length (config.n_factors) so np.array() produces
-        # a regular 2D array instead of crashing on ragged lists.
         w = np.zeros(config.n_factors)
-        w[:len(good_factors)] = coef[:-1]  # Exclude bias term
+        w[:len(top_indices)] = coef[:-1]
         weights_history.append(w)
-    
+
     print(f"  Generated {len(predictions)} predictions")
     
     # Save results
