@@ -21,7 +21,7 @@ mcts:
 
 # LLM配置
 llm:
-  model: "gpt-4o-mini"        # 模型名称
+  model: "deepseek-v4-flash"        # 模型名称
   temperature:
     initial: 1.0              # 初始生成温度
     refinement: 0.9           # 优化温度

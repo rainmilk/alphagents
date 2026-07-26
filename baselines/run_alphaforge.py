@@ -27,16 +27,19 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import json
 
+# Add project root to path BEFORE any project-package import, so that
+# `import methods` / `import dataloader` resolve both when this file is run
+# standalone (python baselines/run_alphaforge.py) and when imported by
+# run_experiments (which already has the project root on sys.path).
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import pandas as pd
 from methods.portfolio_utils import allocate_score_proportional, allocate_portfolio_weights
 import yaml
 
 warnings.filterwarnings('ignore')
-
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 
 @dataclass

@@ -56,7 +56,7 @@ class LLMClient:
     Wrapper for OpenAI API with domain-specific methods for alpha generation.
     """
     
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini", 
+    def __init__(self, api_key: str, model: str = "deepseek-v4-flash", 
                  max_retries: int = 3, retry_delay: float = 1.0,
                  base_url: Optional[str] = None):
         """

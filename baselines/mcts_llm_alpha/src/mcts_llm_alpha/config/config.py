@@ -39,7 +39,7 @@ class MCTSConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     """LLM配置。"""
-    model: str = Field("gpt-4o-mini", description="OpenAI model name")
+    model: str = Field("deepseek-v4-flash", description="OpenAI model name")
     base_url: Optional[str] = Field(None, description="OpenAI API base URL (e.g. proxy endpoint)")
     temperature: Dict[str, float] = Field(
         default_factory=lambda: {

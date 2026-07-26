@@ -32,7 +32,7 @@ mcts:
   max_expansions_per_dimension: 2 # Max expansions per dimension per node
 
 llm:
-  model: "gpt-4o-mini"           # OpenAI model to use
+  model: "deepseek-v4-flash"           # OpenAI model to use
   max_retries: 3                 # API retry attempts
   retry_delay: 1.0               # Delay between retries
   temperature: 0.7               # Default generation temperature

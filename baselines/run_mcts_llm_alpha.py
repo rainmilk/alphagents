@@ -247,26 +247,36 @@ def run_mcts_llm_alpha_baseline(
     print("\n[3/6] Initializing MCTS components...")
 
     # Check for LLM availability
-    # Read API key and base_url from config first, fall back to env variable
+    # Read API key, base_url AND model from main config first, fall back to env
+    # variable / mcts package default. The model MUST come from the same config
+    # that supplies api_key + base_url (single source of truth) — the mcts
+    # package's own default of "gpt-4o-mini" is rejected by the deepseek endpoint.
     api_key = ""
     base_url = None
+    main_config = {}
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            main_config = yaml.safe_load(f)
+            main_config = yaml.safe_load(f) or {}
         api_key = main_config.get('llm', {}).get('generator', {}).get('api_key', '')
         base_url = main_config.get('llm', {}).get('generator', {}).get('base_url')
     except Exception:
         pass
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY", "")
+    # Model: prefer main config 'llm.generator.model' (e.g. deepseek-v4-flash),
+    # fall back to the mcts package default only if not configured.
+    llm_model_name = (
+        main_config.get('llm', {}).get('generator', {}).get('model')
+        or mcts_config.llm.model
+    )
     has_llm = use_llm and api_key and api_key != "your_openai_api_key_here"
 
     if has_llm:
-        print(f"  LLM enabled: model={mcts_config.llm.model}")
+        print(f"  LLM enabled: model={llm_model_name}")
         from baselines.mcts_llm_alpha.src.mcts_llm_alpha.llm import LLMClient
         from baselines.mcts_llm_alpha.src.mcts_llm_alpha.llm.wrapper import create_formula_generator, create_formula_refiner
 
-        llm_client = LLMClient(api_key=api_key, model=mcts_config.llm.model, base_url=base_url)
+        llm_client = LLMClient(api_key=api_key, model=llm_model_name, base_url=base_url)
         formula_generator = create_formula_generator(llm_client, evaluator)
         formula_refiner = create_formula_refiner(llm_client, evaluator)
     else:

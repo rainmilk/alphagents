@@ -64,7 +64,7 @@ MCTS-LLM Alpha挖掘系统
 [1] 加载配置...
   - 最大迭代次数: 10
   - 评估模式: Qlib真实评估 + 相对排名
-  - LLM模型: gpt-4o-mini
+  - LLM模型: deepseek-v4-flash
 
 [2] 初始化数据提供者...
   - Qlib初始化成功
