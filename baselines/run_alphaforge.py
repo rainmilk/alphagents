@@ -47,7 +47,6 @@ class AlphaForgeConfig:
     """Configuration for AlphaForge baseline."""
     instruments: str = "csi300"
     train_end_year: int = 2023
-    seeds: List[int] = None
     save_name: str = "alphaforge"
     zoo_size: int = 50  # Number of factors to mine in Stage 1
     n_factors: int = 10  # Number of factors to use in Stage 2
@@ -55,10 +54,6 @@ class AlphaForgeConfig:
     top_n_stocks: int = 50  # Number of stocks in portfolio
     forward_period: int = 10  # Forward return period for IC evaluation (must match other baselines)
     holding_period: int = 1  # Portfolio holding period (days) for backtest; 1 = daily rebalance
-
-    def __post_init__(self):
-        if self.seeds is None:
-            self.seeds = [0, 1, 2, 3, 4]
 
 
 def convert_to_multindex(prices: pd.DataFrame) -> pd.DataFrame:
@@ -536,7 +531,6 @@ def gan_mine_factors(
     batch_size: int = 64,
     latent_dim: int = 32,
     device: str = 'cpu',
-    seed: int = 42,
     verbose: bool = True,
 ) -> Tuple[List[str], List[float], Dict]:
     """
@@ -560,17 +554,12 @@ def gan_mine_factors(
         batch_size: GAN batch size
         latent_dim: Generator latent dimension
         device: Torch device
-        seed: Random seed
         verbose: Print progress
 
     Returns:
         Tuple of (factor_expressions, factor_ranks_ic, gan_stats)
     """
     import torch
-    np.random.seed(seed)
-    if torch.cuda.is_available() and 'cuda' in device:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
 
     # ── Helper: evaluate a factor expression → Rank IC ──
     def _eval_expr(expr: str) -> float:
@@ -925,7 +914,6 @@ def stage1_mine_factors(
             batch_size=64,
             latent_dim=32,
             device=device,
-            seed=config.seeds[0] if config.seeds else 42,
             verbose=True,
         )
     else:
@@ -1444,7 +1432,6 @@ def run_alphaforge_baseline(
     top_n_stocks: int = None,
     n_factors: int = 10,
     zoo_size: int = 50,
-    seeds: List[int] = None,
     output_dir: str = "experiments/alphaforge",
     verbose: bool = False,
     use_gan: bool = True,
@@ -1477,7 +1464,6 @@ def run_alphaforge_baseline(
         top_n_stocks: Number of stocks in portfolio (overrides config)
         n_factors: Number of factors to combine
         zoo_size: Number of factors to mine
-        seeds: Random seeds
         output_dir: Output directory
         verbose: Verbose output
         use_gan: Use GAN-based factor mining (True) or template fallback (False)
@@ -1612,7 +1598,6 @@ def run_alphaforge_baseline(
         instruments=instruments,
         n_factors=n_factors,
         zoo_size=zoo_size,
-        seeds=seeds or [0],
         top_n_stocks=top_n_stocks,
         forward_period=forward_period,
         holding_period=holding_period if holding_period is not None else 1,

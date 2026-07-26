@@ -21,7 +21,6 @@ import sys
 import os
 import argparse
 import json
-import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from datetime import datetime
@@ -253,7 +252,6 @@ def _train_predict_oneshot_lstm(
     test_features: pd.DataFrame,
     test_targets: pd.DataFrame,
     test_start_date: str,
-    seed: int = 42,
     seq_len: int = 20,
     hidden_size: int = 64,
     num_layers: int = 2,
@@ -291,18 +289,6 @@ def _train_predict_oneshot_lstm(
         DataFrame (date x stock) of predicted forward returns.
     """
     test_start_ts = pd.Timestamp(test_start_date)
-
-    # ── Deterministic RNG setup ──
-    # Without seeding, PyTorch weight init, dropout masks, and the
-    # torch.randperm batch shuffle (below) differ every run; on GPU the
-    # cuDNN LSTM kernels are also non-deterministic. Seed everything so
-    # repeated runs are bit-reproducible on the same hardware / library.
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if _DEVICE.type == 'cuda':
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
     # Reconstruct the continuous (train + test) panel. Config keeps the two
     # slices adjacent, so concatenating yields the original full grid with a
@@ -507,7 +493,6 @@ def run_lstm_baseline(
     learning_rate: float = 0.001,
     holding_period: Optional[int] = None,  # None -> config['backtest']['trading']['holding_period'] (1)
     forward_period: Optional[int] = None,  # resolved from config (evolution.forward_period) if None
-    seed: int = 42,
     output_dir: Optional[str] = None,
     portfolio_method: str = "equal_weight",  # FIXED: ML baseline uses equal-weight 1/n
 ) -> Dict:
@@ -621,7 +606,6 @@ def run_lstm_baseline(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        seed=seed,
     )
     print(f"  Predictions: {predictions.shape[0]} days x "
           f"{predictions.shape[1]} stocks")
@@ -789,8 +773,6 @@ if __name__ == '__main__':
                         help='Mini-batch size')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for reproducibility (default 42)')
     parser.add_argument('--holding-period', type=int, default=None,
                         help='Holding period (1=daily, 5=weekly)')
     parser.add_argument('--forward-period', type=int, default=None,
@@ -815,7 +797,6 @@ if __name__ == '__main__':
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
-        seed=args.seed,
         holding_period=args.holding_period,
         forward_period=args.forward_period,
         output_dir=args.output_dir,

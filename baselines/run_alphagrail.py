@@ -1208,9 +1208,6 @@ def run_alphagrail_baseline(
     forward_period: Optional[int] = None,
     n_quantiles: int = 5,
     use_neutralization: bool = False,
-    seed: int = 42,            # Reserved for reproducibility; the deterministic
-                               # factor path uses no RNG (only the optional
-                               # LLM tournament consumes it).
     output_dir: Optional[str] = None,
     portfolio_method: str = "equal_weight",
 ) -> Dict:
@@ -1586,10 +1583,6 @@ if __name__ == '__main__':
                         help='Number of quantile groups for group return analysis')
     parser.add_argument('--neutralize', action='store_true',
                         help='Apply industry + size neutralization to factors')
-    parser.add_argument('--seed', type=int, default=_ag_cfg.get('seed', 42),
-                        help='Random seed (config: seed). AlphaGrail is '
-                             'deterministic; only the optional LLM tournament '
-                             'path consumes it.')
     parser.add_argument('--output-dir', default='experiments/alphagrail',
                         help='Output directory')
 
@@ -1608,7 +1601,6 @@ if __name__ == '__main__':
         forward_period=args.forward_period,
         n_quantiles=args.n_quantiles,
         use_neutralization=args.neutralize,
-        seed=args.seed,
         output_dir=args.output_dir,
     )
 

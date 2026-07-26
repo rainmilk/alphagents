@@ -386,7 +386,6 @@ def _llm_generate_factor(
 def _cluster_factors(
     ic_df: pd.DataFrame,
     n_clusters: int = 8,
-    random_state: int = 42,
 ) -> pd.Series:
     """
     Cluster factors by their IC time-series profiles using K-Means.
@@ -394,7 +393,6 @@ def _cluster_factors(
     Args:
         ic_df: IC matrix (dates x factors)
         n_clusters: Number of clusters
-        random_state: Random seed
 
     Returns:
         Series mapping factor name -> cluster label
@@ -411,7 +409,7 @@ def _cluster_factors(
     if actual_k < 1:
         return pd.Series(dtype=int)
 
-    model = KMeans(n_clusters=actual_k, random_state=random_state, n_init=10)
+    model = KMeans(n_clusters=actual_k, n_init=10)
     labels = model.fit_predict(X)
 
     return pd.Series(labels, index=X.index, name="cluster")
@@ -721,7 +719,6 @@ def run_alphafama_baseline(
     forward_period: Optional[int] = None,
     holding_period: Optional[int] = None,
     n_jobs: Optional[int] = None,
-    seed: int = 42,
     portfolio_method: str = "equal_weight",
     top_n: Optional[int] = None,
 ) -> Dict:
@@ -1682,27 +1679,21 @@ if __name__ == '__main__':
                         help='Worker processes for Alpha101 factor computation '
                              '(step 4). None=auto (cpu_count-1). 1=serial. '
                              'Env override: ALPHAFAMA_N_JOBS.')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed (config: seed). AlphaFAMA IC pipeline '
-                             'is deterministic; this only seeds the LLM-mining path.')
-
     # Seed config-driven defaults (e.g. alpha101_ratio) before final parse so
     # the CLI flag can still override them. Pre-parse only --config first.
     _pre = argparse.ArgumentParser(add_help=False)
     _pre.add_argument('--config', default='config/config.yaml')
     _cfg_ns, _ = _pre.parse_known_args()
     _alpha101_default = 0.5
-    _seed_default = 42
     try:
         with open(_cfg_ns.config, 'r', encoding='utf-8') as f:
             _cfg = yaml.safe_load(f) or {}
         _alpha101_default = float(
             (_cfg.get('alphafama') or {}).get('alpha101_ratio', 0.5)
         )
-        _seed_default = int(_cfg.get('seed', 42))
     except Exception:
         pass
-    parser.set_defaults(alpha101_ratio=_alpha101_default, seed=_seed_default)
+    parser.set_defaults(alpha101_ratio=_alpha101_default)
 
     args = parser.parse_args()
 
@@ -1722,7 +1713,6 @@ if __name__ == '__main__':
         holding_period=args.holding_period,
         top_n=args.top_n,
         n_jobs=args.n_jobs,
-        seed=args.seed,
     )
 
     print("\n" + "=" * 60)

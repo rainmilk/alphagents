@@ -1147,7 +1147,6 @@ class AlphaPool:
 
 def _generate_random_factor(
     builder: ExpressionBuilder,
-    seed: int = -1,
     min_tokens: int = 3,
 ) -> Optional[ExprNode]:
     """
@@ -1161,15 +1160,11 @@ def _generate_random_factor(
 
     Args:
         builder: ExpressionBuilder to use (will be reset)
-        seed: Random seed (-1 for no seeding)
         min_tokens: Minimum tokens to use before allowing SEP
 
     Returns:
         ExprNode if a valid expression was generated, None otherwise.
     """
-    if seed >= 0:
-        np.random.seed(seed)
-
     builder.reset()
 
     for step in range(MAX_EXPR_LENGTH):
@@ -1218,7 +1213,6 @@ def _generate_random_factor(
 
 def generate_factor_batch(
     n_factors: int,
-    seed: int = 42,
     max_attempts_per_factor: int = 100,
     verbose: bool = False,
 ) -> List[ExprNode]:
@@ -1227,21 +1221,18 @@ def generate_factor_batch(
 
     Args:
         n_factors: Number of factors to generate
-        seed: Random seed
         max_attempts_per_factor: Max random restarts per factor
         verbose: Print progress
 
     Returns:
         List of generated ExprNode objects
     """
-    rng = np.random.RandomState(seed)
     builder = ExpressionBuilder()
     factors = []
 
     for i in range(n_factors):
         for attempt in range(max_attempts_per_factor):
-            # Use a different seed for each attempt
-            factor = _generate_random_factor(builder, seed=rng.randint(0, 2**31-1))
+            factor = _generate_random_factor(builder)
             if factor is not None:
                 factors.append(factor)
                 if verbose and (i + 1) % 10 == 0:
@@ -1329,7 +1320,6 @@ class AlphaGenConfig:
     top_n_stocks: int = 50          # Portfolio size
     holding_period: int = 1         # Rebalance frequency
     mutual_ic_threshold: float = 0.99
-    seed: int = 42                  # Random seed
     verbose: bool = True
 
 
@@ -1348,7 +1338,6 @@ def run_alphagen_baseline(
     pool_capacity: int = 20,
     top_n_stocks: Optional[int] = None,    # None -> config['fusion']['portfolio']['top_n'] (50)
     holding_period: Optional[int] = None,
-    seed: int = 42,
     output_dir: Optional[str] = None,
     # ── RL method selection ──
     rl_method: str = 'reinforce',
@@ -1396,7 +1385,6 @@ def run_alphagen_baseline(
         pool_capacity: AlphaPool capacity
         top_n_stocks: Number of stocks in portfolio
         holding_period: Rebalance frequency
-        seed: Random seed
         output_dir: Directory for saving results
         rl_method: Factor generation method ('random', 'reinforce', 'ppo')
         n_episodes: REINFORCE training episodes (Option B)
@@ -1508,7 +1496,7 @@ def run_alphagen_baseline(
         # ── Random factor generation (original approach) ──
         print(f"\n[Step 3] Generating {n_generate} random factor expressions...")
         t0 = time.time()
-        factors = generate_factor_batch(n_generate, seed=seed, verbose=True)
+        factors = generate_factor_batch(n_generate, verbose=True)
         elapsed = time.time() - t0
         print(f"  Generated {len(factors)} valid factors in {elapsed:.1f}s")
 
@@ -1761,9 +1749,8 @@ if __name__ == '__main__':
     parser.add_argument('--n-generate', type=int, default=300, help='Factors to generate (random only)')
     parser.add_argument('--pool-capacity', type=int, default=20, help='Pool capacity')
     parser.add_argument('--top-n', type=int, default=None, help='Portfolio size (default: config fusion.portfolio.top_n)')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output-dir', default='experiments/alphagen', help='Output directory')
-    
+
     # ── RL method selection ──
     parser.add_argument('--rl-method', default='reinforce',
                         choices=['random', 'reinforce', 'ppo'],
@@ -1813,7 +1800,6 @@ if __name__ == '__main__':
         pool_capacity=args.pool_capacity,
         top_n_stocks=args.top_n,
         holding_period=args.holding_period,
-        seed=args.seed,
         output_dir=args.output_dir,
         rl_method=args.rl_method,
         n_episodes=args.n_episodes,

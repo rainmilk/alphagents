@@ -608,7 +608,6 @@ class ExperimentRunner:
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagrail"
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
@@ -625,7 +624,6 @@ class ExperimentRunner:
             holding_period=holding_period,
             forward_period=forward_period,
             use_llm_tournament=False,
-            seed=seed,
             output_dir=output_dir,
         )
 
@@ -668,7 +666,6 @@ class ExperimentRunner:
         # baseline's hardcoded default of 1.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/mcts_llm_alpha"
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
@@ -681,7 +678,6 @@ class ExperimentRunner:
             use_llm=False,  # No LLM by default for reproducible baseline
             forward_period=forward_period,
             holding_period=holding_period,
-            seed=seed,
             top_n_stocks=top_n,
         )
 
@@ -730,7 +726,6 @@ class ExperimentRunner:
             alpha101_ratio = float(
                 (self.config.get('alphafama') or {}).get('alpha101_ratio', 0.5)
             )
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         top_n = int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50))
@@ -747,7 +742,6 @@ class ExperimentRunner:
             forward_period=forward_period,
             holding_period=holding_period,
             alpha101_ratio=alpha101_ratio,
-            seed=seed,
             output_dir=output_dir,
         )
         
@@ -791,7 +785,6 @@ class ExperimentRunner:
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
 
         output_dir = f"{self.output_dir}/alphaagent"
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
@@ -801,7 +794,6 @@ class ExperimentRunner:
             config_path="config/config.yaml",
             output_dir=output_dir,
             n_formulas=50,
-            seed=seed,
             train_start_date=start_date,
             test_end_date=end_date,
             train_end_date=train_end,
@@ -841,7 +833,6 @@ class ExperimentRunner:
             # forward_period / holding_period config-driven
             forward_period = self.config['evolution'].get('forward_period', 10)
             holding_period = self.config['backtest']['trading'].get('holding_period', 1)
-            seed = int(self.config.get('seed', 42))
             method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
             results = run_alphaforge_baseline(
                 portfolio_method="equal_weight",
@@ -851,10 +842,6 @@ class ExperimentRunner:
                 instruments=self.config['data']['universe'].get('name', 'csi300'),
                 top_n_stocks=int((self.config.get('fusion') or {}).get('portfolio', {}).get('top_n', 50)),
                 n_factors=self.config.get('alphagents', {}).get('n_factors', 10),
-                # Keep AlphaForge's 5-seed variance-reduction averaging, but
-                # base the seed list on the global config seed so it is fully
-                # reproducible and config-controlled.
-                seeds=[seed + i for i in range(5)],
                 output_dir=f"{self.output_dir}/alphaforge",
                 verbose=True,
                 use_gan=True,
@@ -917,7 +904,6 @@ class ExperimentRunner:
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
 
         output_dir = f"{self.output_dir}/xgboost"
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
@@ -938,7 +924,6 @@ class ExperimentRunner:
             learning_rate=0.05,
             holding_period=holding_period,
             forward_period=forward_period,
-            random_state=seed,
             output_dir=output_dir,
         )
 
@@ -978,7 +963,6 @@ class ExperimentRunner:
         # NOT the baseline's hardcoded default of 1, so it stays aligned with config.
         holding_period = self.config['backtest']['trading'].get('holding_period', 1)
         output_dir = f"{self.output_dir}/alphagen"
-        seed = int(self.config.get('seed', 42))
 
         method = (self.config.get('fusion') or {}).get('portfolio', {}).get('method', 'score_proportional')
         # Single portfolio-size knob: MASE step7 + all 9 baselines read this.
@@ -996,7 +980,6 @@ class ExperimentRunner:
             top_n_stocks=top_n,
             holding_period=holding_period,
             forward_period=forward_period,
-            seed=seed,
             output_dir=output_dir,
         )
 

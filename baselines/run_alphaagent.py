@@ -532,14 +532,13 @@ def _generate_random_formula(rng: np.random.Generator, field: str = None) -> str
 
 def generate_simulated_formulas(
     n_formulas: int = 50,
-    seed: int = 42,
 ) -> List[Tuple[str, str]]:
     """
     Generate simulated factor formulas for baseline evaluation.
 
     Returns list of (formula_name, formula_string) tuples.
     """
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng()
     formulas = []
 
     for i in range(n_formulas):
@@ -1007,7 +1006,6 @@ Strictly adhere to the syntax. Do NOT use undeclared variables or functions."""
 def generate_llm_factors(
     n_formulas: int = 50,
     config_path: str = "config/config.yaml",
-    seed: int = 42,
     max_retries: int = 3,
 ) -> Tuple[List[Tuple[str, str]], bool]:
     """
@@ -1031,7 +1029,6 @@ def generate_llm_factors(
     Args:
         n_formulas: Target number of factor formulas
         config_path: Path to config.yaml for LLM settings
-        seed: Random seed (used for direction selection and fallback)
         max_retries: Max LLM retry attempts per round when factors are rejected
             by the originality regulator (default 3)
 
@@ -1042,7 +1039,7 @@ def generate_llm_factors(
 
     if not api_key:
         print("  [WARN] No LLM API key found, falling back to random generation")
-        return generate_simulated_formulas(n_formulas=n_formulas, seed=seed), False
+        return generate_simulated_formulas(n_formulas=n_formulas), False
 
     print(f"  LLM backend: model={model}, base_url={base_url[:40]}...")
 
@@ -1053,7 +1050,7 @@ def generate_llm_factors(
     else:
         print(f"  AST originality regulator: disabled (factor_ast module unavailable)")
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng()
     formulas = []
     prev_hypotheses = []
     n_rejected = 0
@@ -1158,7 +1155,7 @@ def generate_llm_factors(
         # Supplement with random formulas if LLM didn't generate enough
         remaining = n_formulas - len(formulas)
         print(f"  Supplementing with {remaining} random formulas...")
-        random_formulas = generate_simulated_formulas(n_formulas=remaining, seed=seed + 1)
+        random_formulas = generate_simulated_formulas(n_formulas=remaining)
         formulas.extend(random_formulas)
 
     # Report validation statistics
@@ -1499,7 +1496,6 @@ def run_alphaagent_baseline(
     config_path: str = "config/config.yaml",
     output_dir: str = "experiments/alphaagent",
     n_formulas: int = 50,
-    seed: int = 42,
     train_start_date: str = None,
     train_end_date: str = None,
     test_start_date: str = None,
@@ -1639,11 +1635,10 @@ def run_alphaagent_baseline(
         formulas, llm_used = generate_llm_factors(
             n_formulas=n_formulas,
             config_path=config_path,
-            seed=seed,
         )
     else:
         print(f"\n[3/6] Generating {n_formulas} random factor formulas...")
-        formulas = generate_simulated_formulas(n_formulas=n_formulas, seed=seed)
+        formulas = generate_simulated_formulas(n_formulas=n_formulas)
         llm_used = False
 
     mode_label = "LLM-generated" if llm_used else "random (fallback)"
@@ -1827,8 +1822,6 @@ if __name__ == "__main__":
                              "{parent}/hs300_{start}_{end}_forward-{fp}_holding-{hp}/alphaagent/")
     parser.add_argument("--n-formulas", type=int, default=50,
                         help="Number of factor formulas to generate")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
     parser.add_argument("--train-start", default=None,
                         help="Data start date (default from config)")
     parser.add_argument("--test-end", default=None,
@@ -1856,7 +1849,6 @@ if __name__ == "__main__":
         config_path=args.config_path,
         output_dir=args.output_dir,
         n_formulas=args.n_formulas,
-        seed=args.seed,
         train_start_date=args.train_start,
         train_end_date=args.train_end,
         test_start_date=args.test_start,
