@@ -12,7 +12,7 @@ Usage:
     python main.py              # Quick demo (no LLM required)
     python main.py --full       # Full end-to-end pipeline
     python main.py --full --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
-    python main.py --test --factor-path experiments/YYYYMMDD/results/final_factors.json
+    python main.py --test --factor-path experiments/zz500_2023-01-01_2025-06-30_forward-5_holding-5/fusion/final_factors.json
     python main.py --test --factor-path PATH --train-start 2023-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2024-12-31
 """
 
@@ -385,16 +385,21 @@ class AAAI2027Pipeline:
                             so the CLI --forward-period flag is honored in Step 3
                             (previously Step 3 read config directly and ignored it).
 
-        Memory augmentation is enabled implicitly when ``n_seeds_memory_augment > 0``
-        (read from config) AND the memory bank has at least one entry. Set the
-        count to 0 to skip memory augmentation entirely — no separate boolean flag
-        needed.
+        Memory augmentation is enabled when ``memory.enabled`` is true in the
+        memory config (default) AND ``n_seeds_memory_augment > 0`` AND the memory
+        bank has at least one entry. To disable the entire memory module — the
+        Step 3 few-shot injection, the Step 4b historical-factor retrieval, AND
+        the Step 4c Alpha101/FAMA-101 retrieval — for the "w/o Memory" ablation,
+        set ``memory.enabled: false`` in config.
+        Setting ``n_seeds_memory_augment`` to 0 disables only the Step 3
+        augmentation (Step 4b would still retrieve if the bank is non-empty).
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 3] Skipped: methods modules not available")
             return
         
         evo_cfg = self.config['evolution']
+        memory_enabled = self.config['memory'].get('enabled', True)
         n_seeds_hypothesis = evo_cfg.get('n_seeds_hypothesis', 0)
         n_seeds_memory_augment = evo_cfg.get('n_seeds_memory_augment', 0)
         n_shots = evo_cfg.get('n_shots', 3)
@@ -414,7 +419,8 @@ class AAAI2027Pipeline:
         # step4c_retrieve_alpha101 (post-debate; does NOT evolve/debate).
         print(f"\n[Step 3] Generating seed factors - "
               f"hypothesis: {n_seeds_hypothesis}, "
-              f"memory-augment: {n_seeds_memory_augment}")
+              f"memory-augment: {n_seeds_memory_augment} "
+              f"(memory.enabled={memory_enabled})")
 
         # Initialize the evolving generator (seeds for Step-4 evolution).
         self.evolving_generator = SelfEvolvingGenerator(
@@ -441,8 +447,10 @@ class AAAI2027Pipeline:
         seed_factors = self.evolving_generator.generate_seed_factors()
         
         # If memory-augment seeds are requested AND the memory bank has entries,
-        # augment via few-shot retrieval. Enabled purely by n_seeds_memory_augment > 0.
-        if (n_seeds_memory_augment > 0
+        # augment via few-shot retrieval. Enabled only when the memory module is
+        # on (memory.enabled) AND n_seeds_memory_augment > 0 AND the bank has entries.
+        if (memory_enabled
+                and n_seeds_memory_augment > 0
                 and self.memory_bank is not None and len(self.memory_bank) > 0):
             print(f"  Using memory-augmented generation (target {n_seeds_memory_augment}, few-shot n_shots={n_shots})...")
             memory_generator = MemoryAugmentedGenerator(
@@ -490,7 +498,9 @@ class AAAI2027Pipeline:
                 print(f"  Memory augmentation skipped: {e}")
                 self.generated_factors = seed_factors
         else:
-            if n_seeds_memory_augment == 0:
+            if not memory_enabled:
+                print("  Memory augmentation skipped (memory.enabled=false).")
+            elif n_seeds_memory_augment == 0:
                 print("  Memory augmentation skipped (n_seeds_memory_augment=0).")
             elif self.memory_bank is None or len(self.memory_bank) == 0:
                 print("  Memory augmentation skipped (memory bank empty).")
@@ -570,7 +580,41 @@ class AAAI2027Pipeline:
         # Parallel worker count for the evolution-loop backtests (0 = auto-scale
         # to the machine: min(32, cpu_count()+4)). Plumbed into evolve().
         eval_max_workers = int(self.config.get('evolution', {}).get('eval_max_workers', 0) or 0)
-        
+
+        # ── w/o Evolve ablation (evolution.enabled=false → caller passes n_rounds=0) ──
+        # Skip the iterative LLM improvement loop, but still backtest the seed
+        # factors ONCE so they carry IC and can enter the pool / fusion. Without
+        # this, evolve() would return an empty best_factors set (the loop never
+        # runs), collapsing the downstream pool.
+        if n_rounds <= 0:
+            seeds = self.generated_factors
+            print(f"\n[Step 4] Evolution disabled (n_rounds<=0): backtesting "
+                  f"{len(seeds)} seed factors once for IC (no LLM improvement)...")
+            _bt = FactorBacktester(
+                prices=self.train_data['price_data'],
+                fundamentals=self.train_data.get('fundamental_data', {}),
+                forward_period=forward_period,
+            )
+            self._train_backtester = _bt
+            self._val_enabled = False
+            _m = _bt.evaluate_batch(seeds, max_workers=1)
+            for i, f in enumerate(seeds):
+                m = _m[i]
+                f.ic = m.get('ic', float('nan'))
+                f.icir = m.get('icir', float('nan'))
+                f.sharpe = m.get('sharpe', 0.0)
+                f.win_rate = m.get('win_rate', 0.5)
+                f.max_drawdown = m.get('max_drawdown', 0.0)
+                f.is_valid = m.get('is_valid', True)
+                if not f.is_valid:
+                    f.parse_error = m.get('parse_error', '')
+            self.best_factors = list(seeds)
+            self.evolution_history = []
+            self._forward_period = forward_period
+            print(f"  w/o Evolve: {len(self.best_factors)} seed factors carried "
+                  f"directly to the pool (IC evaluated on TRAIN).")
+            return
+
         print(f"\n[Step 4] Evolving factors ({n_rounds} rounds, forward={forward_period}d)...")
 
         # --- Train / validation split (anti-overfitting lever) ---
@@ -657,6 +701,11 @@ class AAAI2027Pipeline:
             print("\n[Step 4b] Skipped: methods modules not available")
             return
 
+        if not self.config['memory'].get('enabled', True):
+            print("\n[Step 4b] Skipped: memory module disabled "
+                  "(memory.enabled=false).")
+            return
+
         if self.memory_bank is None or len(self.memory_bank) == 0:
             print("\n[Step 4b] Skipped: memory bank is empty")
             return
@@ -729,6 +778,14 @@ class AAAI2027Pipeline:
         """
         if not METHODS_AVAILABLE:
             print("\n[Step 4c] Skipped: methods modules not available")
+            return
+
+        # Step 4c is part of the "external factor knowledge" group. For the
+        # "w/o Memory" ablation (memory.enabled=false) we also skip Alpha101 /
+        # FAMA-101 retrieval, so the run relies purely on LLM-generated factors.
+        if not self.config['memory'].get('enabled', True):
+            print("\n[Step 4c] Skipped: memory module disabled "
+                  "(memory.enabled=false).")
             return
 
         evo_cfg = self.config['evolution']
@@ -1739,8 +1796,8 @@ class AAAI2027Pipeline:
                 series (``mase_daily_returns.csv``) and equity curve
                 (``mase_portfolio_values.csv``). If None, falls back to the same
                 default used by step9_save_results
-                (``experiments/{YYYYMMDD}/results/``) so the series lands next to
-                the other MASE result files.
+                (``experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/``)
+                so the series lands next to the other MASE result files.
 
                 This mirrors what the 9 baselines do via
                 ``engine.run(..., save_dir=run_dir)``: each of them persists a
@@ -1823,12 +1880,11 @@ class AAAI2027Pipeline:
 
         Args:
             output_dir: Directory to save results.
-                        If None, defaults to `experiments/{YYYYMMDD}/results/`.
+                        If None, defaults to the semantic path
+                        `experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/`.
         """
         if output_dir is None:
-            date_str = datetime.now().strftime("%Y%m%d")
-            output_dir = os.path.join(date_str, "results")
-            output_dir = config_path('experiments', output_dir)
+            output_dir = self._default_output_dir()
 
         print(f"\n[Step 9] Saving results to {output_dir}...")
 
@@ -1914,11 +1970,25 @@ class AAAI2027Pipeline:
             print(f"  [warn] Could not compute composite test IC/ICIR: {e}")
             return False
 
+    def _default_output_dir(self, universe=None, train_start=None, test_end=None,
+                            forward_period=None, holding_period=None):
+        """Semantic default output dir: experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/."""
+        eff_universe = universe or self.config.get('data', {}).get('universe', {}).get('index', 'unknown')
+        eff_forward = forward_period if forward_period is not None \
+            else self.config.get('evolution', {}).get('forward_period', 10)
+        eff_holding = holding_period if holding_period is not None \
+            else self.config.get('backtest', {}).get('trading', {}).get('holding_period', 1)
+        eff_train = train_start or self.config.get('data', {}).get('train_start_date', 'unknown')
+        eff_test = test_end or self.config.get('data', {}).get('test_end_date', 'unknown')
+        base_name = f"{eff_universe}_{eff_train}_{eff_test}_forward-{eff_forward}_holding-{eff_holding}"
+        return config_path('experiments', base_name)
+
     def run_full_pipeline(
         self,
         use_sample: bool = True,
         n_evolution_rounds: int = 5,
         output_dir: str = None,
+        save_name: str = None,
         universe: str = None,
         train_start_date: str = None,
         train_end_date: str = None,
@@ -1941,7 +2011,9 @@ class AAAI2027Pipeline:
             use_sample: True=sample data, False=real data
             data_source: Real data source ('westock', 'akshare', 'tushare', 'auto')
             n_evolution_rounds: Number of evolution rounds (overrides config)
-            output_dir: Output directory for step9. None = experiments/{YYYYMMDD}/results/
+            output_dir: Output directory. None = the semantic default
+                experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/.
+                --save-name (if given) nests a sub-directory under this base.
             train_start_date: Explicit train start date for train/test split
             train_end_date: Explicit train end date for train/test split
             test_start_date: Explicit test start date for train/test split
@@ -1975,6 +2047,25 @@ class AAAI2027Pipeline:
         test_start  = test_start_date  or self.config.get('data', {}).get('test_start_date', '2024-01-01')
         test_end    = test_end_date    or self.config.get('data', {}).get('test_end_date', '2025-06-30')
 
+        # ── Resolve effective output directory ──
+        # Default base directory is SEMANTIC (not a date stamp) so each run's
+        # results land in a self-describing folder:
+        #   experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/
+        # --output-dir overrides the base entirely; --save-name (if given)
+        # appends a sub-directory so different ablation studies stay distinct and
+        # easily comparable without re-typing the full base path each run.
+        # Resolved ONCE here and forwarded to step8/step9 so both share an
+        # identical path (and we avoid step8 vs step9 computing different dates
+        # across a midnight run).
+        if output_dir is None:
+            output_dir = self._default_output_dir(
+                universe=universe, train_start=train_start, test_end=test_end,
+                forward_period=forward_period, holding_period=holding_period,
+            )
+        if save_name:
+            output_dir = os.path.join(output_dir, save_name)
+        print(f"\n[output] Results will be saved under: {output_dir}")
+
         # Run all steps
         self.step1_load_data(
             use_sample=use_sample,
@@ -1988,13 +2079,23 @@ class AAAI2027Pipeline:
         )
         self.step2_initialize_memory()
         self.step3_generate_factors(forward_period=forward_period)
-        self.step4_evolve_factors(n_evolution_rounds, forward_period=forward_period)
+        # ── Step 4 self-evolving generation (ablation "w/o Evolve") ──
+        evolve_enabled = bool(self.config['evolution'].get('enabled', True))
+        self.step4_evolve_factors(
+            n_evolution_rounds if evolve_enabled else 0,
+            forward_period=forward_period,
+        )
         self.step4b_retrieve_from_memory()   # retrieve after evolution → augment candidate pool
         self.step4c_retrieve_alpha101(forward_period=forward_period)  # Alpha101/FAMA-101 → post_debate
         self.step4d_select_top_factors()     # filter + rank → keep top n_best4debate for Step 5
-        if skip_eval:
+        debate_enabled = bool(
+            self.config.get('llm', {}).get('evaluator', {}).get('use_debate', True))
+        if skip_eval or not debate_enabled:
             print("\n[skip] Step 5 (debate) and Step 5b (Chair synthesis) skipped "
                   "--fusing top_k best_factors directly in Step 6.")
+            if not debate_enabled and not skip_eval:
+                print('  (debate disabled via llm.evaluator.use_debate=false — '
+                      'ablation "w/o Debate")')
             if bool(self.config.get('fusion', {}).get('use_chair_selection', False)):
                 print("  [warn] fusion.use_chair_selection is TRUE but Step 5b was "
                       "skipped, so Chair selection is effectively disabled (no ranked "
@@ -2553,6 +2654,44 @@ Examples:
         help='Disable Alpha101 loading during factor generation (Step 4c).',
     )
     parser.add_argument(
+        '--memory-enabled', dest='memory_enabled', action='store_true',
+        default=None,
+        help='Enable the memory module (Step 3 few-shot + Step 4b retrieval + '
+             'Step 4c Alpha101/FAMA-101). Default: from config (memory.enabled=true). '
+             'Pass --no-memory-enabled to disable (ablation "w/o Memory": only '
+             'LLM-generated factors remain).',
+    )
+    parser.add_argument(
+        '--no-memory-enabled', dest='memory_enabled', action='store_false',
+        help='Disable the memory module entirely (ablation "w/o Memory"): '
+             'turns off both Step 3 few-shot injection and Step 4b retrieval.',
+    )
+    parser.add_argument(
+        '--evolve-enabled', dest='evolve_enabled', action='store_true',
+        default=None,
+        help='Enable the self-evolving factor generation (Step 4). '
+             'Default: from config (evolution.enabled=true). '
+             'Pass --no-evolve-enabled to disable (ablation "w/o Evolve"): '
+             'seed factors are backtested once and carried to the pool without '
+             'LLM improvement rounds.',
+    )
+    parser.add_argument(
+        '--no-evolve-enabled', dest='evolve_enabled', action='store_false',
+        help='Disable self-evolving generation (ablation "w/o Evolve").',
+    )
+    parser.add_argument(
+        '--debate-enabled', dest='debate_enabled', action='store_true',
+        default=None,
+        help='Enable the multi-agent debate (Step 5) + Chair synthesis (Step 5b). '
+             'Default: from config (llm.evaluator.use_debate=true). '
+             'Pass --no-debate-enabled to disable (ablation "w/o Debate"); '
+             'factors fuse directly.',
+    )
+    parser.add_argument(
+        '--no-debate-enabled', dest='debate_enabled', action='store_false',
+        help='Disable the multi-agent debate (ablation "w/o Debate").',
+    )
+    parser.add_argument(
         '--n-shots', type=int, default=None,
         help='Few-shot examples injected into the LLM prompt by MemoryAugmentedGenerator (default: config value)',
     )
@@ -2595,7 +2734,17 @@ Examples:
     )
     parser.add_argument(
         '--output-dir', type=str, default=None,
-        help='Output directory (default: experiments/YYYYMMDD/results/)',
+        help='Base output directory. Default: experiments/{universe}_{train_start}_'
+             '{test_end}_forward-{F}_holding-{H}/. Combine with --save-name to nest '
+             'a sub-directory, e.g. '
+             '--save-name wo_evolve → experiments/zz500_2023-01-01_2025-06-30_forward-5_holding-5/wo_evolve/.',
+    )
+    parser.add_argument(
+        '--save-name', type=str, default=None,
+        help='Sub-directory name appended under the output directory (or the '
+             'default experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/) '
+             'so different ablation / experiment runs are kept in separate, comparable folders. '
+             'Ignored if --output-dir already points at the exact target.',
     )
     parser.add_argument(
         '--test', action='store_true',
@@ -2604,7 +2753,7 @@ Examples:
     parser.add_argument(
         '--factor-path', type=str, default=None,
         help='Path to final_factors.json for --test mode '
-             '(default: experiments/YYYYMMDD/fusion/final_factors.json)',
+             '(default: experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/fusion/final_factors.json)',
     )
     parser.add_argument(
         '--context-days', type=int, default=None,
@@ -2633,6 +2782,12 @@ Examples:
             evo_overrides['n_seeds_memory_augment'] = args.n_seeds_memory_augment
         if args.retrieve_alpha101 is not None:
             evo_overrides['retrieve_alpha101'] = args.retrieve_alpha101
+        if args.memory_enabled is not None:
+            pipeline.config.setdefault('memory', {})['enabled'] = args.memory_enabled
+        if args.evolve_enabled is not None:
+            pipeline.config.setdefault('evolution', {})['enabled'] = args.evolve_enabled
+        if args.debate_enabled is not None:
+            pipeline.config.setdefault('llm', {}).setdefault('evaluator', {})['use_debate'] = args.debate_enabled
         if args.n_shots is not None:
             evo_overrides['n_shots'] = args.n_shots
         if args.n_seeds is not None:
@@ -2656,6 +2811,7 @@ Examples:
             universe=args.universe,
             n_evolution_rounds=args.n_evolution_rounds,
             output_dir=args.output_dir,
+            save_name=args.save_name,
             forward_period=args.forward_period,
             holding_period=args.holding_period,
             skip_eval=args.skip_eval,

@@ -5,15 +5,6 @@
 # Keys marked [UNUSED] are defined here as reference/roadmap but
 # are not yet read by any code path — they have no runtime effect.
 
-# ==================== Global Random Seed [ACTIVE] ====================
-# Single source of truth for reproducibility across ALL 9 baselines.
-# Each baseline reads this value (the CLI `--seed` flag overrides it).
-# Deterministic baselines (e.g. AlphaGrail formula evaluation) ignore it;
-# the ML/RL baselines (LSTM, XGBoost x2, AlphaGen, AlphaAgent, MCTS,
-# AlphaForge) seed their RNGs from it. Change one number to re-run the
-# whole paper under a fresh but reproducible seed.
-seed: 42
-
 # ==================== Data Configuration [ALL ACTIVE] ====================
 data:
   # Data source — loader supports westock, tushare, akshare, auto
@@ -103,6 +94,7 @@ llm:
     temperature: 0.3
     n_agents: 5        # number of debate agents (higher = more diverse opinions)
     n_debate_rounds: 3 # debate rounds per factor
+    use_debate: true   # [ACTIVE] master switch for the multi-agent debate (Step 5) + Chair synthesis (Step 5b). false = skip both (ablation "w/o Debate"); factors fuse directly.
     parallel_eval: true  # true = concurrent eval via ThreadPoolExecutor; false = serial (debug)
 
   # Chair Agent — synthesizes debate results into ranked cross-factor report
@@ -138,6 +130,7 @@ evolution:
   n_best_factors: 20   # [ACTIVE] top-N factors to retain per round
   n_best4debate: 15     # [ACTIVE] Step 4d: pre-step5 filter — keep top-N factors by |train IC| from the combined pool (evolved + memory + alpha101-llm). 0 = disabled (pass all to Step 5). Set to match fusion.top_k to avoid wasting debate API calls on factors that will be cut.
   max_rounds: 5       # [ACTIVE] max evolution rounds (overridable via CLI --n-evolution-rounds)
+  enabled: true       # [ACTIVE] master switch for Step 4 self-evolving factor generation (ablation "w/o Evolve"). false = skip iterative LLM improvement; seed factors are backtested once and carried directly to the pool.
   n_improve: 15        # [ACTIVE] target number of improved factors per round (LLM generation)
   n_mutate: 5          # [ACTIVE] mutation variations per top factor (rule-based fallback)
   convergence_delta: 0.003  # [ACTIVE] min IC improvement to continue (below this = converged)
@@ -155,6 +148,7 @@ evolution:
 
 # ==================== Memory Bank Configuration ====================
 memory:
+  enabled: true   # [ACTIVE] master switch for the ENTIRE memory module — gates BOTH step3 few-shot augmentation AND step4b historical-factor retrieval. Set false to disable the State-Aware Factor Memory Bank (ablation "w/o Memory").
   # Market state encoding → used by MarketEncoder (step1 init)
   market_state:
     recent_days: 60    # [ACTIVE] recent data window for encoding current market state
@@ -270,7 +264,7 @@ alphafama:
   # Proportion of the FINAL top-k selected factors that come from the Alpha101
   # family (rest are LLM). 0=all LLM; 0.5=half/half; 1=all Alpha101 (default 0.5).
   # Overridable at runtime via the --alpha101-ratio CLI flag.
-  alpha101_ratio: 0
+  alpha101_ratio: 0.2
 
 # This section is defined as a placeholder for planned cross-validation / baseline
 # comparison features. No code reads these keys at runtime.
