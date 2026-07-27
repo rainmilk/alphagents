@@ -667,7 +667,6 @@ class PortfolioConfig:
     max_weight: float = 0.05            # 单只股票最大权重
     min_weight: float = 0.001           # 单只股票最小权重
     max_industry_exposure: float = 0.30  # 单行业最大暴露度
-    rebalance_freq: str = "M"           # 换仓频率: D/W/M
 
 
 @dataclass

@@ -438,8 +438,20 @@ def evaluate_formula_pandas(
         factor_series.name = 'factor'
         factor_df = factor_series.to_frame()
 
-        # 3. Align with returns
-        aligned = pd.concat([factor_df, return_series], axis=1).dropna()
+        # 3. Align with returns.
+        # NOTE: factor_df (clipped to [start, end]) and the full-range
+        # return_series share the same (datetime, instrument) MultiIndex in the
+        # normal path, but a plain `pd.concat([df, series], axis=1)` aligns only
+        # by *label* — if the two indices ever diverge (a parser path that
+        # returns a differently-indexed factor, or an instrument/date mismatch),
+        # it silently produces an empty frame and the `len(aligned) < 100` guard
+        # below then returns None, discarding a valid formula. Reindex the return
+        # series onto the factor's exact index and make both operands DataFrames
+        # so the alignment is explicit and shape-consistent.
+        return_aligned = return_series.reindex(factor_df.index)
+        aligned = pd.concat(
+            [factor_df, return_aligned.to_frame(name='return')], axis=1
+        ).dropna()
 
         if len(aligned) < 100:
             print(f"[PandasEval] Insufficient data points: {len(aligned)}")
