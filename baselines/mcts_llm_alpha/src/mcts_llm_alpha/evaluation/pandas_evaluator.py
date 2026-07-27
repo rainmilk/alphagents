@@ -292,33 +292,43 @@ class ExprParser:
         """
         return x.groupby(level='datetime').rank(pct=True)
 
-    def _fn_corr(self, x: pd.Series, y: pd.Series, n: Union[pd.Series, int, float]) -> pd.Series:
+    def _rolling_pair(self, x: pd.Series, y: pd.Series, n, rolling_op) -> pd.Series:
+        """Per-instrument rolling pairwise stat (Corr/Cov), reassembled to x's MultiIndex.
+
+        The naive implementation computed each instrument's Series (DatetimeIndex)
+        and concatenated them, which *flattens* the ``(datetime, instrument)``
+        MultiIndex into a bare DatetimeIndex. Any downstream arithmetic or
+        ``Rank``/``groupby`` on that result then silently misaligns. Here we rebuild
+        the proper two-level index and reindex to ``x``'s exact ordering so the
+        output stays shape- and order-consistent with ``x``.
+        """
         n = int(self._to_scalar(n))
-        result_parts = []
+        minp = max(2, n // 2)
+        parts = []
         if isinstance(x.index, pd.MultiIndex):
             for inst in x.index.get_level_values('instrument').unique():
                 xi = x.xs(inst, level='instrument')
                 yi = y.xs(inst, level='instrument')
-                corr = xi.rolling(n, min_periods=max(2, n//2)).corr(yi)
-                corr.name = inst
-                result_parts.append(corr)
-        if result_parts:
-            return pd.concat(result_parts)
+                s = rolling_op(xi, yi, n, minp)
+                s.index = pd.MultiIndex.from_product(
+                    [s.index, [inst]], names=['datetime', 'instrument']
+                )
+                parts.append(s)
+        if parts:
+            return pd.concat(parts).reindex(x.index)
         return pd.Series(np.nan, index=x.index)
 
+    def _fn_corr(self, x: pd.Series, y: pd.Series, n: Union[pd.Series, int, float]) -> pd.Series:
+        return self._rolling_pair(
+            x, y, n,
+            lambda xi, yi, nn, minp: xi.rolling(nn, min_periods=minp).corr(yi),
+        )
+
     def _fn_cov(self, x: pd.Series, y: pd.Series, n: Union[pd.Series, int, float]) -> pd.Series:
-        n = int(self._to_scalar(n))
-        result_parts = []
-        if isinstance(x.index, pd.MultiIndex):
-            for inst in x.index.get_level_values('instrument').unique():
-                xi = x.xs(inst, level='instrument')
-                yi = y.xs(inst, level='instrument')
-                cov = xi.rolling(n, min_periods=max(2, n//2)).cov(yi)
-                cov.name = inst
-                result_parts.append(cov)
-        if result_parts:
-            return pd.concat(result_parts)
-        return pd.Series(np.nan, index=x.index)
+        return self._rolling_pair(
+            x, y, n,
+            lambda xi, yi, nn, minp: xi.rolling(nn, min_periods=minp).cov(yi),
+        )
 
     def _fn_delta(self, x: pd.Series, n: Union[pd.Series, int, float]) -> pd.Series:
         """Delta(x, n) = x - Ref(x, n)"""
@@ -327,18 +337,18 @@ class ExprParser:
 
     def _fn_log(self, x: pd.Series) -> pd.Series:
         x_safe = x.clip(lower=1e-10)
-        return np.log(x_safe)
+        return pd.Series(np.log(x_safe), index=x.index)
 
     def _fn_abs(self, x: pd.Series) -> pd.Series:
         return x.abs()
 
     def _fn_sign(self, x: pd.Series) -> pd.Series:
-        return np.sign(x)
+        return pd.Series(np.sign(x), index=x.index)
 
     def _fn_sigmoid(self, x: pd.Series) -> pd.Series:
         # Sigmoid: 1 / (1 + exp(-x))
         x_clipped = np.clip(x, -50, 50)  # prevent overflow
-        return 1.0 / (1.0 + np.exp(-x_clipped))
+        return pd.Series(1.0 / (1.0 + np.exp(-x_clipped)), index=x.index)
 
 
 # ── Main Data Bridge ──────────────────────────────────────────────────
@@ -365,6 +375,19 @@ def convert_to_multindex(
         if isinstance(df, pd.DataFrame):
             stacked = df.stack()
             stacked.index = stacked.index.set_names(['datetime', 'instrument'])
+            # Guard against duplicate (datetime, instrument) rows. These arise
+            # when the source panel has repeated stock codes (duplicate columns)
+            # or repeated dates. A non-unique MultiIndex makes downstream Series
+            # arithmetic raise
+            # `NotImplementedError: Index._join_level on non-unique index is not
+            # implemented`, and breaks label-based reindex alignment. Keep the
+            # first occurrence per (datetime, instrument) cell.
+            dup_mask = stacked.index.duplicated(keep='first')
+            if dup_mask.any():
+                print(f"[convert_to_multindex] Warning: dropped "
+                      f"{int(dup_mask.sum())} duplicate (datetime, instrument) "
+                      f"rows from field '{field}'.")
+                stacked = stacked[~dup_mask]
             result[field] = stacked
     return result
 
