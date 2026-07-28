@@ -1893,7 +1893,7 @@ class AAAI2027Pipeline:
         # daily return and is exactly what we want on disk.
         if output_dir is None:
             date_str = datetime.now().strftime("%Y%m%d")
-            _save_dir = config_path('experiments', os.path.join(date_str, "results"))
+            _save_dir = config_path('experiments', f"{date_str}/results")
         else:
             _save_dir = output_dir
         self.performance_metrics = self.backtest_engine.run(
@@ -2011,7 +2011,20 @@ class AAAI2027Pipeline:
 
     def _default_output_dir(self, universe=None, train_start=None, test_end=None,
                             forward_period=None, holding_period=None):
-        """Semantic default output dir: experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/."""
+        """Default output dir: experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/{run_date}/.
+
+        The semantic prefix is contributed by config_path() (which reads the
+        module-level global_config tags). We populate those tags HERE — instead of
+        relying on step1_load_data() — because run_full_pipeline() calls this at
+        L2099, BEFORE step1 runs at L2109. Previously the tags were still 'NA'
+        when config_path() was evaluated, so it emitted a spurious "NA_NA_NA"
+        prefix AND the full semantic dir was re-applied as the suffix, landing
+        results in experiments/NA_NA_NA/<semantic>/ (no dated sub-folder).
+
+        We pass only the run-date as the suffix, so the result is a single
+        semantic dir + one dated sub-folder per run — matching the layout that
+        fusion/debate already use via config_path("experiments", f"{date}/fusion").
+        """
         eff_universe = universe or self.config.get('data', {}).get('universe', {}).get('index', 'unknown')
         eff_forward = forward_period if forward_period is not None \
             else self.config.get('evolution', {}).get('forward_period', 10)
@@ -2019,8 +2032,23 @@ class AAAI2027Pipeline:
             else self.config.get('backtest', {}).get('trading', {}).get('holding_period', 1)
         eff_train = train_start or self.config.get('data', {}).get('train_start_date', 'unknown')
         eff_test = test_end or self.config.get('data', {}).get('test_end_date', 'unknown')
-        base_name = f"{eff_universe}_{eff_train}_{eff_test}_forward-{eff_forward}_holding-{eff_holding}"
-        return config_path('experiments', base_name)
+
+        # Populate global_config dir tags so config_path() emits the correct
+        # semantic prefix. step1_load_data() sets these again later (same values),
+        # but it runs too late for the run_full_pipeline output_dir resolution.
+        global_config.universe = eff_universe
+        global_config.train_start_date = eff_train
+        global_config.test_end_date = eff_test
+        global_config.forward_period = eff_forward
+        global_config.holding_period = eff_holding
+
+        date_str = datetime.now().strftime("%Y%m%d")
+        # `results` sub-folder matches the documented layout
+        # (experiments/{...}/{YYYYMMDD}/results/{portfolio_values,performance_metrics}.csv)
+        # and the auto-detect glob at L2897 (experiments/*/results/final_factors.json).
+        # Use a forward-slash join to stay consistent with config_path()'s '/' output
+        # (avoids mixing os.path.join's backslash on Windows).
+        return config_path('experiments', f"{date_str}/results")
 
     def run_full_pipeline(
         self,
@@ -2087,9 +2115,9 @@ class AAAI2027Pipeline:
         test_end    = test_end_date    or self.config.get('data', {}).get('test_end_date', '2025-06-30')
 
         # ── Resolve effective output directory ──
-        # Default base directory is SEMANTIC (not a date stamp) so each run's
-        # results land in a self-describing folder:
-        #   experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/
+        # Default directory is SEMANTIC + a per-run date stamp, so each run's
+        # results land in a self-describing, dated folder:
+        #   experiments/{universe}_{train_start}_{test_end}_forward-{F}_holding-{H}/{YYYYMMDD}/results/
         # --output-dir overrides the base entirely; --save-name (if given)
         # appends a sub-directory so different ablation studies stay distinct and
         # easily comparable without re-typing the full base path each run.
