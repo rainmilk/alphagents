@@ -1264,9 +1264,15 @@ class AAAI2027Pipeline:
         (typically a stronger model like GPT-4o) reviews all debate results
         holistically and produces:
 
-        - Ranked list of factors with 入选理由 (selection reasons)
-        - Rejected factors with 淘汰原因 (rejection reasons)
+        - Ranked list of factors with 入选理由 (selection reasons); each may be
+          marked decision='selected' or decision='conditional' (approved WITH
+          conditions/monitoring — still KEPT in the pool)
+        - Rejected factors with 淘汰原因 (rejection reasons); decision='rejected'
+          → these are the ONLY factors hard-dropped from best_factors.
         - Cross-cutting themes and overall confidence assessment
+
+        Key invariant: ONLY *rejected* factors are removed from the pool.
+        *selected* and *conditional* factors both proceed to Step 6 fusion.
 
         Output: experiments/{yyyymmdd}/chair_synthesis.json
         """
@@ -1323,40 +1329,73 @@ class AAAI2027Pipeline:
         _ranked = synthesis.get('factors_ranked', []) or []
         _rejected = synthesis.get('rejected_factors', []) or []
         self.chair_synthesis = synthesis
-        self.chair_selected_expressions = {
-            str(item.get('expression', '')).strip()
-            for item in _ranked if str(item.get('expression', '')).strip()
+
+        # ── Three-way Chair classification ──
+        # selected    → KEPT, full weight
+        # conditional → KEPT (approved WITH conditions/monitoring), full weight
+        # rejected    → HARD-DROPPED from best_factors below
+        # Only *rejected* factors are removed; selected AND conditional stay in
+        # the pool. The textual "conditional" fallback rescues factors the LLM
+        # drops into rejected_factors with a "conditional approval" reason — it
+        # cannot always be relied upon to emit the explicit `decision` field.
+        def _classify(items, default_decision, sel, cond, rej):
+            for item in items:
+                expr = str(item.get('expression', '')).strip()
+                if not expr:
+                    continue
+                raw = item.get('decision', None)  # None if the field is absent
+                dec = str(raw).strip().lower() if raw is not None else None
+                if dec not in ('selected', 'conditional', 'rejected'):
+                    # field absent or holds an unknown token → infer from text,
+                    # else fall back to the array's default (selected / rejected)
+                    txt = ' '.join([
+                        str(item.get('rejection_reason', '')),
+                        str(item.get('selection_reason', '')),
+                    ]).lower()
+                    dec = 'conditional' if 'conditional' in txt else default_decision
+                if dec == 'rejected':
+                    rej.add(expr)
+                else:  # selected or conditional → kept
+                    sel.add(expr)
+                    if dec == 'conditional':
+                        cond.add(expr)
+
+        _sel, _cond, _rej = set(), set(), set()
+        _classify(_ranked, 'selected', _sel, _cond, _rej)
+        _classify(_rejected, 'rejected', _sel, _cond, _rej)
+
+        self.chair_selected_expressions = _sel
+        self.chair_conditional_expressions = _cond
+        self.chair_rejected_expressions = _rej
+        # score map: every KEPT factor (selected + conditional) with its final_score
+        _ranked_scores = {
+            str(i.get('expression', '')).strip(): float(i.get('final_score') or 0.0)
+            for i in _ranked if str(i.get('expression', '')).strip()
         }
-        self.chair_rejected_expressions = {
-            str(item.get('expression', '')).strip()
-            for item in _rejected if str(item.get('expression', '')).strip()
+        self.chair_score_map = {e: _ranked_scores[e] for e in _sel if e in _ranked_scores}
+        # rejected score map: only HARD-rejected (used if Step 6 later wires soft-rejection)
+        _rej_scores = {
+            str(i.get('expression', '')).strip(): float(i.get('final_score') or 0.0)
+            for i in _rejected if str(i.get('expression', '')).strip()
         }
-        self.chair_score_map = {
-            str(item.get('expression', '')).strip(): float(item.get('final_score') or 0.0)
-            for item in _ranked if str(item.get('expression', '')).strip()
-        }
-        # Rejected factors also carry final_score — needed so Step 6 can
-        # DOWNWEIGHT (soft-reject) them instead of hard-dropping. Without this
-        # map, soft-rejected factors would fall back to debate_score 0.0.
-        self.chair_rejected_score_map = {
-            str(item.get('expression', '')).strip(): float(item.get('final_score') or 0.0)
-            for item in _rejected if str(item.get('expression', '')).strip()
-        }
+        self.chair_rejected_score_map = {e: _rej_scores[e] for e in _rej if e in _rej_scores}
         print(f"  [step5b→step6] Chair selection persisted: "
-              f"{len(self.chair_selected_expressions)} ranked, "
+              f"{len(self.chair_selected_expressions)} kept "
+              f"({len(self.chair_conditional_expressions)} conditional), "
               f"{len(self.chair_rejected_expressions)} rejected "
               f"(use_chair_selection={self.config['fusion'].get('use_chair_selection', False)})")
 
-        # ── Hard-delete Chair-rejected factors from the pool ──
-        # When use_chair_selection is on, the Chair's rejections physically
-        # remove factors from best_factors HERE (Step 5b) so they never reach
-        # Step 6 fusion. The matching uses the base expression (stripping the
-        # '...__dupN' de-dup suffix) — identical to Step 6. Selected factors
-        # always win over rejections; factors the Chair neither ranked nor
-        # rejected are kept. (At this point best_factors holds only the
-        # debaited set — the post-debate memory/Alpha101/FAMA factors are
-        # merged back AFTER Step 5, so they are never touched by Chair
-        # rejection here.)
+        # ── Hard-delete Chair-REJECTED factors from the pool ──
+        # When use_chair_selection is on, ONLY the Chair's *rejected* factors
+        # are physically removed from best_factors HERE (Step 5b) so they never
+        # reach Step 6 fusion. *conditional* factors are KEPT (they are in
+        # chair_selected_expressions, not in chair_rejected_expressions), as are
+        # factors the Chair neither ranked nor rejected. The matching uses the
+        # base expression (stripping the '...__dupN' de-dup suffix) — identical
+        # to Step 6. Selected/conditional factors always win over rejections.
+        # (At this point best_factors holds only the debaited set — the
+        # post-debate memory/Alpha101/FAMA factors are merged back AFTER Step 5,
+        # so they are never touched by Chair rejection here.)
         _use_chair = bool(self.config['fusion'].get('use_chair_selection', False))
         if _use_chair:
             _sel = self.chair_selected_expressions

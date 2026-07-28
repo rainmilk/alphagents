@@ -1434,11 +1434,17 @@ class DebateEvaluator:
             "  'factors_ranked' (array): Top factors ranked from best to worst, each with:\n"
             "    - 'rank' (int), 'expression' (string), 'final_score' (float),\n"
             "    - 'selection_reason' (string, 入选理由 — WHY this factor is selected)\n"
+            "    - 'decision' (string, optional): 'selected' (default) or 'conditional' "
+            "(approved WITH conditions / monitoring — still KEPT in the pool)\n"
             "    NOTE: keep selection_reason concise (1-2 sentences). Do NOT add 'strengths'/'risks' arrays.\n"
             "  'selected_count' (int): How many factors you recommend selecting\n"
             "  'rejected_factors' (array): Factors NOT selected, each with:\n"
             "    - 'expression' (string), 'final_score' (float),\n"
             "    - 'rejection_reason' (string, 淘汰原因 — WHY this factor was rejected, concise)\n"
+            "    - 'decision' (string, optional): 'rejected' (default)\n"
+            "  IMPORTANT: Only HARD rejections go in 'rejected_factors'. Factors approved WITH "
+            "conditions ('conditional') must be listed in 'factors_ranked' with "
+            "decision:'conditional', NOT in 'rejected_factors'.\n"
             "  'key_themes' (array of strings): Cross-cutting observations\n"
             "  'chair_confidence' (string): HIGH / MEDIUM / LOW\n"
             "FAMILY DIVERSITY: each factor above is labeled with its Family. Prefer a "
@@ -1479,12 +1485,14 @@ class DebateEvaluator:
                     f"辩论综合评分 {score:.1f}/10，{result.recommendation}。"
                     f"IC={ic:.3f}，{result.consensus_summary}"
                 )
+                entry["decision"] = "selected"
                 ranked.append(entry)
             else:
                 entry["rejection_reason"] = (
                     f"辩论综合评分 {score:.1f}/10 < 7.0 阈值，{result.recommendation}。"
                     f"{result.consensus_summary}"
                 )
+                entry["decision"] = "rejected"
                 rejected.append(entry)
 
         # Sort ranked by composite score descending
@@ -1518,6 +1526,7 @@ class DebateEvaluator:
                     f"家族集中剔除: {entry['family']} 已入选 {_MAX_PER_FAMILY} 个（上限），"
                     f"composite={entry['composite_score']} 但因组合多样性要求移入淘汰。"
                 ),
+                "decision": "rejected",
             })
         ranked = selected
         ranked.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -1574,6 +1583,7 @@ class DebateEvaluator:
                 "expression": str(item.get("expression", "")),
                 "final_score": float(item.get("final_score", 0.0)),
                 "selection_reason": str(item.get("selection_reason", "")),
+                "decision": str(item.get("decision", "selected")).strip().lower() or "selected",
                 "strengths": [str(s) for s in item.get("strengths", [])],
                 "risks": [str(r) for r in item.get("risks", [])],
             })
@@ -1590,6 +1600,7 @@ class DebateEvaluator:
                 "expression": str(item.get("expression", "")),
                 "final_score": float(item.get("final_score", 0.0)),
                 "rejection_reason": str(item.get("rejection_reason", "")),
+                "decision": str(item.get("decision", "rejected")).strip().lower() or "rejected",
             })
         return cleaned
 
