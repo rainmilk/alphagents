@@ -2357,7 +2357,17 @@ class AAAI2027Pipeline:
         self._compute_composite_test_ic(test_data)
 
         # ── 9. Save results (step9) ──
-        self.step9_save_results(output_dir)
+        # Resolve effective output_dir: explicit param > config-backed default
+        # using the CLI-overridden dates from step1 (self._train_start_date etc.)
+        # rather than the raw config values, so --train-start/--test-end are
+        # reflected in the saved path.
+        _od = output_dir or self._default_output_dir(
+            train_start=getattr(self, '_train_start_date', None),
+            test_end=getattr(self, '_test_end_date', None),
+            forward_period=getattr(self, '_forward_period', None),
+            holding_period=holding_period,
+        )
+        self.step9_save_results(_od)
 
         print("\n" + "=" * 60)
         print("  Test Pipeline Complete!")
