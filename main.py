@@ -2920,10 +2920,14 @@ Examples:
             exit(1)
 
         # Load data (step1) to get test_data for the test period.
-        # The split (train/test) is controlled by train_end_date / test_start_date
-        # from config, which defaults to the last ~2 years as test.
+        # The split (train/test) can be overridden via --train-start/--train-end/
+        # --test-start/--test-end, falling back to config defaults.
         pipeline.step1_load_data(
             use_sample=not args.real,
+            train_start_date=args.train_start,
+            train_end_date=args.train_end,
+            test_start_date=args.test_start,
+            test_end_date=args.test_end,
             forward_period=args.forward_period,
             holding_period=args.holding_period,
         )
