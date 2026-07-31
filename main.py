@@ -2208,6 +2208,7 @@ class AAAI2027Pipeline:
         test_data: dict,
         holding_period: int = None,
         context_days: int = None,
+        output_dir: str = None,
     ):
         """
         Load saved factors from JSON and run test-period portfolio construction + backtest.
@@ -2354,6 +2355,9 @@ class AAAI2027Pipeline:
         # vs the N-day forward returns, all on the out-of-sample period.
         # Stored as mean_rank_ic / icir into self.performance_metrics.
         self._compute_composite_test_ic(test_data)
+
+        # ── 9. Save results (step9) ──
+        self.step9_save_results(output_dir)
 
         print("\n" + "=" * 60)
         print("  Test Pipeline Complete!")
@@ -2945,6 +2949,7 @@ Examples:
             test_data=pipeline.test_data,
             holding_period=args.holding_period,
             context_days=args.context_days,
+            output_dir=args.output_dir,
         )
         if metrics:
             print(f"\nFinal Performance: Sharpe = {metrics.get('sharpe_ratio', 0):.4f}")
